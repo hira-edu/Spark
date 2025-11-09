@@ -3,6 +3,7 @@ module Spark
 go 1.18
 
 require (
+	github.com/atotto/clipboard v0.1.4
 	github.com/creack/pty v1.1.18
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/gin-gonic/gin v1.7.7
@@ -16,6 +17,7 @@ require (
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil/v3 v3.22.2
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
+	golang.org/x/sys v0.3.0
 )
 
 require (
@@ -41,7 +43,6 @@ require (
 	github.com/ugorji/go/codec v1.1.7 // indirect
 	github.com/yusufpapurcu/wmi v1.2.2 // indirect
 	golang.org/x/net v0.0.0-20220111093109-d55c255bac03 // indirect
-	golang.org/x/sys v0.3.0 // indirect
 	golang.org/x/text v0.3.7 // indirect
 	gopkg.in/yaml.v2 v2.2.8 // indirect
 )
