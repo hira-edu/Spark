@@ -49,7 +49,12 @@ func detectHardwareEncoders(m *Manager) {
 		log.Printf("encoder: hardware capability detection skipped: %v", err)
 		return
 	}
-	registerHardwareStub(m, "NVENC", "nvenc-h264", "nvenc-hardware", "h264", selectAdapter(candidates, vendorNVIDIA))
+	if nv := selectAdapter(candidates, vendorNVIDIA); nv != nil {
+		registerHardwareStub(m, "NVENC", "nvenc-h264", "nvenc-hardware", "h264", nv)
+		if nv.videoSupported {
+			registerNVENCFactory(m, nv)
+		}
+	}
 	registerHardwareStub(m, "AMF", "amf-h264", "amf-hardware", "h264", selectAdapter(candidates, vendorAMD))
 	registerHardwareStub(m, "QSV", "qsv-h264", "qsv-hardware", "h264", selectAdapter(candidates, vendorIntel))
 }

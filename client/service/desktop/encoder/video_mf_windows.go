@@ -21,7 +21,7 @@ func registerMediaFoundationEncoder(m *Manager) {
 	if m == nil {
 		return
 	}
-	m.registerVideoFactory(&mfH264Factory{})
+	m.registerVideoFactory(&mfH264Factory{}, true)
 }
 
 func (mfH264Factory) Capability() Capability {

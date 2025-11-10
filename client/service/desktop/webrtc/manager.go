@@ -197,6 +197,20 @@ func (m *Manager) videoEnabled() bool {
 	return m != nil && m.video != nil
 }
 
+// Metrics returns the most recent transport metrics for the requested desktop (if available).
+func (m *Manager) Metrics(desktopID string) (Metrics, bool) {
+	if m == nil || desktopID == "" {
+		return Metrics{}, false
+	}
+	m.mu.Lock()
+	session := m.sessions[desktopID]
+	m.mu.Unlock()
+	if session == nil {
+		return Metrics{}, false
+	}
+	return session.snapshotMetrics()
+}
+
 func loadICEServers() []webrtc.ICEServer {
 	raw := strings.TrimSpace(os.Getenv("SPARK_WEBRTC_ICE"))
 	if raw == "" {
@@ -237,8 +251,86 @@ func filterEmpty(values []string) []string {
 	return result
 }
 
+// Capability describes the agent's WebRTC transport configuration for UI negotiation.
+func (m *Manager) Capability() map[string]any {
+	if m == nil || !transportFeatureEnabled() {
+		return nil
+	}
+	desc := map[string]any{
+		"enabled": true,
+		"videoEnabled": func() bool {
+			return m.video != nil
+		}(),
+		"dataChannels": []string{"spark-diff"},
+	}
+	if iceCfg := serializeICEConfig(m.iceConfig); len(iceCfg) > 0 {
+		for k, v := range iceCfg {
+			desc[k] = v
+		}
+	}
+	if m.video != nil {
+		desc["video"] = map[string]any{
+			"encoder": defaultVideoEncoderName,
+			"codecs":  []string{"h264"},
+		}
+	}
+	return desc
+}
+
+func serializeICEConfig(cfg webrtc.Configuration) map[string]any {
+	if len(cfg.ICEServers) == 0 {
+		return nil
+	}
+	servers := make([]map[string]any, 0, len(cfg.ICEServers))
+	for _, server := range cfg.ICEServers {
+		if len(server.URLs) == 0 {
+			continue
+		}
+		entry := map[string]any{
+			"urls": server.URLs,
+		}
+		if server.Username != "" {
+			entry["username"] = server.Username
+		}
+		switch cred := server.Credential.(type) {
+		case string:
+			if cred != "" {
+				entry["credential"] = cred
+			}
+		}
+		if ct := strings.TrimSpace(string(server.CredentialType)); ct != "" {
+			entry["credentialType"] = ct
+		}
+		servers = append(servers, entry)
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"iceServers": servers,
+		"config": map[string]any{
+			"iceServers": servers,
+		},
+	}
+}
+
+// Enabled reports whether the WebRTC transport is allowed by feature flags.
+// VideoReady reports whether a video encoder is available for WebRTC media.
+func (m *Manager) VideoReady() bool {
+	return m != nil && m.video != nil
+}
+
+// TransportEnabled reports whether the agent should advertise WebRTC transport support.
+func TransportEnabled() bool {
+	return transportFeatureEnabled()
+}
+
 func videoStreamingEnabled() bool {
 	return strings.EqualFold(os.Getenv("SPARK_EXPERIMENTAL_WEBRTC_ENCODERS"), "1")
+}
+
+func transportFeatureEnabled() bool {
+	return strings.EqualFold(os.Getenv("SPARK_EXPERIMENTAL_WEBRTC"), "1")
 }
 
 func videoEncoderAvailable(name string) bool {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v3"
 )
@@ -18,6 +20,123 @@ const (
 	signalAnswer    webRTCSignalKind = "answer"
 	signalCandidate webRTCSignalKind = "candidate"
 )
+
+type webrtcSessionState struct {
+	Desktop               string
+	LastOfferAt           time.Time
+	LastAnswerAt          time.Time
+	LastCandidate         time.Time
+	BrowserReady          bool
+	AgentReady            bool
+	ExpiresAt             time.Time
+	QueuedAgentCandidates []map[string]any
+}
+
+type webrtcController struct {
+	mu       sync.Mutex
+	sessions map[string]*webrtcSessionState
+	ttl      time.Duration
+}
+
+func newWebRTCController(ttl time.Duration) *webrtcController {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return &webrtcController{
+		sessions: make(map[string]*webrtcSessionState),
+		ttl:      ttl,
+	}
+}
+
+func (c *webrtcController) touch(desktop string) *webrtcSessionState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	return c.touchLocked(desktop)
+}
+
+func (c *webrtcController) touchLocked(desktop string) *webrtcSessionState {
+	state, ok := c.sessions[desktop]
+	if !ok {
+		state = &webrtcSessionState{Desktop: desktop}
+		c.sessions[desktop] = state
+	}
+	state.ExpiresAt = time.Now().Add(c.ttl)
+	return state
+}
+
+func (c *webrtcController) recordOffer(desktop string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	state := c.touchLocked(desktop)
+	state.LastOfferAt = time.Now()
+	state.BrowserReady = false
+	state.AgentReady = false
+	state.QueuedAgentCandidates = nil
+}
+
+func (c *webrtcController) recordAnswer(desktop string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	state := c.touchLocked(desktop)
+	state.LastAnswerAt = time.Now()
+	state.AgentReady = true
+}
+
+func (c *webrtcController) recordCandidate(desktop string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	state := c.touchLocked(desktop)
+	state.LastCandidate = time.Now()
+}
+
+func (c *webrtcController) markBrowserReady(desktop string) []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	state := c.touchLocked(desktop)
+	state.BrowserReady = true
+	queued := state.QueuedAgentCandidates
+	state.QueuedAgentCandidates = nil
+	return queued
+}
+
+func (c *webrtcController) snapshot(desktop string) webrtcSessionState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	if state, ok := c.sessions[desktop]; ok {
+		return *state
+	}
+	return webrtcSessionState{Desktop: desktop}
+}
+
+func (c *webrtcController) queueAgentCandidate(desktop string, candidate map[string]any) bool {
+	if candidate == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupLocked(time.Now())
+	state := c.touchLocked(desktop)
+	if state.BrowserReady {
+		return false
+	}
+	state.QueuedAgentCandidates = append(state.QueuedAgentCandidates, candidate)
+	return true
+}
+
+func (c *webrtcController) remove(desktop string) {
+	if c == nil || desktop == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.sessions, desktop)
+	c.mu.Unlock()
+}
 
 func normalizeBrowserSignal(kind webRTCSignalKind, payload map[string]any) (map[string]any, error) {
 	switch kind {
@@ -144,4 +263,12 @@ func mapFromAny(value any) (map[string]any, bool) {
 		return m, true
 	}
 	return nil, false
+}
+
+func (c *webrtcController) cleanupLocked(now time.Time) {
+	for key, state := range c.sessions {
+		if now.After(state.ExpiresAt) {
+			delete(c.sessions, key)
+		}
+	}
 }

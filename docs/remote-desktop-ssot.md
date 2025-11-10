@@ -77,7 +77,7 @@ Single source of truth for implementing “best of the best” remote desktop co
 - [x] Import UMH’s session/identity metadata plumbing (ProcessIdToSessionId, SID capture, connection IDs) so the Spark agent can reason about console vs. RDP vs. VM sessions before applying enforcement. → See `docs/umh-porting-plan.md`.
 
 ### Streaming & Transport
-- [ ] Implement WebRTC signaling handler (`server/handler/desktop/webrtc.go`) using pion, bridging to existing event loop.
+- [x] Implement WebRTC signaling handler (`server/handler/desktop/{desktop,webrtc}.go`) using pion, bridging to existing event loop. → The server now validates browser offers against `DESKTOP_CAPS`, queues agent ICE candidates until the answer is delivered, and emits richer `DESKTOP_WEBRTC_STATE` telemetry while draining the queue once the browser is ready.
 - [ ] Introduce encoder abstraction in client (DXGI+NVENC, AMD AMF, Intel QuickSync/Media Foundation) with dynamic capability detection.
 - [ ] Build adaptive bitrate controller exchanging stats between browser and client; expose quality presets.
 - [ ] Add optional audio capture/stream path respecting OS permissions and bandwidth caps.
@@ -96,8 +96,13 @@ Single source of truth for implementing “best of the best” remote desktop co
 
 #### WebRTC Signaling & Fallback Plan
 - **Server handler** – add `server/handler/desktop/webrtc.go` that spins up a pion `PeerConnection` per session. SDP offers/answers and ICE candidates flow over the existing WebSocket control channel (`DESKTOP_WEBRTC_{OFFER,ANSWER,CANDIDATE}`), so there are still zero inbound listeners and the current auth secrets stay in play. If negotiation fails, the handler emits `DESKTOP_TRANSPORT_FALLBACK` and resumes the diff WS stream without user action.
+- **Implementation Guide** – See `docs/webrtc-end-to-end-plan.md` for the scoped milestones covering server controller, agent media tracks, browser playback, and TURN credential distribution.
+- **Agent media pilot** – Behind `SPARK_EXPERIMENTAL_WEBRTC_ENCODERS=1` we now feed captured frames through the Media Foundation pipeline and attach a `spark-video` track to every WebRTC session. The console still renders diff canvas by default, but the `<video>` element can replay the new RTP samples for early testing.
 - **Agent transport** – `client/service/desktop/webrtc` will share capture buffers with the JPEG diff encoder. It exposes `Init`, `Start`, `Stop`, and `Stats` so the desktop service can hot-switch transports. Each viewer gets its own pion connection, and HookBridge policy events remain in sync because we reuse the same session IDs. Until WebRTC proves stable, frames can be mirrored to both transports so the server/browser can pick the healthiest path.
 - **Browser clients** – the React modal creates a `RTCPeerConnection` only when `DESKTOP_CAPS.transports` includes `webrtc`. TURN credentials are provided by the server; the WS diff tunnel stays open as a standby. Operators see the active transport (“WebRTC (TURN)” vs “Diff WS”) in the HUD banner.
+- **Automatic fallback** – `server/handler/desktop/desktop.go` now emits `DESKTOP_TRANSPORT_FALLBACK` whenever WebRTC negotiation fails or the agent rejects an offer, and `web/src/components/desktop/desktop.jsx` consumes it to tear down WebRTC and resume the diff/WebSocket stream without operator input.
+- **Negotiation HUD & fallback** – browsers listen for `DESKTOP_WEBRTC_STATE` heartbeats, surface the latest stage (“browser offer”, “agent answer”, “ICE ready”) in the HUD, and automatically fall back to the diff/WebSocket transport if signalling or the data channel fails. Operators can re-enable WebRTC with a single toggle once conditions improve.
+- **Transport metrics** – Every metrics tick now embeds WebRTC counters (data/video bytes, FPS, keyframes, drops). The server derives instantaneous bandwidth/FPS and forwards them to the HUD so operators can see “WebRTC Video 24 fps 3.4 Mbps, state=connected” next to the diff stats.
 - **Audio/data channels** – audio capture (Wasapi/Media Foundation) rides the WebRTC connection behind a policy flag. Control traffic (input, clipboard, quality commands) continues over WS for now, but we leave a `datachannel` slot reserved for future clipboard/file streaming once DLP stories are defined.
 
 #### Encoder Abstraction & Adaptive Bitrate
@@ -135,6 +140,7 @@ Single source of truth for implementing “best of the best” remote desktop co
 - [ ] Detect when SetWindowDisplayAffinity or similar APIs blank the session and surface UX warnings plus optional policy-driven override/whitelist workflows.
 - [ ] Provide fallbacks when local keyboard/mouse input is disabled (filter drivers, accessibility locks), including HID emulation paths with explicit authorization gates.
 - [ ] Port UMH’s multi-layer hook stack for `SetWindowDisplayAffinity`, `NtUserSetWindowDisplayAffinity`, `BlockInput`, `NtUserBlockInput`, `AttachThreadInput`, DirectInput, and `SetWindowsHookEx*` into Spark to guarantee capture/input continuity.
+- [x] Automatically neutralize `SetWindowDisplayAffinity` and `BlockInput` attempts detected via HookBridge by forcing capture/input policy overrides per session. → `client/service/desktop/desktop.go` now calls `sessionPolicies.applyOverrides(..., forceCapture=true, forceInput=true)` whenever UMH reports those APIs, ensuring both bypasses re-enable capture and input immediately.
 - [x] Expose policy flags (e.g., `FORCE_INPUT`, `FORCE_CAPTURE`) similar to UMH’s enforcement toggles so operators can escalate enforcement per session. → `web/src/components/desktop/desktop.jsx` now renders Force Input/Capture buttons backed by `DESKTOP_POLICY_FORCE`, with loading/consent states and policy-gated disabling.
 - [ ] Mirror UMH’s per-process targeting (allowlists, fingerprints) so Spark only injects hooks into desktop processes tied to an active remote session.
 - [ ] Port UMH’s session-aware policy engine (rolling counters per PID/session, auto-enforce/relax logic) so keyboard/display remediation happens automatically with hysteresis instead of manual toggles.

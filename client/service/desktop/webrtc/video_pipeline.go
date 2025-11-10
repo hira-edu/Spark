@@ -22,6 +22,7 @@ type videoPipeline struct {
 	encoder  encoder.VideoInstance
 	cfg      encoder.VideoConfig
 	lastDims image.Rectangle
+	manager  *Manager
 }
 
 type videoFrame struct {
@@ -57,6 +58,7 @@ func (p *videoPipeline) start(m *Manager) {
 	if p == nil || m == nil {
 		return
 	}
+	p.manager = m
 	p.mu.Lock()
 	if p.running {
 		p.mu.Unlock()
@@ -109,8 +111,8 @@ func (p *videoPipeline) encode(frame videoFrame) (encoder.VideoSample, error) {
 func (p *videoPipeline) ensureEncoder(frame videoFrame) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	rect := frame.image.Rect
-	if p.encoder != nil && rect.Eq(p.lastDims) {
+	bounds := frame.image.Bounds()
+	if p.encoder != nil && bounds.Eq(p.lastDims) {
 		return nil
 	}
 	if p.encoder != nil {
@@ -123,11 +125,11 @@ func (p *videoPipeline) ensureEncoder(frame videoFrame) error {
 	}
 	fps := int(time.Second / frameDur)
 	cfg := encoder.VideoConfig{
-		Name:    defaultVideoEncoderName,
-		Width:   rect.Dx(),
-		Height:  rect.Dy(),
+		Name:    p.preferredEncoderName(),
+		Width:   bounds.Dx(),
+		Height:  bounds.Dy(),
 		FPS:     fps,
-		Bitrate: estimateBitrate(rect.Dx(), rect.Dy(), fps),
+		Bitrate: estimateBitrate(bounds.Dx(), bounds.Dy(), fps),
 	}
 	inst, err := encoder.Instance().OpenVideoEncoder(defaultVideoEncoderName, cfg)
 	if err != nil {
@@ -135,7 +137,7 @@ func (p *videoPipeline) ensureEncoder(frame videoFrame) error {
 	}
 	p.encoder = inst
 	p.cfg = cfg
-	p.lastDims = rect
+	p.lastDims = bounds
 	return nil
 }
 
@@ -159,11 +161,15 @@ func cloneRGBA(src *image.RGBA) *image.RGBA {
 	if src == nil {
 		return nil
 	}
-	rect := src.Rect
-	dst := image.NewRGBA(rect)
-	rowBytes := rect.Dx() * 4
-	for y := 0; y < rect.Dy(); y++ {
-		copy(dst.Pix[y*dst.Stride:y*dst.Stride+rowBytes], src.Pix[y*src.Stride:y*src.Stride+rowBytes])
+	bounds := src.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	rowBytes := width * 4
+	for y := 0; y < height; y++ {
+		srcOff := src.PixOffset(bounds.Min.X, bounds.Min.Y+y)
+		dstOff := y * dst.Stride
+		copy(dst.Pix[dstOff:dstOff+rowBytes], src.Pix[srcOff:srcOff+rowBytes])
 	}
 	return dst
 }
@@ -184,4 +190,14 @@ func estimateBitrate(width, height, fps int) int {
 		return max
 	}
 	return bitrate
+}
+
+func (p *videoPipeline) preferredEncoderName() string {
+	if p == nil || p.manager == nil {
+		return defaultVideoEncoderName
+	}
+	if name := p.manager.preferredVideoEncoder(); name != "" {
+		return name
+	}
+	return defaultVideoEncoderName
 }

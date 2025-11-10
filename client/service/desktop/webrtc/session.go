@@ -25,6 +25,7 @@ type Session struct {
 	closed bool
 	dc     *webrtc.DataChannel
 	video  *webrtc.TrackLocalStaticSample
+	stats  *transportMetrics
 }
 
 var ErrDataChannelUnavailable = errors.New("webrtc: diff data channel unavailable")
@@ -42,6 +43,7 @@ func NewSession(desktopID, eventID string, cfg webrtc.Configuration, sender sign
 		pc:        pc,
 		sender:    sender,
 		createdAt: time.Now(),
+		stats:     newTransportMetrics(),
 	}
 	// Ensure we advertise video send capability even before media plumbing lands.
 	if err := session.prepareTransceivers(); err != nil {
@@ -233,7 +235,16 @@ func (s *Session) SendDiffFrame(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
 	}
-	return s.dc.Send(payload)
+	if err := s.dc.Send(payload); err != nil {
+		if s.stats != nil {
+			s.stats.recordDataDrop(err)
+		}
+		return err
+	}
+	if s.stats != nil {
+		s.stats.recordDataBytes(len(payload))
+	}
+	return nil
 }
 
 // SendVideoSample writes an encoded video sample to the WebRTC track.
@@ -249,10 +260,20 @@ func (s *Session) SendVideoSample(sample encoder.VideoSample) error {
 	if len(sample.Data) == 0 {
 		return nil
 	}
-	return s.video.WriteSample(media.Sample{
+	err := s.video.WriteSample(media.Sample{
 		Data:     sample.Data,
 		Duration: sample.Duration,
 	})
+	if err != nil {
+		if s.stats != nil {
+			s.stats.recordVideoDrop(err)
+		}
+		return err
+	}
+	if s.stats != nil {
+		s.stats.recordVideoSample(len(sample.Data), sample.Keyframe)
+	}
+	return nil
 }
 
 func decodeSessionDescription(payload map[string]any) (webrtc.SessionDescription, error) {
@@ -271,4 +292,137 @@ func decodeSessionDescription(payload map[string]any) (webrtc.SessionDescription
 		return webrtc.SessionDescription{}, fmt.Errorf("empty SDP")
 	}
 	return desc, nil
+}
+
+type transportMetrics struct {
+	sync.Mutex
+	dataBytes    uint64
+	dataDrops    uint64
+	videoBytes   uint64
+	videoFrames  uint64
+	videoKey     uint64
+	videoDrops   uint64
+	lastError    string
+	intervalBase time.Time
+}
+
+type Metrics struct {
+	IntervalMs     int64  `json:"intervalMs"`
+	Timestamp      int64  `json:"timestamp"`
+	State          string `json:"state"`
+	DataBytes      uint64 `json:"dataBytes"`
+	DataDrops      uint64 `json:"dataDrops"`
+	VideoBytes     uint64 `json:"videoBytes"`
+	VideoFrames    uint64 `json:"videoFrames"`
+	VideoKeyframes uint64 `json:"videoKeyframes"`
+	VideoDrops     uint64 `json:"videoDrops"`
+	LastError      string `json:"lastError,omitempty"`
+}
+
+func newTransportMetrics() *transportMetrics {
+	return &transportMetrics{
+		intervalBase: time.Now(),
+	}
+}
+
+func (m *transportMetrics) recordDataBytes(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.Lock()
+	m.dataBytes += uint64(n)
+	m.Unlock()
+}
+
+func (m *transportMetrics) recordVideoSample(size int, keyframe bool) {
+	if m == nil || size <= 0 {
+		return
+	}
+	m.Lock()
+	m.videoBytes += uint64(size)
+	m.videoFrames++
+	if keyframe {
+		m.videoKey++
+	}
+	m.Unlock()
+}
+
+func (m *transportMetrics) recordDataDrop(err error) {
+	if m == nil {
+		return
+	}
+	m.Lock()
+	m.dataDrops++
+	if err != nil {
+		m.lastError = err.Error()
+	}
+	m.Unlock()
+}
+
+func (m *transportMetrics) recordVideoDrop(err error) {
+	if m == nil {
+		return
+	}
+	m.Lock()
+	m.videoDrops++
+	if err != nil {
+		m.lastError = err.Error()
+	}
+	m.Unlock()
+}
+
+func (m *transportMetrics) snapshot(state string) (Metrics, bool) {
+	if m == nil {
+		return Metrics{}, false
+	}
+	m.Lock()
+	defer m.Unlock()
+	now := time.Now()
+	interval := now.Sub(m.intervalBase)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	stats := Metrics{
+		IntervalMs:     interval.Milliseconds(),
+		Timestamp:      now.UnixMilli(),
+		State:          state,
+		DataBytes:      m.dataBytes,
+		DataDrops:      m.dataDrops,
+		VideoBytes:     m.videoBytes,
+		VideoFrames:    m.videoFrames,
+		VideoKeyframes: m.videoKey,
+		VideoDrops:     m.videoDrops,
+		LastError:      m.lastError,
+	}
+	m.dataBytes = 0
+	m.dataDrops = 0
+	m.videoBytes = 0
+	m.videoFrames = 0
+	m.videoKey = 0
+	m.videoDrops = 0
+	m.lastError = ""
+	m.intervalBase = now
+	hasActivity := stats.DataBytes > 0 ||
+		stats.DataDrops > 0 ||
+		stats.VideoBytes > 0 ||
+		stats.VideoFrames > 0 ||
+		stats.VideoDrops > 0 ||
+		stats.LastError != ""
+	if !hasActivity {
+		return stats, false
+	}
+	return stats, true
+}
+
+func (s *Session) snapshotMetrics() (Metrics, bool) {
+	if s == nil || s.stats == nil {
+		return Metrics{}, false
+	}
+	state := "closed"
+	if s.dc != nil {
+		state = s.dc.ReadyState().String()
+	} else if s.video != nil {
+		state = "video"
+	}
+	return s.stats.snapshot(state)
 }

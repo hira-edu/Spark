@@ -13,12 +13,31 @@ type config struct {
 	Salt      string            `json:"salt"`
 	Auth      map[string]string `json:"auth"`
 	Log       *log              `json:"log"`
+	WebRTC    *WebRTCConfig     `json:"webrtc"`
 	SaltBytes []byte            `json:"-"`
 }
 type log struct {
 	Level string `json:"level"`
 	Path  string `json:"path"`
 	Days  uint   `json:"days"`
+}
+
+// WebRTCConfig describes TURN/ICE server provisioning used for WebRTC sessions.
+type WebRTCConfig struct {
+	Enabled       bool              `json:"enabled"`
+	CredentialTTL string            `json:"credentialTTL"`
+	Servers       []WebRTCIceServer `json:"servers"`
+	RelayHint     string            `json:"relayHint"`
+}
+
+// WebRTCIceServer mirrors the ICE server schema while allowing shared secrets
+// for per-session credential minting.
+type WebRTCIceServer struct {
+	URLs             []string `json:"urls"`
+	Username         string   `json:"username"`
+	Credential       string   `json:"credential"`
+	CredentialType   string   `json:"credentialType"`
+	CredentialSecret string   `json:"credentialSecret"`
 }
 
 // Commit is hash of this commit, for auto upgrade.

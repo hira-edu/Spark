@@ -8,6 +8,7 @@ import (
 	"Spark/utils/melody"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"github.com/gin-gonic/gin"
 	"math"
 	"net/http"
@@ -40,6 +41,7 @@ const (
 )
 
 var desktopSessions = melody.New()
+var webrtcSessions = newWebRTCController(5 * time.Minute)
 
 func init() {
 	desktopSessions.Config.MaxMessageSize = common.MaxMessageSize
@@ -137,8 +139,8 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				`deviceConn`: desktop.deviceConn,
 			})
 		case `DESKTOP_CAPS`:
-			desktop.caps = pack.Data
-			sendPack(modules.Packet{Act: `DESKTOP_CAPS`, Event: pack.Event, Data: pack.Data}, desktop.srcConn)
+			desktop.caps = enrichDesktopWebRTCCaps(desktop.uuid, pack.Data)
+			sendPack(modules.Packet{Act: `DESKTOP_CAPS`, Event: pack.Event, Data: desktop.caps}, desktop.srcConn)
 			common.Info(desktop.srcConn, `DESKTOP_CAPS`, ``, ``, map[string]any{
 				`deviceConn`: desktop.deviceConn,
 				`caps`:       pack.Data,
@@ -266,7 +268,55 @@ func logDesktopMetrics(pack modules.Packet, desktop *desktop) map[string]any {
 	if len(lastError) > 0 {
 		uiMetrics[`lastError`] = lastError
 	}
+	if rawWebRTC, ok := mapFromAny(pack.Data[`webrtc`]); ok {
+		if derived := deriveWebRTCMetrics(rawWebRTC); len(derived) > 0 {
+			metrics[`webrtc`] = derived
+			uiMetrics[`webrtc`] = derived
+		}
+	}
 	return uiMetrics
+}
+
+func deriveWebRTCMetrics(raw map[string]any) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	intervalMs, ok := metricFloat(raw[`intervalMs`])
+	if !ok || intervalMs <= 0 {
+		intervalMs = 1000
+	}
+	intervalSeconds := intervalMs / 1000
+	if intervalSeconds <= 0 {
+		intervalSeconds = 1
+	}
+	dataBytes, _ := metricFloat(raw[`dataBytes`])
+	videoBytes, _ := metricFloat(raw[`videoBytes`])
+	videoFrames, _ := metricFloat(raw[`videoFrames`])
+	videoKeyframes, _ := metricFloat(raw[`videoKeyframes`])
+	dataDrops, _ := metricFloat(raw[`dataDrops`])
+	videoDrops, _ := metricFloat(raw[`videoDrops`])
+	videoFps := 0.0
+	if videoFrames > 0 {
+		videoFps = videoFrames / intervalSeconds
+	}
+	metrics := map[string]any{
+		`intervalMs`:                intervalMs,
+		`timestamp`:                 raw[`timestamp`],
+		`state`:                     raw[`state`],
+		`dataBytes`:                 int(dataBytes),
+		`videoBytes`:                int(videoBytes),
+		`videoFrames`:               int(videoFrames),
+		`videoKeyframes`:            int(videoKeyframes),
+		`dataDrops`:                 int(dataDrops),
+		`videoDrops`:                int(videoDrops),
+		`dataBandwidthBytesPerSec`:  math.Round((dataBytes/intervalSeconds)*100) / 100,
+		`videoBandwidthBytesPerSec`: math.Round((videoBytes/intervalSeconds)*100) / 100,
+		`videoFps`:                  math.Round(videoFps*100) / 100,
+	}
+	if lastErr, ok := raw[`lastError`].(string); ok && lastErr != "" {
+		metrics[`lastError`] = lastErr
+	}
+	return metrics
 }
 
 func logPolicyAlert(desktop *desktop, pack modules.Packet) {
@@ -668,6 +718,7 @@ func onDesktopDisconnect(session *melody.Session) {
 		`desktop`: desktop.uuid,
 	}, Event: desktop.uuid}, desktop.deviceConn)
 	common.RemoveEvent(desktop.uuid)
+	webrtcSessions.remove(desktop.uuid)
 	session.Set(`Desktop`, nil)
 	desktop = nil
 }
@@ -714,24 +765,39 @@ func handleBrowserWebRTCSignal(desktop *desktop, pack modules.Packet) {
 	}
 	kind, err := toSignalKind(pack.Data[`kind`])
 	if err != nil {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "browser_kind", err.Error())
+		return
+	}
+	if kind == signalOffer && !desktopSupportsWebRTC(desktop) {
+		sendWebRTCUnsupported(desktop, "remote device has not advertised WebRTC support")
+		common.Warn(desktop.srcConn, `DESKTOP_WEBRTC_SIGNAL`, `unsupported`, `device missing WebRTC capability`, map[string]any{
+			`desktop`: desktop.uuid,
+		})
 		return
 	}
 	payload, ok := mapFromAny(pack.Data[`payload`])
 	if !ok {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "browser_payload", `${i18n|COMMON.INVALID_PARAMETER}`)
 		return
 	}
 	normalized, err := normalizeBrowserSignal(kind, payload)
 	if err != nil {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "browser_normalize", err.Error())
 		return
+	}
+	if desktop.deviceConn == nil {
+		sendWebRTCSignalError(desktop, "agent_unavailable", `${i18n|DESKTOP.SESSION_CLOSED}`)
+		return
+	}
+	if kind == signalOffer {
+		webrtcSessions.recordOffer(desktop.uuid)
 	}
 	common.Info(desktop.srcConn, `DESKTOP_WEBRTC_SIGNAL`, `browser_forward`, ``, map[string]any{
 		`deviceConn`: desktop.deviceConn,
 		`desktop`:    desktop.uuid,
 		`kind`:       string(kind),
 	})
+	state := webrtcSessions.snapshot(desktop.uuid)
 	common.SendPack(modules.Packet{
 		Act:   `DESKTOP_WEBRTC_SIGNAL`,
 		Event: desktop.uuid,
@@ -742,6 +808,7 @@ func handleBrowserWebRTCSignal(desktop *desktop, pack modules.Packet) {
 			`origin`:  `browser`,
 		},
 	}, desktop.deviceConn)
+	sendWebRTCState(desktop, "browser_"+string(kind), state)
 }
 
 func handleAgentWebRTCSignal(desktop *desktop, pack modules.Packet) {
@@ -749,30 +816,197 @@ func handleAgentWebRTCSignal(desktop *desktop, pack modules.Packet) {
 		return
 	}
 	if pack.Code != 0 {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: pack.Code, Msg: pack.Msg}, desktop.srcConn)
+		stage := "agent_error"
+		if pack.Msg == "" {
+			pack.Msg = `${i18n|COMMON.UNKNOWN_ERROR}`
+		}
+		sendWebRTCSignalError(desktop, stage, pack.Msg)
 		return
 	}
 	kind, err := toSignalKind(pack.Data[`kind`])
 	if err != nil {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "agent_kind", err.Error())
 		return
 	}
 	payload, ok := mapFromAny(pack.Data[`payload`])
 	if !ok {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "agent_payload", `${i18n|COMMON.INVALID_PARAMETER}`)
 		return
 	}
 	normalized, err := normalizeAgentSignal(kind, payload)
 	if err != nil {
-		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		sendWebRTCSignalError(desktop, "agent_normalize", err.Error())
 		return
+	}
+	stage := "agent_" + string(kind)
+	deliver := true
+	switch kind {
+	case signalAnswer:
+		webrtcSessions.recordAnswer(desktop.uuid)
+	case signalCandidate:
+		webrtcSessions.recordCandidate(desktop.uuid)
+		if webrtcSessions.queueAgentCandidate(desktop.uuid, normalized) {
+			deliver = false
+			stage = "agent_candidate_queued"
+		}
+	}
+	if deliver {
+		sendPack(modules.Packet{
+			Act:  `DESKTOP_WEBRTC_SIGNAL`,
+			Code: 0,
+			Data: map[string]any{
+				`kind`:    string(kind),
+				`payload`: normalized,
+			},
+		}, desktop.srcConn)
+	}
+	if kind == signalAnswer {
+		queued := webrtcSessions.markBrowserReady(desktop.uuid)
+		for _, candidate := range queued {
+			sendPack(modules.Packet{
+				Act:  `DESKTOP_WEBRTC_SIGNAL`,
+				Code: 0,
+				Data: map[string]any{
+					`kind`:    string(signalCandidate),
+					`payload`: candidate,
+				},
+			}, desktop.srcConn)
+		}
+	}
+	state := webrtcSessions.snapshot(desktop.uuid)
+	sendWebRTCState(desktop, stage, state)
+}
+
+func sendWebRTCState(desktop *desktop, stage string, state webrtcSessionState) {
+	if desktop == nil || desktop.srcConn == nil {
+		return
+	}
+	payload := map[string]any{
+		"desktop":       desktop.uuid,
+		"stage":         stage,
+		"browserReady":  state.BrowserReady,
+		"agentReady":    state.AgentReady,
+		"lastOfferAt":   state.LastOfferAt.UnixMilli(),
+		"lastAnswerAt":  state.LastAnswerAt.UnixMilli(),
+		"lastCandidate": state.LastCandidate.UnixMilli(),
+	}
+	common.Info(desktop.srcConn, `DESKTOP_WEBRTC_STATE`, stage, ``, payload)
+	common.SendPack(modules.Packet{
+		Act:  "DESKTOP_WEBRTC_STATE",
+		Code: 0,
+		Data: payload,
+	}, desktop.srcConn)
+}
+
+func desktopSupportsWebRTC(desktop *desktop) bool {
+	if desktop == nil {
+		return false
+	}
+	caps := desktop.caps
+	if caps == nil {
+		return false
+	}
+	transports := toStringSlice(caps[`transports`])
+	supportsTransport := false
+	for _, transport := range transports {
+		if strings.EqualFold(transport, "webrtc") {
+			supportsTransport = true
+			break
+		}
+	}
+	webrtcCaps, _ := caps[`webrtc`].(map[string]any)
+	if !supportsTransport {
+		if webrtcCaps == nil {
+			return false
+		}
+		if enabled, ok := webrtcCaps[`enabled`].(bool); ok {
+			return enabled
+		}
+		return true
+	}
+	if webrtcCaps != nil {
+		if enabled, ok := webrtcCaps[`enabled`].(bool); ok {
+			return enabled
+		}
+	}
+	return true
+}
+
+func toStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		result := make([]string, 0, len(v))
+		for _, entry := range v {
+			if entry == nil {
+				continue
+			}
+			result = append(result, fmt.Sprintf("%v", entry))
+		}
+		return result
+	default:
+		if s, ok := raw.(string); ok && s != "" {
+			return []string{s}
+		}
+	}
+	return nil
+}
+
+func sendWebRTCUnsupported(desktop *desktop, message string) {
+	if desktop == nil || desktop.srcConn == nil {
+		return
+	}
+	payload := map[string]any{
+		`status`: "unsupported",
+	}
+	if message != "" {
+		payload[`message`] = message
 	}
 	sendPack(modules.Packet{
 		Act:  `DESKTOP_WEBRTC_SIGNAL`,
 		Code: 0,
-		Data: map[string]any{
-			`kind`:    string(kind),
-			`payload`: normalized,
-		},
+		Data: payload,
 	}, desktop.srcConn)
+	sendTransportFallback(desktop, "browser_offer_unsupported", message)
+}
+
+func sendWebRTCSignalError(desktop *desktop, stage, message string) {
+	if desktop == nil || desktop.srcConn == nil {
+		return
+	}
+	if message == "" {
+		message = `${i18n|COMMON.UNKNOWN_ERROR}`
+	}
+	sendPack(modules.Packet{
+		Act:  `DESKTOP_WEBRTC_SIGNAL`,
+		Code: 1,
+		Msg:  message,
+	}, desktop.srcConn)
+	sendTransportFallback(desktop, stage, message)
+}
+
+func sendTransportFallback(desktop *desktop, stage, reason string) {
+	if desktop == nil || desktop.srcConn == nil {
+		return
+	}
+	payload := map[string]any{
+		`desktop`: desktop.uuid,
+	}
+	if stage != "" {
+		payload[`stage`] = stage
+	}
+	if reason != "" {
+		payload[`reason`] = reason
+	}
+	sendPack(modules.Packet{
+		Act:   `DESKTOP_TRANSPORT_FALLBACK`,
+		Event: desktop.uuid,
+		Data:  payload,
+	}, desktop.srcConn)
+	common.Warn(desktop.srcConn, `DESKTOP_TRANSPORT_FALLBACK`, `webrtc`, reason, map[string]any{
+		`desktop`: desktop.uuid,
+		`stage`:   stage,
+	})
+	webrtcSessions.remove(desktop.uuid)
 }

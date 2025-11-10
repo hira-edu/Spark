@@ -15,6 +15,24 @@ let frames = 0;
 let bytes = 0;
 let ticks = 0;
 let title = i18n.t('DESKTOP.TITLE');
+
+function formatDurationShort(ms) {
+	if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+		return '';
+	}
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) {
+		return `${hours}h ${minutes}m`;
+	}
+	if (minutes > 0) {
+		return `${minutes}m ${seconds}s`;
+	}
+	return `${seconds}s`;
+}
+
 function ScreenModal(props) {
 	const [resolution, setResolution] = useState('0x0');
 	const [bandwidth, setBandwidth] = useState(0);
@@ -25,6 +43,8 @@ function ScreenModal(props) {
 	const [webrtcState, setWebrtcState] = useState('idle');
 	const [webrtcError, setWebrtcError] = useState(null);
 	const [webrtcOptIn, setWebrtcOptIn] = useState(true);
+	const [webrtcStateInfo, setWebrtcStateInfo] = useState(null);
+	const [webrtcFallbackReason, setWebrtcFallbackReason] = useState(null);
 	const [agentStats, setAgentStats] = useState(null);
 	const [monitors, setMonitors] = useState([]);
 	const [selectedMonitor, setSelectedMonitor] = useState(null);
@@ -80,6 +100,8 @@ useEffect(() => {
 			setWebrtcState('idle');
 			setWebrtcError(null);
 			setWebrtcOptIn(true);
+			setWebrtcStateInfo(null);
+			setWebrtcFallbackReason(null);
 			setMonitors([]);
 			setSelectedMonitor(null);
 			setMonitorLoading(false);
@@ -116,7 +138,7 @@ useEffect(() => {
 			await startWebRTCSession();
 		} catch (err) {
 			if (!cancelled) {
-				teardownWebRTC(err?.message || 'WebRTC initialization failed.');
+				fallbackToDiff(err?.message || 'WebRTC initialization failed.', {toast: true});
 			}
 		}
 	})();
@@ -358,6 +380,10 @@ useEffect(() => {
 	function toggleControl() {
 		if (policyState && policyState.inputEnabled === false) {
 			message.warning(getPolicyBlockMessage());
+			return;
+		}
+		if (inputBlockedByIssues) {
+			message.warning(i18n.t('DESKTOP.POLICY_INPUT_BLOCKED') || 'Remote input blocked by local policy.');
 			return;
 		}
 		if (!controlEnabled && !controlConsentGiven) {
@@ -663,6 +689,9 @@ useEffect(() => {
 			teardownWebRTC();
 			message.info(i18n.t('DESKTOP.WEBRTC_DISABLED') || 'WebRTC beta disabled for this session.');
 		} else if (props.open && webrtcAvailable) {
+			setWebrtcFallbackReason(null);
+			setWebrtcError(null);
+			setWebrtcState('connecting');
 			startWebRTCSession().catch(() => {
 				/* error surfaced inside startWebRTCSession */
 			});
@@ -672,11 +701,10 @@ useEffect(() => {
 	function buildPeerConnectionConfig() {
 		const config = {};
 		if (caps?.webrtc?.config) {
-			return caps.webrtc.config;
+			return {...caps.webrtc.config};
 		}
 		if (Array.isArray(caps?.webrtc?.iceServers)) {
-			config.iceServers = caps.webrtc.iceServers;
-			return config;
+			return {iceServers: caps.webrtc.iceServers};
 		}
 		if (typeof window !== 'undefined') {
 			if (window.SPARK_WEBRTC_PEER_CONFIG) {
@@ -696,6 +724,18 @@ useEffect(() => {
 			}
 		}
 		return config;
+	}
+
+	function formatWebRTCStage(stage) {
+		if (!stage || typeof stage !== 'string') {
+			return '';
+		}
+		return stage.split('_').map((segment) => {
+			if (!segment) {
+				return segment;
+			}
+			return segment.charAt(0).toUpperCase() + segment.slice(1);
+		}).join(' → ');
 	}
 
 	async function startWebRTCSession() {
@@ -734,14 +774,17 @@ useEffect(() => {
 			}
 		};
 		pc.onconnectionstatechange = () => {
-			setWebrtcState(pc.connectionState);
-			if (pc.connectionState === 'connected') {
+			const state = pc.connectionState;
+			setWebrtcState(state);
+			if (state === 'connected') {
 				setWebrtcSignal({kind: 'connected', timestamp: Date.now()});
+				setWebrtcFallbackReason(null);
+				setWebrtcError(null);
 			}
-			if (pc.connectionState === 'failed') {
-				setWebrtcError(i18n.t('DESKTOP.WEBRTC_FAILED') || 'WebRTC connection failed.');
+			if (state === 'failed') {
+				fallbackToDiff(i18n.t('DESKTOP.WEBRTC_FAILED') || 'WebRTC connection failed.', {toast: true});
 			}
-			if (pc.connectionState === 'closed' || pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+			if (state === 'closed' || state === 'failed' || state === 'disconnected') {
 				webrtcOfferSentRef.current = false;
 			}
 		};
@@ -761,8 +804,7 @@ useEffect(() => {
 			};
 			channel.onerror = (evt) => {
 				const errMsg = evt?.message || i18n.t('DESKTOP.WEBRTC_DATA_ERROR') || 'WebRTC data channel error.';
-				setWebrtcError(errMsg);
-				message.error(errMsg);
+				fallbackToDiff(errMsg || 'WebRTC data channel error.', {toast: true});
 			};
 			channel.onmessage = (evt) => {
 				if (evt?.data) {
@@ -781,7 +823,7 @@ useEffect(() => {
 				sdp: offer.sdp,
 			});
 		} catch (err) {
-			teardownWebRTC(err?.message || 'WebRTC initialization failed.');
+			fallbackToDiff(err?.message || 'WebRTC initialization failed.', {toast: true});
 			throw err;
 		}
 	}
@@ -816,6 +858,21 @@ useEffect(() => {
 		} else if (!webrtcAvailable) {
 			setWebrtcState('idle');
 			setWebrtcError(null);
+		}
+	}
+
+	function fallbackToDiff(reason, options = {}) {
+		const fallbackMsg = reason || (i18n.t('DESKTOP.WEBRTC_FALLBACK') || 'WebRTC unavailable.');
+		const alreadyDisabled = !webrtcOptIn;
+		teardownWebRTC(fallbackMsg);
+		setWebrtcFallbackReason(fallbackMsg);
+		setWebrtcStateInfo(null);
+		if (options.toast !== false) {
+			const diffNotice = i18n.t('DESKTOP.WEBRTC_FALLBACK_NOTICE') || 'Falling back to WebSocket diff transport.';
+			message.warning(`${fallbackMsg} ${diffNotice}`);
+		}
+		if (!alreadyDisabled) {
+			setWebrtcOptIn(false);
 		}
 	}
 
@@ -868,17 +925,15 @@ useEffect(() => {
 		const code = typeof packet?.code === 'number' ? packet.code : 0;
 		if (code !== 0) {
 			const warnMsg = packet?.msg || i18n.t('DESKTOP.WEBRTC_SIGNAL_FAILED') || 'WebRTC signalling failed.';
-			setWebrtcError(warnMsg);
-			message.warning(warnMsg);
+			fallbackToDiff(warnMsg, {toast: true});
 			return;
 		}
 		const data = packet?.data || {};
 		if (data?.status === 'unsupported') {
 			const unsupportedMsg = i18n.t('DESKTOP.WEBRTC_UNSUPPORTED') || 'Remote device does not support WebRTC yet.';
-			setWebrtcError(unsupportedMsg);
 			setWebrtcState('unsupported');
 			message.info(unsupportedMsg);
-			teardownWebRTC();
+			fallbackToDiff(unsupportedMsg, {toast: false});
 			return;
 		}
 		const kind = (data?.kind || packet?.kind || '').toLowerCase();
@@ -910,9 +965,17 @@ useEffect(() => {
 			}
 		} catch (err) {
 			const errMsg = err?.message || 'WebRTC signalling error.';
-			setWebrtcError(errMsg);
-			message.error(errMsg);
+			fallbackToDiff(errMsg, {toast: true});
 		}
+	}
+
+	function handleTransportFallback(packet) {
+		const payload = packet?.data || packet || {};
+		const reason = payload.reason || packet?.reason || packet?.msg || (i18n.t('DESKTOP.WEBRTC_FALLBACK') || 'WebRTC unavailable.');
+		const stage = payload.stage || packet?.stage;
+		const stageLabel = stage ? formatWebRTCStage(stage) || stage : null;
+		const messageText = stageLabel ? `${reason} (${stageLabel})` : reason;
+		fallbackToDiff(messageText, {toast: true});
 	}
 
 	useEffect(() => {
@@ -1135,6 +1198,20 @@ useEffect(() => {
 			handlePolicyForceResponse(data);
 			return;
 		}
+		if (data?.act === 'DESKTOP_WEBRTC_STATE') {
+			const payload = data?.data || data;
+			setWebrtcStateInfo(payload);
+			if (payload?.browserReady && payload?.agentReady) {
+				setWebrtcState((prev) => (prev === 'datachannel-open' ? prev : 'connected'));
+				setWebrtcError(null);
+				setWebrtcFallbackReason(null);
+			}
+			return;
+		}
+		if (data?.act === 'DESKTOP_TRANSPORT_FALLBACK') {
+			handleTransportFallback(data);
+			return;
+		}
 		if (data?.act === 'DESKTOP_WEBRTC_SIGNAL') {
 			handleWebRTCSignal(data);
 			return;
@@ -1203,10 +1280,14 @@ useEffect(() => {
 	const policyForceAvailable = !!(policyState && policyState.connectionId);
 	const policyForceInputActive = !!(typeof policyState?.requestedForceInput === 'boolean' ? policyState.requestedForceInput : policyState?.forceInput);
 	const policyForceCaptureActive = !!(typeof policyState?.requestedForceCapture === 'boolean' ? policyState.requestedForceCapture : policyState?.forceCapture);
+	const inputBlockedByIssues = !!(policyIssueFlags?.input_block?.active);
+	const captureBlockedByIssues = !!(policyIssueFlags?.display_protection?.active);
 	const activePolicyIssues = Object.entries(policyIssueFlags || {}).filter(([, issue]) => issue?.active);
 	const transports = Array.isArray(caps?.transports) ? caps.transports : [];
 	const rtcSupported = typeof window !== 'undefined' && typeof window.RTCPeerConnection === 'function';
-	const webrtcAvailable = rtcSupported && transports.includes('webrtc');
+	const webrtcCaps = caps?.webrtc || {};
+	const webrtcTransportAdvertised = transports.includes('webrtc');
+	const webrtcAvailable = rtcSupported && webrtcTransportAdvertised && (webrtcCaps.enabled !== false);
 	const selectedQuality = qualityOptions.find((option) => option.value === qualityKey) || qualityOptions[0];
 	const qualityLabel = selectedQuality ? `Quality: ${selectedQuality.label}` : null;
 	const captureLabel = caps?.capture?.primary ? caps.capture.primary.toUpperCase() : '';
@@ -1221,6 +1302,34 @@ useEffect(() => {
 	const capabilityTitle = [captureLabel, encoderLabel, transportLabel, monitorTitle].filter(Boolean).join(' · ');
 	const webrtcStatusLabel = webrtcAvailable ? `WebRTC: ${webrtcOptIn ? webrtcState : 'disabled'}` : null;
 	const webrtcErrorLabel = webrtcOptIn && webrtcError ? `WebRTC Error: ${webrtcError}` : null;
+	const webrtcVideoLabel = typeof webrtcCaps.videoEnabled === 'boolean'
+		? (webrtcCaps.videoEnabled
+			? `WebRTC Video: ${webrtcCaps?.video?.encoder || 'enabled'}`
+			: 'WebRTC Video: not available')
+		: null;
+	const webrtcToken = webrtcCaps?.token;
+	const tokenExpiryMs = typeof webrtcToken?.expiresAtMs === 'number'
+		? webrtcToken.expiresAtMs
+		: (typeof webrtcToken?.expiresAt === 'number' ? webrtcToken.expiresAt * 1000 : null);
+	let webrtcTokenLabel = null;
+	if (typeof tokenExpiryMs === 'number' && Number.isFinite(tokenExpiryMs)) {
+		const remainingMs = tokenExpiryMs - Date.now();
+		const expiryLabel = new Date(tokenExpiryMs).toLocaleTimeString();
+		if (remainingMs <= 0) {
+			webrtcTokenLabel = `TURN TTL: expired (was ${expiryLabel})`;
+		} else {
+			const remainingLabel = formatDurationShort(remainingMs);
+			webrtcTokenLabel = remainingLabel ? `TURN TTL: ${remainingLabel} (exp ${expiryLabel})` : `TURN TTL: expires at ${expiryLabel}`;
+		}
+	}
+	const webrtcRelayLabel = typeof webrtcCaps.relayHint === 'string' && webrtcCaps.relayHint.length
+		? `TURN Relay: ${webrtcCaps.relayHint}`
+		: null;
+	const webrtcStageLabel = webrtcStateInfo?.stage ? `WebRTC Stage: ${formatWebRTCStage(webrtcStateInfo.stage)}` : null;
+	const webrtcReadyLabel = (webrtcStateInfo?.browserReady || webrtcStateInfo?.agentReady)
+		? `WebRTC Ready: browser=${webrtcStateInfo.browserReady ? 'yes' : 'no'}, agent=${webrtcStateInfo.agentReady ? 'yes' : 'no'}`
+		: null;
+	const webrtcFallbackLabel = webrtcFallbackReason ? `${i18n.t('DESKTOP.WEBRTC_FALLBACK_SHORT') || 'WebRTC fallback'}: ${webrtcFallbackReason}` : null;
 	const capItems = caps ? [
 		caps?.capture?.primary ? `Capture: ${caps.capture.primary}` : null,
 		caps?.encoders?.length ? `Encoder: ${caps.encoders.map((enc) => enc.name || enc.type).filter(Boolean).join(', ')}` : null,
@@ -1228,8 +1337,15 @@ useEffect(() => {
 		monitorLabel,
 		qualityLabel,
 		webrtcStatusLabel,
+		webrtcVideoLabel,
+		webrtcStageLabel,
+		webrtcTokenLabel,
+		webrtcRelayLabel,
+		webrtcReadyLabel,
+		webrtcFallbackLabel,
 		webrtcErrorLabel,
 	].filter(Boolean) : [];
+	const controlDisabledByPolicy = (policyState && policyState.inputEnabled === false) || inputBlockedByIssues;
 	const policyItems = policyState ? [
 		policyState.inputEnabled === true ? 'Input Enabled' : (policyState.inputEnabled === false ? 'Input Disabled' : null),
 		typeof policyState.pointerEnabled === 'boolean' ? `Pointer Input: ${policyState.pointerEnabled ? 'Ready' : 'Blocked'}` : null,
@@ -1238,6 +1354,8 @@ useEffect(() => {
 		policyState.requestedForceCapture ? 'Requested: Force Capture' : null,
 		policyState.forceInput ? 'UMH: Force Input Active' : null,
 		policyState.forceCapture ? 'UMH: Force Capture Active' : null,
+		inputBlockedByIssues ? (i18n.t('DESKTOP.POLICY_INPUT_BLOCKED') || 'Remote input blocked by local policy.') : null,
+		captureBlockedByIssues ? (i18n.t('DESKTOP.POLICY_DISPLAY_PROTECTION') || 'Remote app is hiding the screen.') : null,
 		policyState.connectionId ? `Policy Session: ${policyState.connectionId.substring(0, 8)}...` : null,
 		policyState.nativePolicyUpdated ? `UMH Updated: ${new Date(policyState.nativePolicyUpdated).toLocaleTimeString()}` : null,
 		policyState.policyUpdated ? `Requested Updated: ${new Date(policyState.policyUpdated).toLocaleTimeString()}` : null,
@@ -1248,9 +1366,14 @@ useEffect(() => {
 		typeof agentStats.queueHighWater === 'number' ? `Frame Queue: ${agentStats.queueHighWater}` : null,
 		agentStats.queueDrops ? `Drops: ${agentStats.queueDrops}` : null,
 		agentStats.lastError ? `Last Error: ${agentStats.lastError}` : null,
+		agentStats.webrtc && typeof agentStats.webrtc.videoFps === 'number' ? `WebRTC Video: ${agentStats.webrtc.videoFps.toFixed(1)}fps ${formatSize(agentStats.webrtc.videoBandwidthBytesPerSec || 0)}/s` : null,
+		agentStats.webrtc && typeof agentStats.webrtc.dataBandwidthBytesPerSec === 'number' ? `WebRTC Data: ${formatSize(agentStats.webrtc.dataBandwidthBytesPerSec)}/s` : null,
+		agentStats.webrtc?.state ? `WebRTC State: ${agentStats.webrtc.state}` : null,
+		agentStats.webrtc?.lastError ? `WebRTC Error: ${agentStats.webrtc.lastError}` : null,
 	].filter(Boolean) : [];
 	const bannerItems = [...sessionItems, ...capItems, ...policyItems, ...agentItems];
-	const agentTitle = agentStats ? ` | Agent ${typeof agentStats.fps === 'number' ? agentStats.fps.toFixed(1) : '—'}fps ${formatSize(agentStats.bandwidthBytesPerSec || 0)}/s` : '';
+	const webrtcTitle = agentStats?.webrtc ? ` WebRTC ${typeof agentStats.webrtc.videoFps === 'number' ? agentStats.webrtc.videoFps.toFixed(1) : '—'}fps ${formatSize(agentStats.webrtc.videoBandwidthBytesPerSec || 0)}/s` : '';
+	const agentTitle = agentStats ? ` | Agent ${typeof agentStats.fps === 'number' ? agentStats.fps.toFixed(1) : '—'}fps ${formatSize(agentStats.bandwidthBytesPerSec || 0)}/s${webrtcTitle}` : '';
 
 	return (
 		<DraggableModal
@@ -1450,7 +1573,7 @@ useEffect(() => {
 				style={{right:'171px'}}
 				className={`header-button ${controlEnabled ? 'active' : ''}`}
 				onClick={toggleControl}
-				disabled={policyState && policyState.inputEnabled === false}
+				disabled={controlDisabledByPolicy}
 			>
 				{controlEnabled ? i18n.t('DESKTOP.CONTROL_ON') || 'Control On' : i18n.t('DESKTOP.CONTROL_OFF') || 'Control Off'}
 			</Button>

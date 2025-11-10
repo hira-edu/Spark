@@ -417,12 +417,15 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 	fallbackCopy := make([]string, len(fallbacks))
 	copy(fallbackCopy, fallbacks)
 	preset := snapshotCapturePreset()
+	webrtcCaps := buildWebRTCCapabilities()
 	transports := []string{"ws-diff"}
 	if experimentalWebRTCEnabled() {
 		transports = append(transports, "webrtc")
 	}
 	features := []string{"diff-jpeg:v1", "metrics:v1", "input:v1"}
-	if experimentalWebRTCEnabled() {
+	if len(webrtcCaps) > 0 {
+		features = append(features, "webrtc:v1")
+	} else if experimentalWebRTCEnabled() {
 		features = append(features, "webrtc:v0")
 	}
 	caps := map[string]any{
@@ -471,7 +474,7 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 		caps["monitors"] = monitors
 		caps["selectedMonitor"] = int(displayIndex)
 	}
-	if webrtcCaps := buildWebRTCCapabilities(); len(webrtcCaps) > 0 {
+	if len(webrtcCaps) > 0 {
 		caps["webrtc"] = webrtcCaps
 	}
 	caps["quality"] = map[string]any{
@@ -485,15 +488,19 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 }
 
 func experimentalWebRTCEnabled() bool {
-	return strings.EqualFold(os.Getenv("SPARK_EXPERIMENTAL_WEBRTC"), "1")
+	return webrtcsvc.TransportEnabled()
 }
 
 func buildWebRTCCapabilities() map[string]any {
 	if !experimentalWebRTCEnabled() {
 		return nil
 	}
+	if caps := webrtcsvc.Instance().Capability(); len(caps) > 0 {
+		return caps
+	}
 	cfg := webrtcsvc.Instance().Configuration()
 	result := map[string]any{
+		"enabled":      true,
 		"dataChannels": []string{"spark-diff"},
 	}
 	if len(cfg.ICEServers) == 0 {
@@ -501,14 +508,17 @@ func buildWebRTCCapabilities() map[string]any {
 	}
 	servers := make([]map[string]any, 0, len(cfg.ICEServers))
 	for _, srv := range cfg.ICEServers {
+		if len(srv.URLs) == 0 {
+			continue
+		}
 		entry := map[string]any{
 			"urls": srv.URLs,
 		}
 		if srv.Username != "" {
 			entry["username"] = srv.Username
 		}
-		if srv.Credential != "" {
-			entry["credential"] = srv.Credential
+		if cred, ok := srv.Credential.(string); ok && cred != "" {
+			entry["credential"] = cred
 		}
 		servers = append(servers, entry)
 	}
@@ -611,6 +621,7 @@ func hookbridgeTelemetrySink(evt hookbridge.Event) {
 		if !ok {
 			return
 		}
+		autoEnforceNativePolicy(category)
 		alert := map[string]any{
 			"func":    funcName,
 			"pid":     evt.PID,
@@ -646,6 +657,29 @@ func hookbridgeTelemetrySink(evt hookbridge.Event) {
 	default:
 		hookBridgeLogger.Debugf("hookbridge event kind=%s pid=%d session=%d", evt.Kind, evt.PID, evt.SessionID)
 	}
+}
+
+func autoEnforceNativePolicy(category string) {
+	if category == "" {
+		return
+	}
+	if category != "input_block" && category != "display_protection" {
+		return
+	}
+	forceInput := true
+	forceCapture := true
+	forceInputPtr := &forceInput
+	forceCapturePtr := &forceCapture
+	sessions.IterCb(func(uuid string, desktop *session) bool {
+		if uuid == "" {
+			return true
+		}
+		if sessionPolicies.applyOverrides(uuid, forceInputPtr, forceCapturePtr) {
+			notifySessionPolicy(uuid)
+			hookBridgeLogger.Debugf("auto policy override category=%s session=%s", category, uuid)
+		}
+		return true
+	})
 }
 
 func resolveProcessIdentity(pid uint32) (winsession.Info, bool) {
@@ -812,7 +846,7 @@ func worker() {
 			if diff != nil && len(diff) > 0 {
 				prevDesktop = img
 				sendImageDiff(diff)
-				if experimentalWebRTCEnabled() {
+				if webrtcsvc.Instance().VideoReady() {
 					webrtcsvc.Instance().PublishFrame(img, cfg.FPS)
 				}
 			}
@@ -1793,6 +1827,9 @@ func monitorDesktopMetrics(desktop *session) {
 		}
 		if len(snap.lastError) > 0 {
 			payload[`lastError`] = snap.lastError
+		}
+		if webrtcStats, ok := webrtcsvc.Instance().Metrics(desktop.event); ok {
+			payload[`webrtc`] = webrtcStats
 		}
 		if common.WSConn == nil {
 			continue

@@ -33,6 +33,7 @@ type Manager struct {
 	defaultEncoder  blockEncoder
 	defaultEncoderN string
 	videoFactories  map[string]VideoFactory
+	preferredVideo  string
 }
 
 // Request describes a block encode request.
@@ -78,7 +79,7 @@ func (m *Manager) addCapability(cap Capability) {
 	m.caps = append(m.caps, cap)
 }
 
-func (m *Manager) registerVideoFactory(factory VideoFactory) {
+func (m *Manager) registerVideoFactory(factory VideoFactory, preferred bool) {
 	if m == nil || factory == nil {
 		return
 	}
@@ -91,6 +92,9 @@ func (m *Manager) registerVideoFactory(factory VideoFactory) {
 	}
 	m.videoFactories[cap.Name] = factory
 	m.addCapability(cap)
+	if preferred || m.preferredVideo == "" {
+		m.preferredVideo = cap.Name
+	}
 }
 
 // Instance returns the singleton encoder manager.
@@ -162,6 +166,16 @@ func (m *Manager) OpenVideoEncoder(name string, cfg VideoConfig) (VideoInstance,
 		return nil, fmt.Errorf("encoder: video encoder %s not registered", target)
 	}
 	return factory.Open(cfg)
+}
+
+func (m *Manager) preferredVideoEncoder() string {
+	if m == nil {
+		return defaultVideoEncoderName
+	}
+	if m.preferredVideo != "" {
+		return m.preferredVideo
+	}
+	return defaultVideoEncoderName
 }
 
 func enableExperimentalH264() bool {

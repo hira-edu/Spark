@@ -14,9 +14,9 @@ require (
 	github.com/kbinani/screenshot v0.0.0-20210720154843-7d3a670d8329
 	github.com/kirides/go-d3d v1.0.0
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
+	github.com/pion/webrtc/v3 v3.2.42
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil/v3 v3.22.2
-	github.com/pion/webrtc/v3 v3.2.42
 	golang.org/x/crypto v0.21.0
 	golang.org/x/sys v0.18.0
 )
@@ -33,6 +33,7 @@ require (
 	github.com/google/uuid v1.3.1 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/hraban/opus v0.0.0-20230925203106-0188a62cb302 // indirect
 	github.com/jezek/xgb v1.1.0 // indirect
 	github.com/kataras/pio v0.0.10 // indirect
 	github.com/leodido/go-urn v1.2.0 // indirect
@@ -40,6 +41,7 @@ require (
 	github.com/mattn/go-isatty v0.0.12 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/moutend/go-wca v0.3.0 // indirect
 	github.com/pion/datachannel v1.5.5 // indirect
 	github.com/pion/dtls/v2 v2.2.7 // indirect
 	github.com/pion/ice/v2 v2.3.24 // indirect
