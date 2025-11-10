@@ -6,25 +6,30 @@ import (
 	"Spark/client/common"
 	"Spark/client/config"
 	"Spark/client/internal/winsession"
+	"Spark/client/service/desktop/encoder"
 	"Spark/client/service/desktop/hookbridge"
+	webrtcsvc "Spark/client/service/desktop/webrtc"
 	"Spark/client/service/input"
 	"Spark/modules"
 	"Spark/utils"
 	"Spark/utils/cmap"
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/kataras/golog"
 	"github.com/kbinani/screenshot"
+	"golang.org/x/sys/windows"
 	"image"
-	"image/jpeg"
 	"os"
+	"os/exec"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -111,6 +116,7 @@ var prevDesktop *image.RGBA
 var displayBounds image.Rectangle
 var errNoImage = errors.New(`DESKTOP.NO_IMAGE_YET`)
 var hookBridgeLogger = golog.Child("[desktop-hookbridge]")
+var webrtcLogger = golog.Child("[desktop-webrtc]")
 var hookBridgeOnce sync.Once
 var hookBridgeErr error
 var agentSessionInfo winsession.Info
@@ -125,9 +131,19 @@ var clipboardLimiter struct {
 	lastPull time.Time
 }
 
+var clipboardPolicy = struct {
+	allowPush  bool
+	allowPull  bool
+	denyRegexp *regexp.Regexp
+}{
+	allowPush: true,
+	allowPull: true,
+}
+
 const (
 	minPointerInterval = 4 * time.Millisecond
 	clipboardCooldown  = 500 * time.Millisecond
+	processIdentityTTL = 30 * time.Second
 )
 
 var (
@@ -156,7 +172,31 @@ var (
 	}
 )
 
+var nativeCallAlerts = map[string]string{
+	"SetWindowDisplayAffinity":         "display_protection",
+	"NtUserSetWindowDisplayAffinity":   "display_protection",
+	"BlockInput":                       "input_block",
+	"NtUserBlockInput":                 "input_block",
+	"AttachThreadInput":                "input_block",
+	"NtUserAttachThreadInput":          "input_block",
+	"DirectInput::Acquire":             "input_block",
+	"DirectInput::SetCooperativeLevel": "input_block",
+	"SetWindowsHookExW":                "input_block",
+	"SetWindowsHookExA":                "input_block",
+}
+
+type processIdentityEntry struct {
+	info    winsession.Info
+	fetched time.Time
+}
+
+var (
+	processIdentityCache   = make(map[uint32]processIdentityEntry)
+	processIdentityCacheMu sync.RWMutex
+)
+
 func init() {
+	initClipboardPolicy()
 	initCapturePreset()
 	if runtime.GOOS != "windows" {
 		return
@@ -171,6 +211,33 @@ func init() {
 func newSessionMetrics() *sessionMetrics {
 	return &sessionMetrics{
 		intervalStart: time.Now(),
+	}
+}
+
+func initClipboardPolicy() {
+	clipboardPolicy.allowPush = readEnvBool("SPARK_CLIPBOARD_ALLOW_PUSH", true)
+	clipboardPolicy.allowPull = readEnvBool("SPARK_CLIPBOARD_ALLOW_PULL", true)
+	if pattern, ok := os.LookupEnv("SPARK_CLIPBOARD_DENY_REGEX"); ok && strings.TrimSpace(pattern) != "" {
+		if compiled, err := regexp.Compile(pattern); err == nil {
+			clipboardPolicy.denyRegexp = compiled
+		} else {
+			hookBridgeLogger.Warnf("clipboard deny regex invalid: %v", err)
+		}
+	}
+}
+
+func readEnvBool(key string, defaultVal bool) bool {
+	val, ok := os.LookupEnv(key)
+	if !ok {
+		return defaultVal
+	}
+	switch strings.ToLower(strings.TrimSpace(val)) {
+	case "0", "false", "no", "off":
+		return false
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return defaultVal
 	}
 }
 
@@ -350,6 +417,14 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 	fallbackCopy := make([]string, len(fallbacks))
 	copy(fallbackCopy, fallbacks)
 	preset := snapshotCapturePreset()
+	transports := []string{"ws-diff"}
+	if experimentalWebRTCEnabled() {
+		transports = append(transports, "webrtc")
+	}
+	features := []string{"diff-jpeg:v1", "metrics:v1", "input:v1"}
+	if experimentalWebRTCEnabled() {
+		features = append(features, "webrtc:v0")
+	}
 	caps := map[string]any{
 		"version":   capabilitySchemaVersion,
 		"timestamp": time.Now().UnixMilli(),
@@ -358,7 +433,7 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 			"arch":   runtime.GOARCH,
 			"commit": config.Commit,
 		},
-		"transports": []string{"ws-diff"},
+		"transports": transports,
 		"capture": map[string]any{
 			"primary":      primary,
 			"fallbacks":    fallbackCopy,
@@ -372,15 +447,13 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 				"height": displayBounds.Dy(),
 			},
 		},
-		"encoders": []map[string]any{
-			{
-				"name":     "jpeg-software",
-				"type":     "software-jpeg",
-				"quality":  imageQuality,
-				"lossless": false,
-			},
-		},
-		"features": []string{"diff-jpeg:v1", "metrics:v1", "input:v1"},
+		"encoders": encoderCapabilities(),
+		"features": features,
+	}
+	clipboardCaps := map[string]any{
+		"enabled":   input.ClipboardSupported(),
+		"allowPush": clipboardPolicy.allowPush && input.ClipboardSupported(),
+		"allowPull": clipboardPolicy.allowPull && input.ClipboardSupported(),
 	}
 	caps["input"] = map[string]any{
 		"pointer": map[string]any{
@@ -389,9 +462,7 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 		"keyboard": map[string]any{
 			"enabled": input.KeyboardEnabled(),
 		},
-		"clipboard": map[string]any{
-			"enabled": input.ClipboardSupported(),
-		},
+		"clipboard": clipboardCaps,
 	}
 	if meta := buildSessionMetadata(); meta != nil {
 		caps["session"] = meta
@@ -400,25 +471,51 @@ func buildDesktopCapabilities(connectionID string) map[string]any {
 		caps["monitors"] = monitors
 		caps["selectedMonitor"] = int(displayIndex)
 	}
+	if webrtcCaps := buildWebRTCCapabilities(); len(webrtcCaps) > 0 {
+		caps["webrtc"] = webrtcCaps
+	}
 	caps["quality"] = map[string]any{
 		`selected`:    preset.Key,
 		`presets`:     listCapturePresets(),
 		`jpegQuality`: preset.JPEGQuality,
 		`fps`:         preset.FPS,
 	}
-	policy := map[string]any{
-		"inputEnabled":  false,
-		"forceInput":    false,
-		"forceCapture":  false,
-		"connectionId":  connectionID,
-		"policyCreated": 0,
-		"policyUpdated": 0,
-	}
-	if state := sessionPolicies.describe(connectionID); len(state) > 0 {
-		policy = state
-	}
-	caps["policy"] = policy
+	caps["policy"] = sessionPolicies.describe(connectionID)
 	return caps
+}
+
+func experimentalWebRTCEnabled() bool {
+	return strings.EqualFold(os.Getenv("SPARK_EXPERIMENTAL_WEBRTC"), "1")
+}
+
+func buildWebRTCCapabilities() map[string]any {
+	if !experimentalWebRTCEnabled() {
+		return nil
+	}
+	cfg := webrtcsvc.Instance().Configuration()
+	result := map[string]any{
+		"dataChannels": []string{"spark-diff"},
+	}
+	if len(cfg.ICEServers) == 0 {
+		return result
+	}
+	servers := make([]map[string]any, 0, len(cfg.ICEServers))
+	for _, srv := range cfg.ICEServers {
+		entry := map[string]any{
+			"urls": srv.URLs,
+		}
+		if srv.Username != "" {
+			entry["username"] = srv.Username
+		}
+		if srv.Credential != "" {
+			entry["credential"] = srv.Credential
+		}
+		servers = append(servers, entry)
+	}
+	if len(servers) > 0 {
+		result["iceServers"] = servers
+	}
+	return result
 }
 
 func buildSessionMetadata() map[string]any {
@@ -438,6 +535,53 @@ func buildSessionMetadata() map[string]any {
 	return meta
 }
 
+func encoderCapabilities() []map[string]any {
+	capList := encoder.Instance().Capabilities()
+	if len(capList) == 0 {
+		return []map[string]any{
+			{
+				"name":     "jpeg-software",
+				"type":     "software-jpeg",
+				"quality":  imageQuality,
+				"lossless": false,
+			},
+		}
+	}
+	encoders := make([]map[string]any, 0, len(capList))
+	for _, cap := range capList {
+		entry := map[string]any{
+			"name":         cap.Name,
+			"type":         cap.Type,
+			"lossless":     cap.Lossless,
+			"hardware":     cap.Hardware,
+			"experimental": cap.Experimental,
+		}
+		if cap.Codec != "" {
+			entry["codec"] = cap.Codec
+		}
+		if cap.Description != "" {
+			entry["description"] = cap.Description
+		}
+		if cap.DefaultQuality > 0 {
+			entry["quality"] = cap.DefaultQuality
+		}
+		if cap.MaxWidth > 0 {
+			entry["maxWidth"] = cap.MaxWidth
+		}
+		if cap.MaxHeight > 0 {
+			entry["maxHeight"] = cap.MaxHeight
+		}
+		if cap.Disabled {
+			entry["disabled"] = true
+		}
+		if cap.DisabledReason != "" {
+			entry["disabledReason"] = cap.DisabledReason
+		}
+		encoders = append(encoders, entry)
+	}
+	return encoders
+}
+
 func ensureHookBridge() {
 	hookBridgeOnce.Do(func() {
 		cfg := hookbridge.Config{
@@ -452,11 +596,93 @@ func ensureHookBridge() {
 }
 
 func hookbridgeTelemetrySink(evt hookbridge.Event) {
-	hookBridgeLogger.Debugf("hookbridge event kind=%s pid=%d session=%d", evt.Kind, evt.PID, evt.SessionID)
+	switch evt.Kind {
+	case "policy_state":
+		forceInput := detailBool(evt.Details, "forceInput")
+		forceCapture := detailBool(evt.Details, "forceCapture")
+		if sessionPolicies.updateNative(forceInput, forceCapture) {
+			for _, id := range sessionPolicies.sessionIDs() {
+				notifySessionPolicy(id)
+			}
+		}
+	case "call":
+		funcName := detailString(evt.Details, "func")
+		category, messageText, severity, ok := nativeAlertMetadata(funcName)
+		if !ok {
+			return
+		}
+		alert := map[string]any{
+			"func":    funcName,
+			"pid":     evt.PID,
+			"session": evt.SessionID,
+			"source":  "umh",
+		}
+		if category != "" {
+			alert["category"] = category
+		}
+		if messageText != "" {
+			alert["message"] = messageText
+		}
+		if severity != "" {
+			alert["severity"] = severity
+		}
+		if evt.Details != nil {
+			if raw, ok := evt.Details["detail"]; ok {
+				alert["detail"] = raw
+			}
+		}
+		if info, ok := resolveProcessIdentity(evt.PID); ok {
+			if info.User != "" {
+				alert["user"] = info.User
+			}
+			if info.SID != "" {
+				alert["sid"] = info.SID
+			}
+			if info.SessionID != 0 && evt.SessionID == 0 {
+				alert["session"] = info.SessionID
+			}
+		}
+		broadcastPolicyAlert(alert)
+	default:
+		hookBridgeLogger.Debugf("hookbridge event kind=%s pid=%d session=%d", evt.Kind, evt.PID, evt.SessionID)
+	}
+}
+
+func resolveProcessIdentity(pid uint32) (winsession.Info, bool) {
+	if pid == 0 {
+		return winsession.Info{}, false
+	}
+	processIdentityCacheMu.RLock()
+	entry, ok := processIdentityCache[pid]
+	if ok && time.Since(entry.fetched) < processIdentityTTL {
+		processIdentityCacheMu.RUnlock()
+		return entry.info, hasProcessIdentity(entry.info)
+	}
+	processIdentityCacheMu.RUnlock()
+	info, err := winsession.QueryProcess(pid)
+	if err != nil {
+		hookBridgeLogger.Debugf("winsession query failed pid=%d: %v", pid, err)
+		info = winsession.Info{}
+	}
+	processIdentityCacheMu.Lock()
+	processIdentityCache[pid] = processIdentityEntry{
+		info:    info,
+		fetched: time.Now(),
+	}
+	processIdentityCacheMu.Unlock()
+	return info, hasProcessIdentity(info)
+}
+
+func hasProcessIdentity(info winsession.Info) bool {
+	return info.SessionID != 0 || info.SID != "" || info.User != ""
 }
 
 func registerSessionPolicy(uuid string) {
-	if !hookbridge.Enabled() || uuid == "" {
+	if uuid == "" {
+		return
+	}
+	if !hookbridge.Enabled() {
+		notifySessionPolicy(uuid)
 		return
 	}
 	policy := &hookbridge.Policy{
@@ -469,6 +695,8 @@ func registerSessionPolicy(uuid string) {
 	if err := hookbridge.ApplyPolicy(*policy); err != nil {
 		hookBridgeLogger.Debugf("hookbridge apply policy failed: %v", err)
 	}
+	sessionPolicies.touch(uuid)
+	notifySessionPolicy(uuid)
 }
 
 func unregisterSessionPolicy(uuid string) {
@@ -476,11 +704,31 @@ func unregisterSessionPolicy(uuid string) {
 		return
 	}
 	sessionPolicies.unregister(uuid)
-	// TODO: send explicit release signal when native bridge supports it
+	notifySessionPolicy(uuid)
 }
 
 func clearSessionPolicies() {
 	sessionPolicies.clear()
+}
+
+func notifySessionPolicy(uuid string) {
+	if uuid == "" || common.WSConn == nil {
+		return
+	}
+	sessionPolicies.touch(uuid)
+	desktop, ok := sessions.Get(uuid)
+	if !ok || desktop == nil || len(desktop.event) == 0 {
+		return
+	}
+	state := sessionPolicies.describe(uuid)
+	if len(state) == 0 {
+		return
+	}
+	_ = common.WSConn.SendPack(modules.Packet{
+		Act:   `DESKTOP_POLICY`,
+		Event: desktop.event,
+		Data:  state,
+	})
 }
 
 func detectCaptureStack() (string, []string, bool) {
@@ -564,6 +812,9 @@ func worker() {
 			if diff != nil && len(diff) > 0 {
 				prevDesktop = img
 				sendImageDiff(diff)
+				if experimentalWebRTCEnabled() {
+					webrtcsvc.Instance().PublishFrame(img, cfg.FPS)
+				}
 			}
 			<-time.After(delay)
 		}
@@ -652,6 +903,7 @@ func quitAllDesktop(info string) {
 	})
 	sessions.Clear()
 	clearSessionPolicies()
+	webrtcsvc.Instance().CloseAll()
 	lock.Lock()
 	working = false
 	lock.Unlock()
@@ -668,8 +920,12 @@ func imageCompare(img, prev *image.RGBA, compress int, cfg capturePreset) []*[]b
 		return result
 	}
 	for _, rect := range diff {
-		block := getImageBlock(img, rect, compress, quality)
-		block = makeImageBlock(block, rect, compress)
+		encoded, err := encodeBlock(img, rect, quality)
+		if err != nil {
+			recordEncoderError(err)
+			continue
+		}
+		block := makeImageBlock(encoded, rect, compress)
 		result = append(result, &block)
 	}
 	return result
@@ -689,42 +945,24 @@ func splitFullImage(img *image.RGBA, compress int, cfg capturePreset) []*[]byte 
 		for x := rect.Min.X; x < rect.Max.X; x += blockSize {
 			width := utils.If(x+blockSize > imgWidth, imgWidth-x, blockSize)
 			blockRect := image.Rect(x, y, x+width, y+height)
-			block := getImageBlock(img, blockRect, compress, quality)
-			block = makeImageBlock(block, blockRect, compress)
+			encoded, err := encodeBlock(img, blockRect, quality)
+			if err != nil {
+				recordEncoderError(err)
+				continue
+			}
+			block := makeImageBlock(encoded, blockRect, compress)
 			result = append(result, &block)
 		}
 	}
 	return result
 }
 
-func getImageBlock(img *image.RGBA, rect image.Rectangle, compress int, quality int) []byte {
-	width := rect.Dx()
-	height := rect.Dy()
-	buf := make([]byte, width*height*4)
-	bufPos := 0
-	imgPos := img.PixOffset(rect.Min.X, rect.Min.Y)
-	for y := 0; y < height; y++ {
-		copy(buf[bufPos:bufPos+width*4], img.Pix[imgPos:imgPos+width*4])
-		bufPos += width * 4
-		imgPos += img.Stride
-	}
-	switch compress {
-	case 0:
-		return buf
-	case 1:
-		subImg := &image.RGBA{
-			Pix:    buf,
-			Stride: width * 4,
-			Rect:   image.Rect(0, 0, width, height),
-		}
-		writer := &bytes.Buffer{}
-		if quality <= 0 {
-			quality = 70
-		}
-		jpeg.Encode(writer, subImg, &jpeg.Options{Quality: quality})
-		return writer.Bytes()
-	}
-	return nil
+func encodeBlock(img *image.RGBA, rect image.Rectangle, quality int) ([]byte, error) {
+	return encoder.Instance().Encode(encoder.Request{
+		Rect:    rect,
+		Frame:   img,
+		Quality: quality,
+	})
 }
 
 func makeImageBlock(block []byte, rect image.Rectangle, compress int) []byte {
@@ -879,8 +1117,9 @@ func KillDesktop(pack modules.Packet) {
 	if !ok {
 		return
 	}
-	sessions.Remove(uuid)
 	unregisterSessionPolicy(uuid)
+	webrtcsvc.Instance().CloseSession(uuid)
+	sessions.Remove(uuid)
 	data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`})
 	data = utils.XOR(data, common.WSConn.GetSecret())
 	common.WSConn.SendRawData(desktop.rawEvent, data, 20, 03)
@@ -959,32 +1198,6 @@ func SetMonitor(pack modules.Packet) {
 	_ = common.WSConn.SendPack(resp)
 }
 
-func SetQuality(pack modules.Packet) {
-	if common.WSConn == nil {
-		return
-	}
-	val, ok := pack.GetData(`preset`, reflect.String)
-	if !ok {
-		return
-	}
-	preset, err := applyCapturePreset(val.(string))
-	resp := modules.Packet{
-		Act:   `DESKTOP_SET_QUALITY`,
-		Event: pack.Event,
-		Data: map[string]any{
-			`selected`:    preset.Key,
-			`presets`:     listCapturePresets(),
-			`jpegQuality`: preset.JPEGQuality,
-			`fps`:         preset.FPS,
-		},
-	}
-	if err != nil {
-		resp.Code = 1
-		resp.Msg = err.Error()
-	}
-	_ = common.WSConn.SendPack(resp)
-}
-
 func HandleDesktopInput(pack modules.Packet) {
 	payload, ok := pack.Data[`payload`]
 	if !ok {
@@ -1007,6 +1220,12 @@ func HandleDesktopInput(pack modules.Packet) {
 		if val, ok := body[`button`].(float64); ok {
 			evt.Button = int(val)
 		}
+		if val, ok := body[`buttons`].(float64); ok {
+			evt.Buttons = int(val)
+		}
+		if val, ok := body[`clicks`].(float64); ok {
+			evt.Clicks = int(val)
+		}
 		if val, ok := body[`deltaY`].(float64); ok {
 			evt.DeltaY = int(val)
 		}
@@ -1016,6 +1235,10 @@ func HandleDesktopInput(pack modules.Packet) {
 		if val, ok := body[`y`].(float64); ok {
 			evt.Y = int(val)
 		}
+		evt.Alt = boolFromAny(body[`altKey`])
+		evt.Ctrl = boolFromAny(body[`ctrlKey`])
+		evt.Shift = boolFromAny(body[`shiftKey`])
+		evt.Meta = boolFromAny(body[`metaKey`])
 		if len(evt.Action) == 0 {
 			return
 		}
@@ -1063,10 +1286,149 @@ func HandleDesktopInput(pack modules.Packet) {
 	}
 }
 
+func HandleWebRTCSignal(pack modules.Packet) {
+	if common.WSConn == nil {
+		return
+	}
+	desktopID := extractDesktopID(pack)
+	kindVal, _ := pack.Data[`kind`].(string)
+	kindTrimmed := strings.TrimSpace(kindVal)
+	kindForUnsupported := kindTrimmed
+	if kindForUnsupported == "" {
+		kindForUnsupported = "offer"
+	}
+	if !experimentalWebRTCEnabled() {
+		webrtcLogger.Infof("ignoring webrtc signal (feature disabled) desktop=%s kind=%s", desktopID, kindForUnsupported)
+		sendWebRTCUnsupported(pack.Event, desktopID, kindForUnsupported)
+		return
+	}
+	if desktopID == "" || kindTrimmed == "" {
+		sendWebRTCError(pack.Event, desktopID, `${i18n|COMMON.INVALID_PARAMETER}`)
+		return
+	}
+	payload, _ := pack.Data[`payload`].(map[string]any)
+	kind := webrtcsvc.SignalKind(strings.ToLower(kindTrimmed))
+	sender := func(kind webrtcsvc.SignalKind, payload map[string]any) error {
+		return sendWebRTCSignal(pack.Event, desktopID, string(kind), payload)
+	}
+	if err := webrtcsvc.Instance().HandleSignal(desktopID, pack.Event, kind, payload, sender); err != nil {
+		webrtcLogger.Warnf("webrtc signal failed desktop=%s kind=%s: %v", desktopID, kind, err)
+		sendWebRTCError(pack.Event, desktopID, err.Error())
+		return
+	}
+	webrtcLogger.Debugf("webrtc signal handled desktop=%s kind=%s", desktopID, kind)
+}
+
+func extractDesktopID(pack modules.Packet) string {
+	if pack.Data == nil {
+		return ""
+	}
+	if val, ok := pack.GetData(`desktop`, reflect.String); ok {
+		if id, ok := val.(string); ok {
+			return id
+		}
+	}
+	if id, ok := pack.Data[`desktop`].(string); ok {
+		return id
+	}
+	return ""
+}
+
+func sendWebRTCSignal(event, desktopID, kind string, payload map[string]any) error {
+	if common.WSConn == nil {
+		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
+	}
+	if event == "" {
+		event = desktopID
+	}
+	data := map[string]any{
+		`desktop`: desktopID,
+		`kind`:    kind,
+		`origin`:  `agent`,
+	}
+	if payload != nil && len(payload) > 0 {
+		data[`payload`] = payload
+	}
+	packet := modules.Packet{
+		Act:   `DESKTOP_WEBRTC_SIGNAL`,
+		Event: event,
+		Code:  0,
+		Data:  data,
+	}
+	return common.WSConn.SendPack(packet)
+}
+
+func sendWebRTCError(event, desktopID, msg string) {
+	if common.WSConn == nil {
+		return
+	}
+	if event == "" {
+		event = desktopID
+	}
+	packet := modules.Packet{
+		Act:   `DESKTOP_WEBRTC_SIGNAL`,
+		Event: event,
+		Code:  1,
+		Msg:   msg,
+		Data: map[string]any{
+			`desktop`: desktopID,
+		},
+	}
+	if err := common.WSConn.SendPack(packet); err != nil {
+		webrtcLogger.Debugf("failed to send webrtc error: %v", err)
+	}
+}
+
+func sendWebRTCUnsupported(event, desktopID, kind string) {
+	if err := sendWebRTCSignal(event, desktopID, kind, map[string]any{
+		`status`: `unsupported`,
+	}); err != nil {
+		webrtcLogger.Debugf("failed to send webrtc unsupported notice: %v", err)
+	}
+}
+
+func broadcastWebRTCFrame(desktopID string, payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	if err := webrtcsvc.Instance().SendDiffFrame(desktopID, payload); err != nil && err != webrtcsvc.ErrDataChannelUnavailable {
+		webrtcLogger.Debugf("webrtc frame drop desktop=%s: %v", desktopID, err)
+	}
+}
+
+func HandleControlEvent(pack modules.Packet) {
+	enabled, ok := pack.GetData(`enabled`, reflect.Bool)
+	if !ok {
+		return
+	}
+	if desktopID, ok := pack.GetData(`desktop`, reflect.String); ok {
+		hookBridgeLogger.Infof("desktop control state desktop=%s enabled=%t", desktopID, enabled)
+	}
+}
+
+func SecureHotkey(pack modules.Packet) {
+	sequenceRaw, ok := pack.GetData(`sequence`, reflect.String)
+	if !ok {
+		sendSecureHotkeyResponse(pack.Event, ``, 1, `${i18n|COMMON.INVALID_PARAMETER}`)
+		return
+	}
+	sequence := strings.ToUpper(strings.TrimSpace(sequenceRaw.(string)))
+	if len(sequence) == 0 {
+		sendSecureHotkeyResponse(pack.Event, ``, 1, `${i18n|COMMON.INVALID_PARAMETER}`)
+		return
+	}
+	if err := triggerSecureHotkey(sequence); err != nil {
+		hookBridgeLogger.Debugf("secure hotkey %s failed: %v", sequence, err)
+		sendSecureHotkeyResponse(pack.Event, sequence, 1, err.Error())
+		return
+	}
+	sendSecureHotkeyResponse(pack.Event, sequence, 0, ``)
+}
+
 func SetQuality(pack modules.Packet) {
 	key, ok := pack.GetData(`preset`, reflect.String)
 	if !ok {
-		sendQualityResponse(1, `${i18n|COMMON.INVALID_PARAMETER}`, nil)
+		sendQualityResponse(pack.Event, 1, `${i18n|COMMON.INVALID_PARAMETER}`, nil)
 		return
 	}
 	preset, err := applyCapturePreset(key.(string))
@@ -1078,44 +1440,208 @@ func SetQuality(pack modules.Packet) {
 		`timestamp`:   time.Now().UnixMilli(),
 	}
 	if err != nil {
-		sendQualityResponse(1, err.Error(), payload)
+		sendQualityResponse(pack.Event, 1, err.Error(), payload)
 		return
 	}
-	sendQualityResponse(0, ``, payload)
+	sendQualityResponse(pack.Event, 0, ``, payload)
 }
 
-func sendQualityResponse(code int, msg string, data map[string]any) {
+func sendQualityResponse(event string, code int, msg string, data map[string]any) {
 	if common.WSConn == nil {
 		return
 	}
 	resp := modules.Packet{
-		Act:  `DESKTOP_SET_QUALITY`,
-		Code: code,
-		Msg:  msg,
-		Data: data,
+		Act:   `DESKTOP_SET_QUALITY`,
+		Event: event,
+		Code:  code,
+		Msg:   msg,
+		Data:  data,
 	}
 	_ = common.WSConn.SendPack(resp)
 }
 
+func HandlePolicyForce(pack modules.Packet) {
+	uuid := pack.Event
+	resp := modules.Packet{
+		Act:   `DESKTOP_POLICY_FORCE`,
+		Event: uuid,
+	}
+	if uuid == "" {
+		resp.Code = 1
+		resp.Msg = "desktop: missing session"
+		sendDesktopResponse(resp)
+		return
+	}
+	var (
+		forceInput, hasInput     = parseOptionalBool(pack.Data["forceInput"])
+		forceCapture, hasCapture = parseOptionalBool(pack.Data["forceCapture"])
+	)
+	if !hasInput && !hasCapture {
+		resp.Code = 1
+		resp.Msg = "desktop: no overrides provided"
+		sendDesktopResponse(resp)
+		return
+	}
+	var inputPtr, capturePtr *bool
+	if hasInput {
+		inputPtr = &forceInput
+	}
+	if hasCapture {
+		capturePtr = &forceCapture
+	}
+	if !sessionPolicies.applyOverrides(uuid, inputPtr, capturePtr) {
+		resp.Code = 1
+		resp.Msg = "desktop: policy unchanged or session missing"
+		sendDesktopResponse(resp)
+		return
+	}
+	notifySessionPolicy(uuid)
+	resp.Data = map[string]any{
+		`forceInput`:   inputPtr != nil && *inputPtr,
+		`forceCapture`: capturePtr != nil && *capturePtr,
+	}
+	sendDesktopResponse(resp)
+}
+
+func sendDesktopResponse(pack modules.Packet) {
+	if common.WSConn == nil {
+		return
+	}
+	_ = common.WSConn.SendPack(pack)
+}
+
+func broadcastPolicyAlert(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	ts := time.Now().UnixMilli()
+	sessions.IterCb(func(uuid string, desktop *session) bool {
+		if desktop == nil || len(desktop.event) == 0 {
+			return true
+		}
+		data := cloneMap(payload)
+		if _, ok := data["timestamp"]; !ok {
+			data["timestamp"] = ts
+		}
+		data["desktop"] = uuid
+		if common.WSConn != nil {
+			_ = common.WSConn.SendPack(modules.Packet{
+				Act:   `DESKTOP_POLICY_ALERT`,
+				Event: desktop.event,
+				Data:  data,
+			})
+		}
+		return true
+	})
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func detailBool(details map[string]any, key string) bool {
+	if details == nil {
+		return false
+	}
+	if v, ok := details[key]; ok {
+		switch val := v.(type) {
+		case bool:
+			return val
+		case string:
+			b, err := strconv.ParseBool(val)
+			return err == nil && b
+		case float64:
+			return val != 0
+		}
+	}
+	return false
+}
+
+func detailString(details map[string]any, key string) string {
+	if details == nil {
+		return ""
+	}
+	if v, ok := details[key]; ok {
+		return fmt.Sprintf("%v", v)
+	}
+	return ""
+}
+
+func isSensitiveNativeCall(name string) bool {
+	_, ok := nativeCallAlerts[name]
+	return ok
+}
+
+func nativeAlertMetadata(funcName string) (category string, message string, severity string, ok bool) {
+	if funcName == "" {
+		return "", "", "", false
+	}
+	category, ok = nativeCallAlerts[funcName]
+	if !ok {
+		return "", "", "", false
+	}
+	switch category {
+	case "display_protection":
+		message = fmt.Sprintf("%s attempted to hide the desktop (display protection).", funcName)
+		severity = "warning"
+	case "input_block":
+		message = fmt.Sprintf("%s attempted to block remote input.", funcName)
+		severity = "error"
+	default:
+		message = fmt.Sprintf("%s triggered a native policy alert.", funcName)
+		severity = "warning"
+	}
+	return category, message, severity, true
+}
+
+func parseOptionalBool(value any) (bool, bool) {
+	switch v := value.(type) {
+	case bool:
+		return v, true
+	case string:
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed, true
+		}
+	case float64:
+		return v != 0, true
+	}
+	return false, false
+}
+
 func ClipboardPush(pack modules.Packet) {
 	if !input.ClipboardSupported() {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_UNSUPPORTED}`, nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_UNSUPPORTED}`, nil)
+		return
+	}
+	if !clipboardPolicy.allowPush {
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_PUSH_DISABLED}`, nil)
 		return
 	}
 	text, ok := pack.GetData(`text`, reflect.String)
 	if !ok {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|COMMON.INVALID_PARAMETER}`, nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|COMMON.INVALID_PARAMETER}`, nil)
+		return
+	}
+	if err := clipboardAllowedText(text.(string)); err != nil {
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
 		return
 	}
 	if !allowClipboardOp(true) {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_RATE_LIMIT}`, nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_RATE_LIMIT}`, nil)
 		return
 	}
 	err := input.WriteClipboardText(text.(string))
 	if err != nil {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
 	} else {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 0, ``, map[string]any{
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 0, ``, map[string]any{
 			`direction`: `push`,
 			`timestamp`: time.Now().UnixMilli(),
 		})
@@ -1124,35 +1650,123 @@ func ClipboardPush(pack modules.Packet) {
 
 func ClipboardPull(pack modules.Packet) {
 	if !input.ClipboardSupported() {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_UNSUPPORTED}`, nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_UNSUPPORTED}`, nil)
+		return
+	}
+	if !clipboardPolicy.allowPull {
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_PULL_DISABLED}`, nil)
 		return
 	}
 	if !allowClipboardOp(false) {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_RATE_LIMIT}`, nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, `${i18n|DESKTOP.CLIPBOARD_RATE_LIMIT}`, nil)
 		return
 	}
 	text, err := input.ReadClipboardText()
 	if err != nil {
-		sendClipboardResponse(`DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
 		return
 	}
-	sendClipboardResponse(`DESKTOP_CLIPBOARD_DATA`, 0, ``, map[string]any{
+	if err := clipboardAllowedText(text); err != nil {
+		sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_RESULT`, 1, err.Error(), nil)
+		return
+	}
+	sendClipboardResponse(pack.Event, `DESKTOP_CLIPBOARD_DATA`, 0, ``, map[string]any{
 		`text`:      text,
 		`timestamp`: time.Now().UnixMilli(),
 	})
 }
 
-func sendClipboardResponse(act string, code int, msg string, data map[string]any) {
+func sendClipboardResponse(event, act string, code int, msg string, data map[string]any) {
 	if common.WSConn == nil {
 		return
 	}
 	resp := modules.Packet{
-		Act:  act,
-		Code: code,
-		Msg:  msg,
-		Data: data,
+		Act:   act,
+		Event: event,
+		Code:  code,
+		Msg:   msg,
+		Data:  data,
 	}
 	_ = common.WSConn.SendPack(resp)
+}
+
+func clipboardAllowedText(text string) error {
+	if clipboardPolicy.denyRegexp == nil {
+		return nil
+	}
+	if clipboardPolicy.denyRegexp.MatchString(text) {
+		return fmt.Errorf(`${i18n|DESKTOP.CLIPBOARD_BLOCKED}`)
+	}
+	return nil
+}
+
+func sendSecureHotkeyResponse(event string, sequence string, code int, msg string) {
+	if common.WSConn == nil {
+		return
+	}
+	data := map[string]any{
+		`sequence`:  sequence,
+		`timestamp`: time.Now().UnixMilli(),
+	}
+	resp := modules.Packet{
+		Act:   `DESKTOP_SECURE_HOTKEY`,
+		Event: event,
+		Code:  code,
+		Msg:   msg,
+		Data:  data,
+	}
+	_ = common.WSConn.SendPack(resp)
+}
+
+func triggerSecureHotkey(seq string) error {
+	switch strings.ToUpper(seq) {
+	case `CTRL_ALT_DEL`:
+		return sendSecureAttentionSequence()
+	case `WIN_L`:
+		return lockRemoteWorkstation()
+	case `CTRL_SHIFT_ESC`:
+		return launchTaskManager()
+	default:
+		return fmt.Errorf("desktop: secure hotkey %s unsupported", seq)
+	}
+}
+
+func sendSecureAttentionSequence() error {
+	sasDLL := windows.NewLazySystemDLL("sas.dll")
+	proc := sasDLL.NewProc("SendSAS")
+	if err := proc.Find(); err != nil {
+		return fmt.Errorf("desktop: secure Ctrl+Alt+Del unavailable (%w)", err)
+	}
+	r, _, err := proc.Call(1)
+	if r == 0 {
+		if err != syscall.Errno(0) {
+			return err
+		}
+		return fmt.Errorf("desktop: secure Ctrl+Alt+Del failed")
+	}
+	return nil
+}
+
+func lockRemoteWorkstation() error {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	proc := user32.NewProc("LockWorkStation")
+	if err := proc.Find(); err != nil {
+		return fmt.Errorf("desktop: Win+L unavailable (%w)", err)
+	}
+	r, _, err := proc.Call()
+	if r == 0 {
+		if err != syscall.Errno(0) {
+			return err
+		}
+		return fmt.Errorf("desktop: LockWorkStation failed")
+	}
+	return nil
+}
+
+func launchTaskManager() error {
+	cmd := exec.Command("taskmgr.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return cmd.Start()
 }
 
 func monitorDesktopMetrics(desktop *session) {
@@ -1201,8 +1815,9 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				data = utils.XOR(data, common.WSConn.GetSecret())
 				common.WSConn.SendRawData(desktop.rawEvent, data, 20, 03)
 				desktop.escape = true
-				sessions.Remove(uuid)
 				unregisterSessionPolicy(uuid)
+				webrtcsvc.Instance().CloseSession(uuid)
+				sessions.Remove(uuid)
 				break
 			}
 			// send image
@@ -1210,6 +1825,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				buf := append([]byte{34, 22, 19, 17, 20, 00}, desktop.rawEvent...)
 				for _, slice := range *msg.frame {
 					if len(buf)+len(*slice) >= common.MaxMessageSize {
+						broadcastWebRTCFrame(uuid, buf)
 						if common.WSConn.SendData(buf) != nil {
 							break
 						}
@@ -1217,6 +1833,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 					}
 					buf = append(buf, *slice...)
 				}
+				broadcastWebRTCFrame(uuid, buf)
 				common.WSConn.SendData(buf)
 				buf = nil
 				continue
@@ -1229,6 +1846,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				binary.BigEndian.PutUint16(data[2:4], uint16(displayBounds.Dx()))
 				binary.BigEndian.PutUint16(data[4:6], uint16(displayBounds.Dy()))
 				buf = append(buf, data...)
+				broadcastWebRTCFrame(uuid, buf)
 				common.WSConn.SendData(buf)
 				continue
 			}
@@ -1252,6 +1870,7 @@ func healthCheck() {
 		})
 		for _, key := range keys {
 			unregisterSessionPolicy(key)
+			webrtcsvc.Instance().CloseSession(key)
 		}
 		sessions.Remove(keys...)
 	}

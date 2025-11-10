@@ -952,6 +952,47 @@ DWORD WINAPI TelemetryPipeServer(LPVOID) {
     return 0;
 }
 
+#ifdef SPARK_UMH_STATIC_BUILD
+extern "C" void sparkHookbridgeEmit(const char* kind, const char* detail, uint32_t pid, uint32_t sessionId);
+
+static std::string EscapeJson(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char c : value) {
+        switch (c) {
+        case '\\': escaped += "\\\\"; break;
+        case '"': escaped += "\\\""; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': escaped += "\\r"; break;
+        case '\t': escaped += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[7];
+                _snprintf_s(buf, _countof(buf), _TRUNCATE, "\\u%04X", static_cast<unsigned char>(c));
+                escaped += buf;
+            } else {
+                escaped += c;
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+static void EmitHookbridgeEvent(const std::string& event,
+                                const std::string& func,
+                                const std::string& details) {
+    DWORD sessionId = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+    std::string payload = "{\"func\":\"" + EscapeJson(func) + "\"";
+    if (!details.empty()) {
+        payload += ",\"detail\":\"" + EscapeJson(details) + "\"";
+    }
+    payload += "}";
+    sparkHookbridgeEmit(event.c_str(), payload.c_str(), GetCurrentProcessId(), sessionId);
+}
+#endif
+
 void LogStructured(const std::string& event,
                    const std::string& func,
                    const std::string& details = std::string()) {
@@ -964,6 +1005,9 @@ void LogStructured(const std::string& event,
         line << " " << details;
     }
     LogMessage(line.str());
+#ifdef SPARK_UMH_STATIC_BUILD
+    EmitHookbridgeEvent(event, func, details);
+#endif
 }
 
 void ApplyPolicyOverride(std::atomic<int>& storage,
@@ -2666,6 +2710,5 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
     return TRUE;
 }
-
 
 

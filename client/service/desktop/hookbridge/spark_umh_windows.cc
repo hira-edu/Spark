@@ -1,42 +1,32 @@
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 
-#include "spark_umh.h"
+#define SPARK_UMH_STATIC_BUILD
+#define NOMINMAX
+
+#include "../../../native/umh/src/dxhooks_stub.cc"
+#include "../../../native/umh/src/vkhooks_stub.cc"
+#include "../../../native/umh/src/openxr_hooks_stub.cc"
+#include "../../../native/umh/src/antidetection_stub.cc"
 
 extern "C" {
-
-static BOOL CALLBACK SparkEnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    (void)lParam;
-    if (IsWindow(hwnd)) {
-        SetWindowDisplayAffinity(hwnd, WDA_NONE);
-    }
-    return TRUE;
+#include "../../../native/umh/vendor/third_party/minhook/src/buffer.c"
+#include "../../../native/umh/vendor/third_party/minhook/src/hde/hde32.c"
+#include "../../../native/umh/vendor/third_party/minhook/src/hde/hde64.c"
+#include "../../../native/umh/vendor/third_party/minhook/src/hook.c"
+#include "../../../native/umh/vendor/third_party/minhook/src/trampoline.c"
 }
 
-int spark_umh_init(void) {
-    return 0;
-}
+#include "../../../native/umh/vendor/src/Config.cpp"
+#include "../../../native/umh/vendor/src/ProcessTargets.cpp"
+#include "../../../native/umh/vendor/src/Policy.cpp"
+#include "../../../native/umh/vendor/src/SelfProtection.cpp"
+#include "../../../native/umh/vendor/src/DirectSyscall.cpp"
+#include "../../../native/umh/vendor/src/HookEngine.cpp"
+#include "../../../native/umh/vendor/src/MultiLayerHook.cpp"
+#include "../../../native/umh/vendor/src/MinHookWrapper.cpp"
+#include "../../../native/umh/vendor/src/HookDLL.cpp"
 
-int spark_umh_apply(const char *connection_id, int force_input, int force_capture) {
-    (void)connection_id;
-    EnumWindows(SparkEnumWindowsProc, 0);
-    if (force_input) {
-        BlockInput(FALSE);
-    }
-    if (force_capture) {
-        // Placeholder for future capture enforcement (e.g., DXGI hooks)
-    }
-    return 0;
-}
+#include "../../../native/umh/src/bridge.cc"
 
-int spark_umh_release(const char *connection_id) {
-    (void)connection_id;
-    return 0;
-}
+#endif  // _WIN32
 
-void spark_umh_shutdown(void) {}
-
-}  // extern "C"
-
-#endif

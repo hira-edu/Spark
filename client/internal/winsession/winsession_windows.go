@@ -4,6 +4,7 @@ package winsession
 
 import (
 	"fmt"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -42,7 +43,7 @@ func QueryProcess(pid uint32) (Info, error) {
 		return info, fmt.Errorf("winsession: missing SID for pid %d", pid)
 	}
 	sid := tokenUser.User.Sid
-	info.SID, _ = sid.String()
+	info.SID = sidString(sid)
 	info.User = lookupAccount(sid)
 	return info, nil
 }
@@ -56,7 +57,7 @@ func lookupAccount(sid *windows.SID) string {
 	if sid == nil {
 		return ""
 	}
-	sidStr, _ := sid.String()
+	sidStr := sidString(sid)
 	var (
 		nameLen   uint32
 		domainLen uint32
@@ -73,4 +74,24 @@ func lookupAccount(sid *windows.SID) string {
 		return sidStr
 	}
 	return fmt.Sprintf("%s\\%s", windows.UTF16ToString(domain), windows.UTF16ToString(name))
+}
+
+func sidString(sid *windows.SID) string {
+	if sid == nil {
+		return ""
+	}
+	if stringer, ok := interface{}(sid).(interface{ String() string }); ok {
+		return stringer.String()
+	}
+	if stringer, ok := interface{}(sid).(interface{ String() (string, error) }); ok {
+		if s, err := stringer.String(); err == nil {
+			return s
+		}
+	}
+	var ptr *uint16
+	if err := windows.ConvertSidToStringSid(sid, &ptr); err != nil || ptr == nil {
+		return ""
+	}
+	defer windows.LocalFree(windows.Handle(unsafe.Pointer(ptr)))
+	return windows.UTF16PtrToString(ptr)
 }

@@ -46,8 +46,12 @@ var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
 	`DESKTOP_SET_MONITOR`:    setDesktopMonitor,
 	`DESKTOP_SET_QUALITY`:    setDesktopQuality,
 	`DESKTOP_INPUT`:          desktopInput,
+	`DESKTOP_CONTROL`:        desktopControl,
+	`DESKTOP_SECURE_HOTKEY`:  desktopSecureHotkey,
 	`DESKTOP_CLIPBOARD_PUSH`: desktopClipboardPush,
 	`DESKTOP_CLIPBOARD_PULL`: desktopClipboardPull,
+	`DESKTOP_POLICY_FORCE`:   desktop.HandlePolicyForce,
+	`DESKTOP_WEBRTC_SIGNAL`:  desktopWebRTCSignal,
 	`COMMAND_EXEC`:           execCommand,
 }
 
@@ -362,12 +366,23 @@ func desktopInput(pack modules.Packet, wsConn *common.Conn) {
 	desktop.HandleDesktopInput(pack)
 }
 
+func desktopControl(pack modules.Packet, wsConn *common.Conn) {
+	desktop.HandleControlEvent(pack)
+}
+func desktopSecureHotkey(pack modules.Packet, wsConn *common.Conn) {
+	desktop.SecureHotkey(pack)
+}
+
 func desktopClipboardPush(pack modules.Packet, wsConn *common.Conn) {
 	desktop.ClipboardPush(pack)
 }
 
 func desktopClipboardPull(pack modules.Packet, wsConn *common.Conn) {
 	desktop.ClipboardPull(pack)
+}
+
+func desktopWebRTCSignal(pack modules.Packet, wsConn *common.Conn) {
+	desktop.HandleWebRTCSignal(pack)
 }
 
 func execCommand(pack modules.Packet, wsConn *common.Conn) {

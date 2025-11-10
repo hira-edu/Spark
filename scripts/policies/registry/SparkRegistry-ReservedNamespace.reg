@@ -1,0 +1,6 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Spark]
+"InstallPath"="C:\\ProgramData\\Spark"
+"Version"="0.0.0"
+"ConfigChecksum"="00000000000000000000000000000000"

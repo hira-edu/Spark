@@ -31,3 +31,9 @@ func HandleDesktopInput(pack modules.Packet) {}
 func ClipboardPush(pack modules.Packet) {}
 
 func ClipboardPull(pack modules.Packet) {}
+
+func HandleWebRTCSignal(pack modules.Packet) {}
+
+func SecureHotkey(pack modules.Packet) {}
+
+func HandlePolicyForce(pack modules.Packet) {}

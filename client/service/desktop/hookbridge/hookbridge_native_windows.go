@@ -3,15 +3,17 @@
 package hookbridge
 
 /*
-#cgo windows CFLAGS: -I${SRCDIR}/../../native/umh/include -I${SRCDIR}/../../native/umh/vendor/include
-#cgo windows CXXFLAGS: -std=c++17 -DNOMINMAX -DUNICODE -D_UNICODE -I${SRCDIR}/../../native/umh/include -I${SRCDIR}/../../native/umh/vendor/include -I${SRCDIR}/../../native/umh/vendor/third_party/minhook/include
-#cgo windows LDFLAGS: -luser32 -lgdi32
+#cgo windows CFLAGS: -DNOMINMAX -DUNICODE -D_UNICODE -guard:cf -MT -I${SRCDIR}/../../../native/umh/include -I${SRCDIR}/../../../native/umh/vendor/include -I${SRCDIR}/../../../native/umh/vendor/third_party/minhook/include
+#cgo windows CXXFLAGS: -std:c++17 -DNOMINMAX -DUNICODE -D_UNICODE -guard:cf -MT -I${SRCDIR}/../../../native/umh/include -I${SRCDIR}/../../../native/umh/vendor/include -I${SRCDIR}/../../../native/umh/vendor/third_party/minhook/include
+#cgo windows LDFLAGS: -luser32 -lgdi32 -ladvapi32 -lbcrypt -ldinput8 -ldxguid -ldbghelp -lpsapi -lshlwapi -lwtsapi32 -lntdll -lole32 -guard:cf
 #include <stdlib.h>
 #include "spark_umh.h"
 */
 import "C"
 import (
+	"encoding/json"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -50,4 +52,29 @@ func nativeRelease(connectionID string) error {
 
 func nativeShutdown() {
 	C.spark_umh_shutdown()
+}
+
+//export sparkHookbridgeEmit
+func sparkHookbridgeEmit(kind *C.char, detail *C.char, pid C.uint, session C.uint) {
+	if kind == nil {
+		return
+	}
+	event := Event{
+		Kind:       C.GoString(kind),
+		PID:        uint32(pid),
+		SessionID:  uint32(session),
+		RecordedAt: time.Now(),
+	}
+	if detail != nil {
+		raw := C.GoString(detail)
+		if len(raw) > 0 {
+			var parsed map[string]any
+			if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+				event.Details = parsed
+			} else {
+				event.Details = map[string]any{"raw": raw}
+			}
+		}
+	}
+	dispatchEvent(event)
 }

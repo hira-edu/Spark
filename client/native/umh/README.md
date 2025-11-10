@@ -11,10 +11,16 @@ code that exposes them to Go via cgo.
 - `vendor/include`, `vendor/src`, `vendor/third_party/minhook` – Files copied
   from https://github.com/hira-edu/UserModeHook (MIT). They retain upstream
   license headers and are kept in sync as we upgrade UMH.
-- `src/spark_umh_windows.c` – Interim bridge that disables
+- `src/bridge.cc` – Shared C++ bridge (included by the Go cgo package) that
+  currently disables `SetWindowDisplayAffinity` and clears `BlockInput`, and will
+  evolve into the real UMH runtime glue as we start compiling the vendored
+  sources in-tree.
   `SetWindowDisplayAffinity` and clears `BlockInput` using plain User32 calls.
   Replace this with the real UMH entry points as soon as we finish wiring the
   vendored sources.
+- `MINIMAL_SOURCESET.md` – Snapshot of the exact UMH translation units we need
+  for the first enforcement milestone (SetWindowDisplayAffinity + BlockInput),
+  plus the build flags required to keep them service-safe.
 
 ## Syncing UMH
 
@@ -30,5 +36,6 @@ code that exposes them to Go via cgo.
 
 The Go bridge compiles these sources via cgo when the `windows` build tag is
 active. The final integration will: (a) compile the real UMH C++ files instead
-of `spark_umh_windows.c`, and (b) add the necessary CXXFLAGS/LDFLAGS so MSVC can
-produce a statically linked object inside the Spark executable.
+of the current stub in `src/bridge.cc`, and (b) add the necessary
+CXXFLAGS/LDFLAGS so MSVC can produce a statically linked object inside the
+Spark executable.

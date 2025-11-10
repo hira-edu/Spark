@@ -6,21 +6,38 @@ import (
 	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/melody"
+	"crypto/sha256"
 	"encoding/hex"
 	"github.com/gin-gonic/gin"
 	"math"
 	"net/http"
 	"reflect"
+	"strings"
+	"sync"
+	"time"
 )
 
 type desktop struct {
-	uuid       string
-	device     string
-	srcConn    *melody.Session
-	deviceConn *melody.Session
-	caps       map[string]any
-	metrics    map[string]any
+	uuid          string
+	device        string
+	srcConn       *melody.Session
+	deviceConn    *melody.Session
+	caps          map[string]any
+	metrics       map[string]any
+	inputLimiter  *rateLimiter
+	inputStats    inputStats
+	inputJournal  []inputDigest
+	hotkeyLimiter *rateLimiter
 }
+
+const (
+	inputRateLimitPerWindow = 600
+	inputRateWindow         = time.Second
+	inputAuditInterval      = 5 * time.Second
+	inputJournalLimit       = 500
+	hotkeyLimitPerWindow    = 3
+	hotkeyRateWindow        = 10 * time.Second
+)
 
 var desktopSessions = melody.New()
 
@@ -112,6 +129,7 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			if len(pack.Msg) > 0 {
 				msg = pack.Msg
 			}
+			flushInputJournal(desktop)
 			sendPack(modules.Packet{Act: `QUIT`, Msg: msg}, desktop.srcConn)
 			common.RemoveEvent(desktop.uuid)
 			desktop.srcConn.Close()
@@ -120,7 +138,7 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			})
 		case `DESKTOP_CAPS`:
 			desktop.caps = pack.Data
-			sendPack(modules.Packet{Act: `DESKTOP_CAPS`, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_CAPS`, Event: pack.Event, Data: pack.Data}, desktop.srcConn)
 			common.Info(desktop.srcConn, `DESKTOP_CAPS`, ``, ``, map[string]any{
 				`deviceConn`: desktop.deviceConn,
 				`caps`:       pack.Data,
@@ -131,19 +149,53 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				derived = pack.Data
 			}
 			desktop.metrics = derived
-			sendPack(modules.Packet{Act: `DESKTOP_METRICS`, Data: derived}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_METRICS`, Event: pack.Event, Data: derived}, desktop.srcConn)
+		case `DESKTOP_POLICY`:
+			if desktop.caps == nil {
+				desktop.caps = map[string]any{}
+			}
+			if pack.Data != nil {
+				desktop.caps[`policy`] = pack.Data
+			}
+			sendPack(modules.Packet{Act: `DESKTOP_POLICY`, Event: pack.Event, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_POLICY_ALERT`:
+			logPolicyAlert(desktop, pack)
+			sendPack(modules.Packet{Act: `DESKTOP_POLICY_ALERT`, Event: pack.Event, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_POLICY_FORCE`:
+			sendPack(modules.Packet{Act: `DESKTOP_POLICY_FORCE`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+		case `DESKTOP_WEBRTC_SIGNAL`:
+			handleAgentWebRTCSignal(desktop, pack)
 		case `DESKTOP_MONITORS`:
-			sendPack(modules.Packet{Act: `DESKTOP_MONITORS`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_MONITORS`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
 		case `DESKTOP_SET_MONITOR`:
-			sendPack(modules.Packet{Act: `DESKTOP_SET_MONITOR`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_SET_MONITOR`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
 		case `DESKTOP_SET_QUALITY`:
-			sendPack(modules.Packet{Act: `DESKTOP_SET_QUALITY`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_SET_QUALITY`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
 		case `DESKTOP_INPUT`:
 			// Currently no echo back to browser.
 		case `DESKTOP_CLIPBOARD_DATA`:
-			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_DATA`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_DATA`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			common.Info(desktop.srcConn, `DESKTOP_CLIPBOARD`, `pull`, pack.Msg, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`desktop`:    desktop.uuid,
+				`timestamp`:  pack.Data[`timestamp`],
+			})
 		case `DESKTOP_CLIPBOARD_RESULT`:
-			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_RESULT`, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			sendPack(modules.Packet{Act: `DESKTOP_CLIPBOARD_RESULT`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			direction, _ := pack.Data[`direction`].(string)
+			common.Info(desktop.srcConn, `DESKTOP_CLIPBOARD`, direction, pack.Msg, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`desktop`:    desktop.uuid,
+				`timestamp`:  pack.Data[`timestamp`],
+			})
+		case `DESKTOP_SECURE_HOTKEY`:
+			sendPack(modules.Packet{Act: `DESKTOP_SECURE_HOTKEY`, Event: pack.Event, Code: pack.Code, Msg: pack.Msg, Data: pack.Data}, desktop.srcConn)
+			common.Info(desktop.srcConn, `DESKTOP_SECURE_HOTKEY`, `result`, pack.Msg, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`desktop`:    desktop.uuid,
+				`sequence`:   pack.Data[`sequence`],
+				`code`:       pack.Code,
+			})
 		}
 	}
 }
@@ -217,6 +269,30 @@ func logDesktopMetrics(pack modules.Packet, desktop *desktop) map[string]any {
 	return uiMetrics
 }
 
+func logPolicyAlert(desktop *desktop, pack modules.Packet) {
+	if desktop == nil {
+		return
+	}
+	payload := map[string]any{}
+	if pack.Data != nil {
+		payload = pack.Data
+	}
+	args := map[string]any{
+		`deviceConn`: desktop.deviceConn,
+		`desktop`:    desktop.uuid,
+		`device`:     desktop.device,
+	}
+	for _, key := range []string{`func`, `pid`, `session`, `user`, `sid`, `source`, `detail`, `timestamp`, `category`, `severity`} {
+		if val, ok := payload[key]; ok && val != nil {
+			args[key] = val
+		}
+	}
+	if pack.Event != "" {
+		args[`eventId`] = pack.Event
+	}
+	common.Warn(desktop.srcConn, `DESKTOP_POLICY_ALERT`, `umh`, pack.Msg, args)
+}
+
 func metricFloat(val any) (float64, bool) {
 	switch v := val.(type) {
 	case float64:
@@ -240,6 +316,134 @@ func metricFloat(val any) (float64, bool) {
 	}
 }
 
+type rateLimiter struct {
+	mu          sync.Mutex
+	limit       int
+	window      time.Duration
+	count       int
+	windowStart time.Time
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		limit:       limit,
+		window:      window,
+		windowStart: time.Now(),
+	}
+}
+
+func (r *rateLimiter) Allow() bool {
+	if r == nil || r.limit <= 0 {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if now.Sub(r.windowStart) >= r.window {
+		r.windowStart = now
+		r.count = 0
+	}
+	if r.count >= r.limit {
+		return false
+	}
+	r.count++
+	return true
+}
+
+type inputStats struct {
+	mu        sync.Mutex
+	mouse     uint64
+	keyboard  uint64
+	blocked   uint64
+	lastFlush time.Time
+}
+
+func newInputStats() inputStats {
+	return inputStats{
+		lastFlush: time.Now(),
+	}
+}
+
+func (s *inputStats) record(kind string) (mouse uint64, keyboard uint64, flush bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if kind == "keyboard" {
+		s.keyboard++
+	} else {
+		s.mouse++
+	}
+	if time.Since(s.lastFlush) >= inputAuditInterval && (s.mouse > 0 || s.keyboard > 0) {
+		mouse = s.mouse
+		keyboard = s.keyboard
+		s.mouse = 0
+		s.keyboard = 0
+		s.lastFlush = time.Now()
+		flush = true
+	}
+	return
+}
+
+func (s *inputStats) recordBlocked() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocked++
+	return s.blocked
+}
+
+func detectInputKind(payload any) string {
+	body, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if val, ok := body[`type`].(string); ok {
+		return strings.ToLower(val)
+	}
+	return ""
+}
+
+type inputDigest struct {
+	Hash      string `json:"hash"`
+	Type      string `json:"type"`
+	Timestamp int64  `json:"ts"`
+}
+
+func (d *desktop) recordInputDigest(entry inputDigest) {
+	if d == nil {
+		return
+	}
+	d.inputJournal = append(d.inputJournal, entry)
+	if len(d.inputJournal) > inputJournalLimit {
+		d.inputJournal = d.inputJournal[len(d.inputJournal)-inputJournalLimit:]
+	}
+}
+
+func newInputDigest(kind string, payload any) *inputDigest {
+	if payload == nil {
+		return nil
+	}
+	data, err := utils.JSON.Marshal(payload)
+	if err != nil {
+		return nil
+	}
+	sum := sha256.Sum256(data)
+	return &inputDigest{
+		Hash:      hex.EncodeToString(sum[:]),
+		Type:      kind,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+func flushInputJournal(desktop *desktop) {
+	if desktop == nil || len(desktop.inputJournal) == 0 {
+		return
+	}
+	common.Info(desktop.srcConn, `DESKTOP_INPUT_JOURNAL`, ``, ``, map[string]any{
+		`deviceConn`: desktop.deviceConn,
+		`entries`:    desktop.inputJournal,
+	})
+	desktop.inputJournal = nil
+}
+
 func onDesktopConnect(session *melody.Session) {
 	device, ok := session.Get(`Device`)
 	if !ok {
@@ -261,10 +465,13 @@ func onDesktopConnect(session *melody.Session) {
 	}
 	desktopUUID := utils.GetStrUUID()
 	desktop := &desktop{
-		uuid:       desktopUUID,
-		device:     device.(string),
-		srcConn:    session,
-		deviceConn: deviceConn,
+		uuid:          desktopUUID,
+		device:        device.(string),
+		srcConn:       session,
+		deviceConn:    deviceConn,
+		inputLimiter:  newRateLimiter(inputRateLimitPerWindow, inputRateWindow),
+		inputStats:    newInputStats(),
+		hotkeyLimiter: newRateLimiter(hotkeyLimitPerWindow, hotkeyRateWindow),
 	}
 	session.Set(`Desktop`, desktop)
 	common.AddEvent(desktopEventWrapper(desktop), connUUID, desktopUUID)
@@ -366,10 +573,80 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			`desktop`: desktop.uuid,
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
+	case `DESKTOP_SECURE_HOTKEY`:
+		seq, ok := pack.GetData(`sequence`, reflect.String)
+		if !ok {
+			sendPack(modules.Packet{Act: `DESKTOP_SECURE_HOTKEY`, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+			return
+		}
+		if desktop.hotkeyLimiter != nil && !desktop.hotkeyLimiter.Allow() {
+			common.Warn(desktop.srcConn, `DESKTOP_SECURE_HOTKEY`, `rate_limit`, `${i18n|DESKTOP.SECURE_HOTKEY_RATE_LIMIT}`, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`sequence`:   seq,
+			})
+			sendPack(modules.Packet{Act: `DESKTOP_SECURE_HOTKEY`, Code: 1, Msg: `${i18n|DESKTOP.SECURE_HOTKEY_RATE_LIMIT}`}, session)
+			return
+		}
+		common.SendPack(modules.Packet{Act: `DESKTOP_SECURE_HOTKEY`, Data: gin.H{
+			`desktop`:  desktop.uuid,
+			`sequence`: seq,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		common.Info(desktop.srcConn, `DESKTOP_SECURE_HOTKEY`, `forward`, ``, map[string]any{
+			`deviceConn`: desktop.deviceConn,
+			`sequence`:   seq,
+		})
+		return
+	case `DESKTOP_CONTROL`:
+		enabled, ok := pack.GetData(`enabled`, reflect.Bool)
+		if !ok {
+			return
+		}
+		common.SendPack(modules.Packet{Act: `DESKTOP_CONTROL`, Data: gin.H{
+			`desktop`: desktop.uuid,
+			`enabled`: enabled,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		common.Info(desktop.srcConn, `DESKTOP_CONTROL`, `state`, ``, map[string]any{
+			`deviceConn`: desktop.deviceConn,
+			`desktop`:    desktop.uuid,
+			`enabled`:    enabled,
+		})
+		return
 	case `DESKTOP_INPUT`:
+		payload := pack.Data[`payload`]
+		kind := detectInputKind(payload)
+		if desktop.inputLimiter != nil && !desktop.inputLimiter.Allow() {
+			blocked := desktop.inputStats.recordBlocked()
+			common.Warn(desktop.srcConn, `DESKTOP_INPUT`, `rate_limit`, `${i18n|DESKTOP.INPUT_RATE_LIMIT}`, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`type`:       kind,
+				`blocked`:    blocked,
+			})
+			sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|DESKTOP.INPUT_RATE_LIMIT}`}, session)
+			return
+		}
+		if digest := newInputDigest(kind, payload); digest != nil {
+			desktop.recordInputDigest(*digest)
+		}
+		if mouse, keyboard, flush := desktop.inputStats.record(kind); flush {
+			common.Info(desktop.srcConn, `DESKTOP_INPUT`, `summary`, ``, map[string]any{
+				`deviceConn`: desktop.deviceConn,
+				`mouse`:      mouse,
+				`keyboard`:   keyboard,
+			})
+		}
 		common.SendPack(modules.Packet{Act: `DESKTOP_INPUT`, Data: gin.H{
 			`desktop`: desktop.uuid,
-			`payload`: pack.Data[`payload`],
+			`payload`: payload,
+		}, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_WEBRTC_SIGNAL`:
+		handleBrowserWebRTCSignal(desktop, pack)
+		return
+	case `DESKTOP_POLICY_FORCE`:
+		common.SendPack(modules.Packet{Act: `DESKTOP_POLICY_FORCE`, Data: gin.H{
+			`desktop`:      desktop.uuid,
+			`forceInput`:   pack.Data[`forceInput`],
+			`forceCapture`: pack.Data[`forceCapture`],
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	}
@@ -386,6 +663,7 @@ func onDesktopDisconnect(session *melody.Session) {
 	if !ok {
 		return
 	}
+	flushInputJournal(desktop)
 	common.SendPack(modules.Packet{Act: `DESKTOP_KILL`, Data: gin.H{
 		`desktop`: desktop.uuid,
 	}, Event: desktop.uuid}, desktop.deviceConn)
@@ -428,4 +706,73 @@ func CloseSessionsByDevice(deviceID string) {
 	for _, session := range queue {
 		session.Close()
 	}
+}
+
+func handleBrowserWebRTCSignal(desktop *desktop, pack modules.Packet) {
+	if desktop == nil {
+		return
+	}
+	kind, err := toSignalKind(pack.Data[`kind`])
+	if err != nil {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		return
+	}
+	payload, ok := mapFromAny(pack.Data[`payload`])
+	if !ok {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, desktop.srcConn)
+		return
+	}
+	normalized, err := normalizeBrowserSignal(kind, payload)
+	if err != nil {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		return
+	}
+	common.Info(desktop.srcConn, `DESKTOP_WEBRTC_SIGNAL`, `browser_forward`, ``, map[string]any{
+		`deviceConn`: desktop.deviceConn,
+		`desktop`:    desktop.uuid,
+		`kind`:       string(kind),
+	})
+	common.SendPack(modules.Packet{
+		Act:   `DESKTOP_WEBRTC_SIGNAL`,
+		Event: desktop.uuid,
+		Data: gin.H{
+			`desktop`: desktop.uuid,
+			`kind`:    string(kind),
+			`payload`: normalized,
+			`origin`:  `browser`,
+		},
+	}, desktop.deviceConn)
+}
+
+func handleAgentWebRTCSignal(desktop *desktop, pack modules.Packet) {
+	if desktop == nil {
+		return
+	}
+	if pack.Code != 0 {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: pack.Code, Msg: pack.Msg}, desktop.srcConn)
+		return
+	}
+	kind, err := toSignalKind(pack.Data[`kind`])
+	if err != nil {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		return
+	}
+	payload, ok := mapFromAny(pack.Data[`payload`])
+	if !ok {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, desktop.srcConn)
+		return
+	}
+	normalized, err := normalizeAgentSignal(kind, payload)
+	if err != nil {
+		sendPack(modules.Packet{Act: `DESKTOP_WEBRTC_SIGNAL`, Code: 1, Msg: err.Error()}, desktop.srcConn)
+		return
+	}
+	sendPack(modules.Packet{
+		Act:  `DESKTOP_WEBRTC_SIGNAL`,
+		Code: 0,
+		Data: map[string]any{
+			`kind`:    string(kind),
+			`payload`: normalized,
+		},
+	}, desktop.srcConn)
 }
