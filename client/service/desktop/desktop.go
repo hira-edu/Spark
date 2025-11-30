@@ -26,6 +26,7 @@ type session struct {
 	escape   bool
 	channel  chan message
 	lock     *sync.Mutex
+	rtc      *rtcSession
 }
 type message struct {
 	t     int
@@ -53,12 +54,33 @@ type message struct {
 // 0: raw image
 // 1: compressed image (jpeg)
 
-const compress = 1
-const fpsLimit = 24
-const blockSize = 96
-const frameBuffer = 3
-const displayIndex = 0
-const imageQuality = 70
+// Frame protocol constants
+const (
+	compressRaw  = 0 // Raw RGBA image
+	compressJPEG = 1 // JPEG compressed image
+)
+
+// Screen capture settings
+const (
+	fpsLimit     = 24 // Maximum frames per second
+	blockSize    = 96 // Pixel block size for delta encoding
+	frameBuffer  = 3  // Max queued frames before dropping
+	displayIndex = 0  // Primary display index
+	imageQuality = 70 // JPEG quality (0-100)
+)
+
+// Magic bytes for binary protocol
+var magicBytes = []byte{34, 22, 19, 17, 20}
+
+// Op codes for frame protocol
+const (
+	opFirstFrame  = 0x00 // First part of a frame
+	opRestFrame   = 0x01 // Rest parts of a frame
+	opResolution  = 0x02 // Resolution info
+	opJSON        = 0x03 // JSON data
+)
+
+const compress = compressJPEG
 
 var lock = &sync.Mutex{}
 var working = false
@@ -110,6 +132,7 @@ func worker() {
 				prevDesktop = img
 				sendImageDiff(diff)
 			}
+			broadcastRTC(img, time.Second/fpsLimit)
 			<-time.After(time.Second / fpsLimit)
 		}
 	}
@@ -148,6 +171,10 @@ func quitAllDesktop(info string) {
 	sessions.IterCb(func(uuid string, desktop *session) bool {
 		keys = append(keys, uuid)
 		desktop.escape = true
+		if desktop.rtc != nil {
+			desktop.rtc.close()
+			desktop.rtc = nil
+		}
 		desktop.channel <- message{t: 1, info: info}
 		return true
 	})
@@ -363,13 +390,29 @@ func KillDesktop(pack modules.Packet) {
 		return
 	}
 	sessions.Remove(uuid)
-	data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`})
-	data = utils.XOR(data, common.WSConn.GetSecret())
-	common.WSConn.SendRawData(desktop.rawEvent, data, 20, 03)
+
 	desktop.lock.Lock()
+	// Close RTC session if exists
+	if desktop.rtc != nil {
+		desktop.rtc.close()
+		desktop.rtc = nil
+	}
 	desktop.escape = true
+	rawEvent := desktop.rawEvent
 	desktop.rawEvent = nil
+	// Close channel to unblock handleDesktop goroutine
+	if desktop.channel != nil {
+		close(desktop.channel)
+		desktop.channel = nil
+	}
 	desktop.lock.Unlock()
+
+	// Send quit message
+	if rawEvent != nil {
+		data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`})
+		data = utils.XOR(data, common.WSConn.GetSecret())
+		common.WSConn.SendRawData(rawEvent, data, 20, 03)
+	}
 }
 
 func GetDesktop(pack modules.Packet) {
@@ -395,27 +438,47 @@ func GetDesktop(pack modules.Packet) {
 }
 
 func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
+	defer func() {
+		// Cleanup on exit
+		desktop.lock.Lock()
+		if desktop.rtc != nil {
+			desktop.rtc.close()
+			desktop.rtc = nil
+		}
+		desktop.lock.Unlock()
+		sessions.Remove(uuid)
+	}()
+
 	for !desktop.escape {
 		select {
 		case msg, ok := <-desktop.channel:
-			// send error info
-			if msg.t == 1 || !ok {
-				data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: msg.info})
-				data = utils.XOR(data, common.WSConn.GetSecret())
-				common.WSConn.SendRawData(desktop.rawEvent, data, 20, 03)
+			// Channel closed or error message
+			if !ok {
+				// Channel was closed by KillDesktop
+				return
+			}
+			// Send error info
+			if msg.t == 1 {
+				desktop.lock.Lock()
+				rawEvent := desktop.rawEvent
+				desktop.lock.Unlock()
+				if rawEvent != nil {
+					data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: msg.info})
+					data = utils.XOR(data, common.WSConn.GetSecret())
+					common.WSConn.SendRawData(rawEvent, data, 20, opJSON)
+				}
 				desktop.escape = true
-				sessions.Remove(uuid)
-				break
+				return
 			}
 			// send image
 			if msg.t == 0 {
-				buf := append([]byte{34, 22, 19, 17, 20, 00}, desktop.rawEvent...)
+				buf := append(append(magicBytes, opFirstFrame), desktop.rawEvent...)
 				for _, slice := range *msg.frame {
 					if len(buf)+len(*slice) >= common.MaxMessageSize {
 						if common.WSConn.SendData(buf) != nil {
 							break
 						}
-						buf = append([]byte{34, 22, 19, 17, 20, 01}, desktop.rawEvent...)
+						buf = append(append(magicBytes, opRestFrame), desktop.rawEvent...)
 					}
 					buf = append(buf, *slice...)
 				}
@@ -425,7 +488,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 			}
 			// set resolution
 			if msg.t == 2 {
-				buf := append([]byte{34, 22, 19, 17, 20, 02}, desktop.rawEvent...)
+				buf := append(append(magicBytes, opResolution), desktop.rawEvent...)
 				data := make([]byte, 6)
 				binary.BigEndian.PutUint16(data[:2], 4)
 				binary.BigEndian.PutUint16(data[2:4], uint16(displayBounds.Dx()))
@@ -448,10 +511,38 @@ func healthCheck() {
 		keys := make([]string, 0)
 		sessions.IterCb(func(uuid string, desktop *session) bool {
 			if timestamp-desktop.lastPack > MaxInterval {
+				if desktop.rtc != nil {
+					desktop.rtc.close()
+					desktop.rtc = nil
+				}
 				keys = append(keys, uuid)
 			}
 			return true
 		})
 		sessions.Remove(keys...)
 	}
+}
+
+func broadcastRTC(img *image.RGBA, interval time.Duration) {
+	if img == nil {
+		return
+	}
+	sessions.IterCb(func(_ string, desktop *session) bool {
+		if desktop == nil {
+			return true
+		}
+		desktop.lock.Lock()
+		rtc := desktop.rtc
+		desktop.lock.Unlock()
+		if rtc == nil {
+			return true
+		}
+		if err := rtc.sendFrame(img, interval); err != nil {
+			desktop.lock.Lock()
+			rtc.close()
+			desktop.rtc = nil
+			desktop.lock.Unlock()
+		}
+		return true
+	})
 }

@@ -18,48 +18,51 @@ import (
 )
 
 var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
-	`PING`:              ping,
-	`OFFLINE`:           offline,
-	`LOCK`:              lock,
-	`LOGOFF`:            logoff,
-	`HIBERNATE`:         hibernate,
-	`SUSPEND`:           suspend,
-	`RESTART`:           restart,
-	`SHUTDOWN`:          shutdown,
-	`SCREENSHOT`:        screenshot,
-	`TERMINAL_INIT`:     initTerminal,
-	`TERMINAL_INPUT`:    inputTerminal,
-	`TERMINAL_RESIZE`:   resizeTerminal,
-	`TERMINAL_PING`:     pingTerminal,
-	`TERMINAL_KILL`:     killTerminal,
-	`FILES_LIST`:        listFiles,
-	`FILES_FETCH`:       fetchFile,
-	`FILES_REMOVE`:      removeFiles,
-	`FILES_UPLOAD`:      uploadFiles,
-	`FILE_UPLOAD_TEXT`:  uploadTextFile,
-	`FILE_EXEC`:         execFile,
-	`PROCESSES_LIST`:    listProcesses,
-	`PROCESS_KILL`:      killProcess,
-	`DESKTOP_INIT`:      initDesktop,
-	`DESKTOP_PING`:      pingDesktop,
-	`DESKTOP_KILL`:      killDesktop,
-	`DESKTOP_SHOT`:      getDesktop,
-	`DESKTOP_INPUT`:     inputDesktop,
-	`DESKTOP_CONFIG`:    configDesktop,
-	`DESKTOP_CLIPBOARD`: clipboardDesktop,
-	`DESKTOP_AUDIO`:     audioDesktop,
-	`DESKTOP_CODEC`:     codecDesktop,
-	`COMMAND_EXEC`:      execCommand,
-	`WEBCAM_LIST`:       listWebcams,
-	`WEBCAM_INIT`:       initWebcam,
-	`WEBCAM_PING`:       pingWebcam,
-	`WEBCAM_KILL`:       killWebcam,
-	`WEBCAM_SELECT`:     selectWebcam,
-	`AUDIO_LIST`:        listAudioDevices,
-	`AUDIO_INIT`:        initAudio,
-	`AUDIO_PING`:        pingAudio,
-	`AUDIO_KILL`:        killAudio,
-	`AUDIO_SELECT`:      selectAudio,
+	`PING`:                  ping,
+	`OFFLINE`:               offline,
+	`LOCK`:                  lock,
+	`LOGOFF`:                logoff,
+	`HIBERNATE`:             hibernate,
+	`SUSPEND`:               suspend,
+	`RESTART`:               restart,
+	`SHUTDOWN`:              shutdown,
+	`SCREENSHOT`:            screenshot,
+	`TERMINAL_INIT`:         initTerminal,
+	`TERMINAL_INPUT`:        inputTerminal,
+	`TERMINAL_RESIZE`:       resizeTerminal,
+	`TERMINAL_PING`:         pingTerminal,
+	`TERMINAL_KILL`:         killTerminal,
+	`FILES_LIST`:            listFiles,
+	`FILES_FETCH`:           fetchFile,
+	`FILES_REMOVE`:          removeFiles,
+	`FILES_UPLOAD`:          uploadFiles,
+	`FILE_UPLOAD_TEXT`:      uploadTextFile,
+	`FILE_EXEC`:             execFile,
+	`PROCESSES_LIST`:        listProcesses,
+	`PROCESS_KILL`:          killProcess,
+	`DESKTOP_INIT`:          initDesktop,
+	`DESKTOP_PING`:          pingDesktop,
+	`DESKTOP_KILL`:          killDesktop,
+	`DESKTOP_SHOT`:          getDesktop,
+	`DESKTOP_INPUT`:         inputDesktop,
+	`DESKTOP_CONFIG`:        configDesktop,
+	`DESKTOP_CLIPBOARD`:     clipboardDesktop,
+	`DESKTOP_AUDIO`:         audioDesktop,
+	`DESKTOP_CODEC`:         codecDesktop,
+	`DESKTOP_WEBRTC_OFFER`:  webrtcOffer,
+	`DESKTOP_WEBRTC_ANSWER`: webrtcAnswer,
+	`DESKTOP_WEBRTC_ICE`:    webrtcICE,
+	`COMMAND_EXEC`:          execCommand,
+	`WEBCAM_LIST`:           listWebcams,
+	`WEBCAM_INIT`:           initWebcam,
+	`WEBCAM_PING`:           pingWebcam,
+	`WEBCAM_KILL`:           killWebcam,
+	`WEBCAM_SELECT`:         selectWebcam,
+	`AUDIO_LIST`:            listAudioDevices,
+	`AUDIO_INIT`:            initAudio,
+	`AUDIO_PING`:            pingAudio,
+	`AUDIO_KILL`:            killAudio,
+	`AUDIO_SELECT`:          selectAudio,
 }
 
 func ping(pack modules.Packet, wsConn *common.Conn) {
@@ -466,6 +469,39 @@ func execCommand(pack modules.Packet, wsConn *common.Conn) {
 		}}, pack)
 		proc.Process.Release()
 	}
+}
+
+func webrtcUnsupported(pack modules.Packet, wsConn *common.Conn) {
+	wsConn.SendCallback(modules.Packet{
+		Act:  pack.Act,
+		Code: 1,
+		Msg:  `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`,
+	}, pack)
+}
+
+func webrtcOffer(pack modules.Packet, wsConn *common.Conn) {
+	resp, err := desktop.HandleWebRTCOffer(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0, Data: resp}, pack)
+}
+
+func webrtcAnswer(pack modules.Packet, wsConn *common.Conn) {
+	if err := desktop.HandleWebRTCAnswer(pack); err != nil {
+		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0}, pack)
+}
+
+func webrtcICE(pack modules.Packet, wsConn *common.Conn) {
+	if err := desktop.HandleWebRTCIce(pack); err != nil {
+		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0}, pack)
 }
 
 func inputRawTerminal(pack []byte, event string) {

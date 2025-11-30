@@ -1,3 +1,31 @@
+## v0.3.0
+
+* Add: WebRTC support for desktop streaming (VP8/VP9).
+* Add: WebRTC data channel for low-latency input.
+* Add: ICE restart support for automatic reconnection.
+* Add: pointer lock mode for relative mouse movement.
+* Add: SDP and ICE candidate validation.
+* Add: WebSocket origin validation (CSWSH prevention).
+* Optimize: VPX encoder caching for better performance.
+* Optimize: input rate limiting with atomic operations.
+* Fix: race conditions in desktop session handling.
+* Fix: resource leaks in desktop session cleanup.
+* Fix: ICE message type consistency.
+
+* 新增：远程桌面 WebRTC 支持（VP8/VP9）。
+* 新增：WebRTC 数据通道实现低延迟输入。
+* 新增：ICE 重启支持自动重连。
+* 新增：指针锁定模式支持相对鼠标移动。
+* 新增：SDP 和 ICE 候选验证。
+* 新增：WebSocket 来源验证（CSWSH 防护）。
+* 优化：VPX 编码器缓存提升性能。
+* 优化：输入速率限制使用原子操作。
+* 修复：桌面会话处理中的竞态条件。
+* 修复：桌面会话清理中的资源泄漏。
+* 修复：ICE 消息类型一致性。
+
+
+
 ## v0.2.1
 
 * Fix: desktop connection timeout.

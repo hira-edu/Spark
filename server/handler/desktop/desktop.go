@@ -1,14 +1,18 @@
 package desktop
 
 import (
+	"encoding/hex"
+	"net/http"
+	"net/url"
+	"strings"
+
 	"Spark/modules"
 	"Spark/server/common"
 	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/melody"
-	"encoding/hex"
+
 	"github.com/gin-gonic/gin"
-	"net/http"
 )
 
 type desktop struct {
@@ -21,6 +25,10 @@ type desktop struct {
 var desktopSessions = melody.New()
 
 const maxDesktopInputBatch = 32
+const (
+	maxSDPLength       = 1 << 15
+	maxCandidateLength = 4096
+)
 
 func init() {
 	desktopSessions.Config.MaxMessageSize = common.MaxMessageSize
@@ -37,6 +45,13 @@ func InitDesktop(ctx *gin.Context) {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
+
+	// Validate WebSocket origin to prevent CSWSH attacks
+	if !validateWebSocketOrigin(ctx) {
+		ctx.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
 	secretStr, ok := ctx.GetQuery(`secret`)
 	if !ok || len(secretStr) != 32 {
 		ctx.AbortWithStatus(http.StatusBadRequest)
@@ -120,6 +135,8 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			if pack.Code != 0 {
 				sendPack(pack, desktop.srcConn)
 			}
+		case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, `DESKTOP_WEBRTC_ICE`:
+			sendPack(pack, desktop.srcConn)
 		}
 	}
 }
@@ -228,6 +245,22 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			Event: desktop.uuid,
 		}, desktop.deviceConn)
 		return
+	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
+		if payload, ok := normalizeSDP(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+			return
+		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+	case `DESKTOP_WEBRTC_ICE`:
+		if payload, ok := normalizeCandidate(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+			return
+		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
 	}
 	session.Close()
 }
@@ -302,17 +335,129 @@ func normalizeInputEvents(data map[string]any) ([]any, bool) {
 			return events[:maxDesktopInputBatch], true
 		}
 		return events, true
-	case []interface{}:
-		if len(events) == 0 {
-			return nil, true
-		}
-		if len(events) > maxDesktopInputBatch {
-			events = events[:maxDesktopInputBatch]
-		}
-		out := make([]any, len(events))
-		copy(out, events)
-		return out, true
 	default:
 		return nil, false
+	}
+}
+
+func normalizeSDP(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	sdp, ok := data[`sdp`].(string)
+	if !ok || len(sdp) == 0 || len(sdp) > maxSDPLength {
+		return nil, false
+	}
+	// Validate SDP format
+	if !isValidSDP(sdp) {
+		return nil, false
+	}
+	t, ok := data[`type`].(string)
+	if !ok || len(t) == 0 {
+		return nil, false
+	}
+	payload := gin.H{
+		`sdp`:  sdp,
+		`type`: t,
+	}
+	if role, ok := data[`role`].(string); ok {
+		payload[`role`] = role
+	}
+	if retry, ok := data[`retry`].(float64); ok {
+		payload[`retry`] = retry
+	}
+	return payload, true
+}
+
+// isValidSDP performs basic validation on SDP format
+func isValidSDP(sdp string) bool {
+	if sdp == "" {
+		return false
+	}
+	// SDP must contain version line and at least one media section
+	return strings.Contains(sdp, "v=") && strings.Contains(sdp, "m=")
+}
+
+func normalizeCandidate(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	candidate, ok := data[`candidate`].(string)
+	if !ok || len(candidate) == 0 || len(candidate) > maxCandidateLength {
+		return nil, false
+	}
+	// Validate ICE candidate format
+	if !isValidICECandidate(candidate) {
+		return nil, false
+	}
+	payload := gin.H{
+		`candidate`: candidate,
+	}
+	if mid, ok := data[`sdpMid`].(string); ok {
+		payload[`sdpMid`] = mid
+	}
+	// Support both mLine and sdpMLineIndex for compatibility
+	if idx, ok := data[`mLine`].(float64); ok {
+		payload[`mLine`] = idx
+	} else if idx, ok := data[`sdpMLineIndex`].(float64); ok {
+		payload[`mLine`] = idx
+	}
+	if role, ok := data[`role`].(string); ok {
+		payload[`role`] = role
+	}
+	if retry, ok := data[`retry`].(float64); ok {
+		payload[`retry`] = retry
+	}
+	return payload, true
+}
+
+// isValidICECandidate performs basic validation on ICE candidate format
+func isValidICECandidate(candidate string) bool {
+	if candidate == "" {
+		return true // Empty candidate signals end-of-candidates
+	}
+	// ICE candidates contain space-separated components and type info
+	return strings.Contains(candidate, " ") &&
+		(strings.HasPrefix(candidate, "candidate:") || strings.Contains(candidate, "typ "))
+}
+
+// validateWebSocketOrigin checks the Origin header to prevent Cross-Site WebSocket Hijacking
+func validateWebSocketOrigin(ctx *gin.Context) bool {
+	origin := ctx.GetHeader("Origin")
+	if origin == "" {
+		// No Origin header - allow (non-browser clients)
+		return true
+	}
+
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	requestHost := ctx.Request.Host
+	// Strip port from both for comparison
+	requestHostWithoutPort := strings.Split(requestHost, ":")[0]
+	originHostWithoutPort := strings.Split(originURL.Host, ":")[0]
+
+	// Same host is always allowed
+	if originHostWithoutPort == requestHostWithoutPort {
+		return true
+	}
+
+	// Allow localhost variants to connect to each other
+	if isLocalhost(originHostWithoutPort) && isLocalhost(requestHostWithoutPort) {
+		return true
+	}
+
+	return false
+}
+
+// isLocalhost checks if a host is a localhost variant
+func isLocalhost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	default:
+		return false
 	}
 }

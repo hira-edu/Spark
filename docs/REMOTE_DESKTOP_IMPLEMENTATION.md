@@ -1,6 +1,6 @@
 # Full-Featured Remote Desktop Implementation Plan
 
-This document outlines the implementation plan for adding full remote desktop control (mouse + keyboard) to Spark using RobotGo and Pion WebRTC.
+This document outlines the implementation plan for adding full remote desktop control (mouse + keyboard) to Spark. Phase 1 uses the existing WebSocket stream plus Windows-native SendInput; Phase 2 adds WebRTC (media + data channel) with graceful fallback to the WS JPEG path.
 
 ## Current State
 
@@ -10,9 +10,8 @@ This document outlines the implementation plan for adding full remote desktop co
 - **WebSocket Transport**: Binary frame protocol over existing WS connection
 
 ### What's Missing
-- Mouse input handling (move, click, scroll)
-- Keyboard input handling (key press/release)
-- Optional: WebRTC for lower latency streaming
+- WebRTC media + data channel (offer/answer/candidates, TURN/STUN, VP8/VP9 track, DESKTOP_INPUT over data channel)
+- Cross-platform input injection (Linux/macOS)
 
 ---
 
@@ -20,204 +19,13 @@ This document outlines the implementation plan for adding full remote desktop co
 
 ### Phase 1: Input Control (Priority: HIGH)
 
-Current implementation uses Win32 `SendInput` for Windows; the RobotGo steps below remain as a fallback plan for cross-platform support.
+Status: Implemented for Windows via Win32 `SendInput`; non-Windows uses RobotGo when built with CGO and falls back to an explicit unsupported error otherwise. Inputs travel over the existing WS `0x14/0x03` channel.
+
+- Device: `client/service/desktop/input.go` parses/bounds batches (32 max), rate-limits per second, and injects via `client/service/desktop/input_windows.go` (SendInput) on Windows or `client/service/desktop/input_nonwindows_cgo.go` (RobotGo) on macOS/Linux CGO builds. Non-Windows without CGO uses the stub in `input_nonwindows_stub.go`.
+- Server: `server/handler/desktop/desktop.go` clamps incoming batches to 32, rejects malformed payloads, and tags with desktop UUID.
+- Web: `web/src/components/desktop/desktop.jsx` batches mouse move/button/wheel and key up/down every 16 ms (32-cap buffer), supports pointer lock, and cleans up listeners on unmount. A simple enable toggle remains to add.
 
 **Guardrails:** Prefer absolute coordinates when pointer lock is off, fall back to relative deltas when pointer lock is on, and always bound coordinates to the current display size. If a desktop session id is missing or stale, return `DESKTOP_INPUT` with a non-zero code and do not try to inject input.
-
-#### 1.1 Add RobotGo Dependency
-
-```bash
-go get github.com/go-vgo/robotgo
-```
-
-**File**: `go.mod`
-```go
-require (
-    github.com/go-vgo/robotgo v0.100.10
-)
-```
-
-#### 1.2 Create Input Handler Service
-
-**New File**: `client/service/desktop/input.go`
-
-```go
-package desktop
-
-import (
-    "Spark/modules"
-    "github.com/go-vgo/robotgo"
-)
-
-// InputEvent represents a mouse/keyboard event from the web client
-type InputEvent struct {
-    Type    string `json:"type"`    // "move", "button", "scroll", "key"
-
-    // Mouse move
-    X       int    `json:"x,omitempty"`
-    Y       int    `json:"y,omitempty"`
-    DeltaX  int    `json:"deltaX,omitempty"`
-    DeltaY  int    `json:"deltaY,omitempty"`
-
-    // Mouse button
-    Button  string `json:"button,omitempty"` // "left", "right", "middle"
-    Down    bool   `json:"down,omitempty"`
-
-    // Keyboard
-    Key     string `json:"key,omitempty"`
-    KeyCode int    `json:"keyCode,omitempty"`
-}
-
-// HandleInput processes input events from the web client
-func HandleInput(pack modules.Packet) error {
-    var events []InputEvent
-    if val, ok := pack.GetData("events", reflect.Slice); ok {
-        // Parse events array
-        events = parseInputEvents(val)
-    }
-
-    for _, event := range events {
-        switch event.Type {
-        case "move":
-            handleMouseMove(event)
-        case "button":
-            handleMouseButton(event)
-        case "scroll":
-            handleMouseScroll(event)
-        case "key":
-            handleKeyboard(event)
-        }
-    }
-    return nil
-}
-
-func handleMouseMove(e InputEvent) {
-    if e.DeltaX != 0 || e.DeltaY != 0 {
-        // Relative movement (pointer lock mode)
-        x, y := robotgo.Location()
-        robotgo.Move(x+e.DeltaX, y+e.DeltaY)
-    } else {
-        // Absolute position
-        robotgo.Move(e.X, e.Y)
-    }
-}
-
-func handleMouseButton(e InputEvent) {
-    button := e.Button
-    if button == "" {
-        button = "left"
-    }
-
-    if e.Down {
-        robotgo.MouseDown(button)
-    } else {
-        robotgo.MouseUp(button)
-    }
-}
-
-func handleMouseScroll(e InputEvent) {
-    // Scroll direction and amount
-    if e.DeltaY != 0 {
-        direction := "down"
-        if e.DeltaY < 0 {
-            direction = "up"
-        }
-        robotgo.ScrollDir(abs(e.DeltaY)/100+1, direction)
-    }
-    if e.DeltaX != 0 {
-        direction := "right"
-        if e.DeltaX < 0 {
-            direction = "left"
-        }
-        robotgo.ScrollDir(abs(e.DeltaX)/100+1, direction)
-    }
-}
-
-func handleKeyboard(e InputEvent) {
-    key := mapKeyCode(e.KeyCode, e.Key)
-    if key == "" {
-        return
-    }
-
-    if e.Down {
-        robotgo.KeyDown(key)
-    } else {
-        robotgo.KeyUp(key)
-    }
-}
-
-// mapKeyCode converts JavaScript keyCodes to RobotGo key names
-func mapKeyCode(keyCode int, key string) string {
-    // Special keys mapping
-    specialKeys := map[int]string{
-        8:   "backspace",
-        9:   "tab",
-        13:  "enter",
-        16:  "shift",
-        17:  "ctrl",
-        18:  "alt",
-        19:  "pause",
-        20:  "capslock",
-        27:  "escape",
-        32:  "space",
-        33:  "pageup",
-        34:  "pagedown",
-        35:  "end",
-        36:  "home",
-        37:  "left",
-        38:  "up",
-        39:  "right",
-        40:  "down",
-        45:  "insert",
-        46:  "delete",
-        91:  "cmd",    // Windows key / Command
-        112: "f1",
-        113: "f2",
-        114: "f3",
-        115: "f4",
-        116: "f5",
-        117: "f6",
-        118: "f7",
-        119: "f8",
-        120: "f9",
-        121: "f10",
-        122: "f11",
-        123: "f12",
-    }
-
-    if mapped, ok := specialKeys[keyCode]; ok {
-        return mapped
-    }
-
-    // For regular characters, use the key string (lowercase)
-    if len(key) == 1 {
-        return strings.ToLower(key)
-    }
-
-    return ""
-}
-
-func abs(x int) int {
-    if x < 0 {
-        return -x
-    }
-    return x
-}
-```
-
-#### 1.3 Register Input Handler
-
-**File**: `client/core/handler.go` (add to existing)
-
-```go
-import "Spark/client/service/desktop"
-
-// In the packet handler switch statement, add:
-case "DESKTOP_INPUT":
-    err = desktop.HandleInput(pack)
-```
-
-#### 1.4 Update Web Frontend for Input
 
 **File**: `web/src/components/desktop/desktop.jsx`
 
@@ -307,98 +115,56 @@ window.addEventListener('keyup', (e) => {
 
 ### Phase 2: WebRTC Streaming (Priority: MEDIUM)
 
-Replace WebSocket JPEG streaming with WebRTC for lower latency.
+Replace WebSocket JPEG streaming with WebRTC for lower latency and move DESKTOP_INPUT to the WebRTC data channel, with automatic fallback to the WS JPEG path.
 
-**Guardrails:** Keep the existing binary header (magic + op + len) on the signaling JSON to avoid breaking older clients while rolling out. Do not send input over WebRTC until the data channel is open and negotiated; buffer and drop after 200 ms rather than blocking the render loop.
+**Guardrails:** Keep the existing binary header (magic + op + len) on signaling JSON to avoid breaking older clients; gate WebRTC behind a feature flag; do not send input over WebRTC until the data channel is open; drop buffered inputs after 200 ms instead of blocking render.
 
-#### 2.1 Add Pion WebRTC Dependency
+#### 2.1 Signaling Contract
+- Add server/device acts for `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, and `DESKTOP_WEBRTC_CANDIDATE`, wrapped in the existing WS service header (`0x14` + JSON op `0x03`) and tagged with the desktop UUID.
+- Payloads: `{ sdp, type }` for offer/answer; `{ candidate, sdpMid, sdpMLineIndex }` for ICE; include `role` and `retry` fields for observability; validate sizes/rates and return error codes.
 
-```bash
-go get github.com/pion/webrtc/v3
-```
+#### 2.2 Server (Go, Pion)
+- Add Pion WebRTC dependency and env-driven ICE servers (STUN/TURN), plus a flag to disable WebRTC.
+- WebRTC session manager keyed by desktop UUID: create PeerConnection, video track (VP8/VP9), and reliable data channel `input`; hook ICE state/logging and cleanup.
+- SDP/ICE handlers bound to the desktop WS session: forward offers/answers/candidates to/from browser; reply with errors via JSON op.
+- Data channel: forward `DESKTOP_INPUT` payloads to the device handler; enforce batch cap and per-second rate; close on protocol violations.
+- Media: produce a VP8 (or VP9) `TrackLocal` from the desktop capture; mirror FPS/quality settings and reset on disconnect.
 
-#### 2.2 Create WebRTC Service
+#### 2.3 Device (client service)
+- Feature-flag WebRTC; build peer with ICE servers; create video track; encode capture frames to VP8/VP9 (mediadevices/vpx or libvpx) at configured FPS/bitrate.
+- Create data channel “input”; onmessage → existing input injector; enforce batch limit and throttle.
+- Handle renegotiation/ICE restart; cleanup on close; fall back to WS JPEG if disabled or negotiation fails.
 
-**New File**: `client/service/desktop/webrtc.go`
+#### 2.4 Web Frontend (`web/src/components/desktop/desktop.jsx`)
+- Add a WebRTC controller: create RTCPeerConnection with ICE servers, negotiate offer/answer/candidates over existing WS, render the video track to `<video>` or canvas.
+- Create reliable data channel for input; batch DESKTOP_INPUT every 16 ms with a bounded buffer; if channel not open within 200 ms, drop buffered inputs and/or fall back to WS.
+- Reconnect/backoff logic; UI toggle to disable WebRTC (force WS); surface states/errors; keep pointer-lock and input enable/disable.
+
+#### 2.5 Observability & Flags
+- Flags (default on): `SPARK_WEBRTC_ENABLED` (set to `0`/`false` to disable), `SPARK_WEBRTC_ICE`, `SPARK_WEBRTC_STUN`, `SPARK_WEBRTC_TURN`, `SPARK_WEBRTC_MAX_BITRATE`, `SPARK_WEBRTC_MAX_FPS`.
+- Metrics/logs: peer/ICE states, bitrate/FPS, data-channel errors, fallback reason.
+
+#### 2.6 VP8/VP9 Encoding
+- Convert RGBA capture to I420 and encode to VP8 (preferred) or VP9; tune bitrate/FPS from env; drop/pace frames on backpressure.
+- Suggested encoder (Go): `github.com/pion/mediadevices/pkg/codec/vpx`
 
 ```go
-package desktop
-
 import (
-    "github.com/pion/webrtc/v3"
-    "github.com/pion/webrtc/v3/pkg/media"
+    "github.com/pion/mediadevices/pkg/codec/vpx"
+    "github.com/pion/mediadevices/pkg/codec/vpx/encoder"
 )
 
-type WebRTCDesktop struct {
-    peerConnection *webrtc.PeerConnection
-    videoTrack     *webrtc.TrackLocalStaticSample
-    dataChannel    *webrtc.DataChannel
-}
-
-func NewWebRTCDesktop() (*WebRTCDesktop, error) {
-    config := webrtc.Configuration{
-        ICEServers: []webrtc.ICEServer{
-            {URLs: []string{"stun:stun.l.google.com:19302"}},
-        },
-    }
-
-    pc, err := webrtc.NewPeerConnection(config)
-    if err != nil {
-        return nil, err
-    }
-
-    // Create video track for screen sharing
-    videoTrack, err := webrtc.NewTrackLocalStaticSample(
-        webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
-        "video", "screen",
+func newVP8Encoder(bitrate, fps int) (*vpx.Encoder, error) {
+    return vpx.NewVP8Encoder(
+        encoder.WithBitrate(bitrate),
+        encoder.WithFrameRate(fps),
     )
-    if err != nil {
-        return nil, err
-    }
-
-    _, err = pc.AddTrack(videoTrack)
-    if err != nil {
-        return nil, err
-    }
-
-    // Create data channel for input events
-    dc, err := pc.CreateDataChannel("input", nil)
-    if err != nil {
-        return nil, err
-    }
-
-    return &WebRTCDesktop{
-        peerConnection: pc,
-        videoTrack:     videoTrack,
-        dataChannel:    dc,
-    }, nil
-}
-
-func (w *WebRTCDesktop) SendFrame(frame []byte, duration time.Duration) error {
-    return w.videoTrack.WriteSample(media.Sample{
-        Data:     frame,
-        Duration: duration,
-    })
 }
 ```
 
-#### 2.3 VP8/VP9 Encoding
-
-For WebRTC, frames need to be encoded as VP8/VP9 instead of JPEG:
-
-```go
-import "github.com/pion/mediadevices/pkg/codec/vpx"
-
-func encodeFrameVP8(img *image.RGBA) ([]byte, error) {
-    encoder, err := vpx.NewVP8Encoder()
-    if err != nil {
-        return nil, err
-    }
-    defer encoder.Close()
-
-    return encoder.Encode(img)
-}
-```
+#### 2.7 Testing & Validation
+- Unit/integration: signaling handlers, data-channel input parsing, encoder outputs valid RTP.
+- Manual: negotiate WebRTC, verify video + input, simulate TURN-only networks, and confirm WS fallback path works when WebRTC fails/disabled.
 
 ---
 
@@ -461,8 +227,8 @@ client/
 │       ├── desktop.go          # Screen capture (existing)
 │       ├── desktop_windows.go  # Windows-specific capture
 │       ├── desktop_others.go   # Linux/macOS capture
-│       ├── input.go            # NEW: Input handling with RobotGo
-│       ├── input_windows.go    # NEW: Windows native input (optional)
+│       ├── input.go            # Input parsing/dispatch
+│       ├── input_windows.go    # Windows SendInput path
 │       ├── webrtc.go           # NEW: WebRTC streaming (Phase 2)
 │       └── screen.go           # Screen abstraction (existing)
 
@@ -483,36 +249,13 @@ web/
 
 ## Build Requirements
 
-The current Windows-only input path relies on Win32 `SendInput` and does not require RobotGo or additional CGO toolchains. If a cross-platform RobotGo path is reintroduced, use the dependency notes below.
-
-### RobotGo Dependencies
-
-**Windows:**
-```bash
-# MinGW-w64 for CGO
-choco install mingw
-```
-
-**Linux:**
-```bash
-# X11 development libraries
-sudo apt-get install libx11-dev libxtst-dev libxinerama-dev
-```
-
-**macOS:**
-```bash
-# Xcode command line tools
-xcode-select --install
-```
+The current Windows-only input path relies on Win32 `SendInput` and does not require RobotGo or additional CGO toolchains.
 
 ### Cross-Compilation
 
 Update `scripts/build.client.sh`:
 
 ```bash
-# Enable CGO for RobotGo
-export CGO_ENABLED=1
-
 # Windows (requires mingw-w64)
 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build ...
 
@@ -525,22 +268,23 @@ GOOS=linux GOARCH=amd64 go build ...
 ## TODO Checklist
 
 ### Phase 1: Input Control
-- [x] Define and parse DESKTOP_INPUT payloads in `client/service/desktop/input.go`, clamping coordinates to display bounds, normalizing scroll, and dropping unknown events with a 256-event cap.
-- [x] Implement Windows input injection via Win32 `SendInput` (`client/service/desktop/input_windows.go`); return a clear unsupported error on non-Windows platforms.
+- [x] Define and parse DESKTOP_INPUT payloads in `client/service/desktop/input.go`, clamping coordinates to display bounds, normalizing scroll, and dropping unknown events with a 32-event cap.
+- [x] Implement Windows input injection via Win32 SendInput in `client/service/desktop/input_windows.go`; use RobotGo on macOS/Linux CGO builds (`client/service/desktop/input_nonwindows_cgo.go`) and return a clear unsupported error when CGO is off.
 - [x] Wire DESKTOP_INPUT through `client/core/handler.go` and the server desktop bridge so payloads keep the existing WS headers (`0x14` + JSON `0x03`) and attach the desktop UUID.
 - [x] Web UI: capture mouse move/button/wheel and key down/up with pointer-lock support, batch every 16 ms with a bounded buffer, scale coords to the remote resolution, and clean up listeners on unmount (`web/src/components/desktop/desktop.jsx`).
-- [ ] Surface an explicit enable/disable toggle in the UI and relay device-side input errors back to the modal.
-- [ ] Smoke test on Windows (move/click/scroll/modifier+char keys); document macOS/Linux as unsupported until a RobotGo/X11 path is added.
+- [x] Surface an explicit enable/disable toggle in the UI and relay device-side input errors back to the modal.
+- [ ] Smoke test on Windows (move/click/scroll/modifier+char keys); document macOS/Linux as unsupported until a cross-platform injector is added.
 
 ### Phase 2: WebRTC (Optional)
-- [ ] Add Pion WebRTC dependency and VP8/VP9 encoder (mediadevices/vpx or equivalent) with env-driven STUN/TURN.
-- [ ] Create `client/service/desktop/webrtc.go` to mirror JPEG cadence, reuse DESKTOP_INPUT over a data channel, and expose lifecycle hooks (offer/answer/ICE/state).
-- [ ] Add signaling endpoints in the server (offer/answer + ICE) with auth checks and a configurable TURN list.
-- [ ] Web frontend: negotiate WebRTC, render the video track, and send batched DESKTOP_INPUT over the data channel with reconnect handling and a disable toggle.
-- [ ] Add observability (connection state logs/metrics) and a flag to disable WebRTC entirely.
+- [x] Add Pion WebRTC dependency (v4) and VP8/VP9 encoder (mediadevices/vpx or equivalent) with env-driven STUN/TURN.
+- [x] Create client WebRTC session/encoder to mirror JPEG cadence, reuse DESKTOP_INPUT over a data channel, and expose lifecycle hooks (offer/answer/ICE/state).
+- [x] Add signaling endpoints in the server (offer/answer + ICE) with auth checks and configurable TURN list; bridge acts `DESKTOP_WEBRTC_OFFER/ANSWER/CANDIDATE` with size validation.
+- [x] Web frontend: negotiate WebRTC, render the video track, and send batched DESKTOP_INPUT over the data channel with reconnect handling and a disable toggle.
+- [ ] Add observability (connection state logs/metrics) and a first-class flag to disable WebRTC entirely (currently default-on with opt-out env only).
+- [ ] Secure share/guest desktop: tie share tokens to desktop sessions and enforce them on a guest-only WS endpoint that wraps the same WebRTC+WS desktop stream with view-only input gating; add TTL + single-use options, log token access, revoke on device disconnect, and optionally filter guest ICE config to TURN-only.
 
 ### Phase 3: Optimizations
-- [ ] Windows native SendInput fast path (cursor + keyboard) with DPI awareness and screensaver wake. *(Basic SendInput is in place; DPI/screensaver handling still pending.)*
+- [x] Windows SendInput fast path with DPI awareness + wake (SetThreadDpiAwarenessContext + SetThreadExecutionState); further screensaver/idle tuning still possible.
 - [ ] Hardware-assisted encoding (NVENC/VAAPI/VideoToolbox) and adaptive quality/FPS based on bandwidth or dropped frames.
 - [ ] Multi-monitor selection with bounds offsets and cursor overlay.
 - [ ] Idle/keepalive cadence tweaks so capture drops to low-power mode when idle; add rate/permission guards and basic telemetry on drops/frame cadence.
@@ -558,7 +302,6 @@ GOOS=linux GOARCH=amd64 go build ...
 
 ## References
 
-- [RobotGo documentation](https://github.com/go-vgo/robotgo) and [key/mouse API](https://github.com/go-vgo/robotgo#keyboard)
 - [Pointer Lock API](https://developer.mozilla.org/en-US/docs/Web/API/Pointer_Lock_API) and [Wheel event](https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent) normalization
 - [Pion WebRTC](https://github.com/pion/webrtc) and [datachannels guide](https://github.com/pion/webrtc/wiki/Examples#data-channels)
 - [Pion mediadevices VP8 codec](https://pkg.go.dev/github.com/pion/mediadevices/pkg/codec/vpx) and [TrackLocal](https://pkg.go.dev/github.com/pion/webrtc/v3#TrackLocal)

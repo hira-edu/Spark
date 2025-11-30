@@ -12,6 +12,7 @@ import (
 	"Spark/server/handler/terminal"
 	"Spark/server/handler/utility"
 	"Spark/server/handler/webcam"
+	"Spark/server/handler/webrtc"
 	"github.com/gin-gonic/gin"
 )
 
@@ -47,6 +48,10 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.Any(`/device/desktop`, desktop.InitDesktop)
 		group.Any(`/device/webcam`, webcam.InitWebcam)
 		group.Any(`/device/audio`, audio.InitAudio)
+		group.POST(`/device/webrtc/offer`, webrtc.Offer)
+		group.POST(`/device/webrtc/answer`, webrtc.Answer)
+		group.POST(`/device/webrtc/ice`, webrtc.ICE)
+		group.GET(`/device/webrtc/config`, webrtc.Config)
 
 		// Share management endpoints (auth required)
 		group.POST(`/share/create`, share.CreateShare)

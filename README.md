@@ -78,6 +78,25 @@ The configuration file `config.json` should be in the same directory as the exec
   - `path`: Log directory (default: `./logs`).
   - `days`: Log retention days (default: `7`).
 
+### WebRTC / ICE Configuration
+
+Add STUN/TURN lists to help WebRTC connections, especially when clients are behind NAT:
+
+```json
+"webrtc": {
+  "turn_servers": [
+    "turn:turn.example.com:3478?transport=udp"
+  ],
+  "stun_servers": [
+    "stun:stun.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478"
+  ]
+}
+```
+
+- Server reads these lists to send to browsers; clients also honor `SPARK_WEBRTC_TURN`, `SPARK_WEBRTC_STUN`, `SPARK_WEBRTC_TURN_USERNAME`, and `SPARK_WEBRTC_TURN_PASSWORD` env vars (comma-separated URLs) when present.
+- To enable VP8/VP9 encoding for WebRTC, build the client with libvpx installed and `CGO_ENABLED=1 go build -tags vpx ./client`; without it, the WebRTC path falls back to stubs.
+
 ---
 
 ## 🔒 HTTPS/TLS Deployment

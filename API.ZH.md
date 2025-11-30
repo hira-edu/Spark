@@ -346,3 +346,165 @@ Hello World.
     "msg": "${i18n|COMMON.DEVICE_NOT_EXIST}"
 }
 ```
+
+---
+
+## 远程桌面控制
+
+远程桌面功能支持实时屏幕查看和输入控制。
+
+### 桌面 WebSocket：`/device/desktop`
+
+**GET参数**：`device`（设备ID）和 `secret`（32位十六进制字符串）
+
+这是一个 WebSocket 端点，用于实时桌面流传输。连接使用二进制协议以提高效率。
+
+#### 连接示例
+```javascript
+const secret = crypto.getRandomValues(new Uint8Array(16));
+const secretHex = Array.from(secret).map(b => b.toString(16).padStart(2, '0')).join('');
+const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}&secret=${secretHex}`);
+ws.binaryType = 'arraybuffer';
+```
+
+#### 二进制协议
+
+所有消息使用5字节魔数头：`[34, 22, 19, 17, 20]`
+
+**操作码（第6字节）：**
+| 代码 | 方向 | 描述 |
+|------|------|------|
+| 0x00 | 服务端→客户端 | 帧的第一部分 |
+| 0x01 | 服务端→客户端 | 帧的剩余部分 |
+| 0x02 | 服务端→客户端 | 分辨率信息 |
+| 0x03 | 双向 | JSON数据（加密） |
+
+**发送消息：**
+```javascript
+function sendData(data) {
+    const json = JSON.stringify(data);
+    const encrypted = encrypt(json, secret); // XOR加密
+    const buffer = new Uint8Array(encrypted.length + 8);
+    buffer.set([34, 22, 19, 17, 20, 3], 0);
+    buffer.set([encrypted.length >> 8, encrypted.length & 0xFF], 6);
+    buffer.set(encrypted, 8);
+    ws.send(buffer);
+}
+```
+
+#### 桌面操作
+
+**心跳包：**
+```json
+{"act": "DESKTOP_PING"}
+```
+
+**请求完整帧刷新：**
+```json
+{"act": "DESKTOP_SHOT"}
+```
+
+**结束桌面会话：**
+```json
+{"act": "DESKTOP_KILL"}
+```
+
+**发送输入事件：**
+```json
+{
+    "act": "DESKTOP_INPUT",
+    "data": {
+        "events": [
+            {"type": "move", "x": 100, "y": 200},
+            {"type": "button", "button": "left", "down": true},
+            {"type": "button", "button": "left", "down": false},
+            {"type": "scroll", "deltaX": 0, "deltaY": -120},
+            {"type": "key", "key": "a", "keyCode": 65, "down": true}
+        ]
+    }
+}
+```
+
+**输入事件类型：**
+| 类型 | 字段 | 描述 |
+|------|------|------|
+| move | x, y | 绝对鼠标位置 |
+| move | deltaX, deltaY | 相对鼠标移动（指针锁定模式） |
+| button | button, down | 鼠标按键（left/middle/right） |
+| scroll | deltaX, deltaY | 鼠标滚轮 |
+| key | key, keyCode, down | 键盘输入 |
+
+---
+
+### WebRTC 桌面配置：`/device/webrtc/config`
+
+**GET参数**：`device`（设备ID）
+
+获取设备的 WebRTC ICE 服务器配置。
+
+```
+{
+    "code": 0,
+    "data": {
+        "ice": {
+            "stun": ["stun:stun.l.google.com:19302"],
+            "turn": []
+        }
+    }
+}
+```
+
+#### WebRTC 信令
+
+WebRTC 信令消息通过桌面 WebSocket 连接发送。
+
+**发送 WebRTC Offer：**
+```json
+{
+    "act": "DESKTOP_WEBRTC_OFFER",
+    "data": {
+        "sdp": "v=0\r\no=...",
+        "type": "offer"
+    }
+}
+```
+
+**接收 WebRTC Answer：**
+```json
+{
+    "act": "DESKTOP_WEBRTC_ANSWER",
+    "data": {
+        "sdp": "v=0\r\no=...",
+        "type": "answer"
+    }
+}
+```
+
+**交换 ICE 候选：**
+```json
+{
+    "act": "DESKTOP_WEBRTC_ICE",
+    "data": {
+        "candidate": "candidate:...",
+        "sdpMid": "0",
+        "mLine": 0
+    }
+}
+```
+
+#### WebRTC 功能
+
+- **视频轨道**：VP8 或 VP9 编码的屏幕捕获
+- **数据通道**：`desktop-input` 用于低延迟输入传输
+- **ICE 重启**：网络变化时自动重连
+
+#### 环境变量（客户端）
+
+| 变量 | 描述 |
+|------|------|
+| `SPARK_WEBRTC_ICE` | 自定义 ICE 服务器（格式：`url\|user\|pass`） |
+| `SPARK_WEBRTC_STUN` | STUN 服务器地址（逗号分隔） |
+| `SPARK_WEBRTC_TURN` | TURN 服务器地址（逗号分隔） |
+| `SPARK_WEBRTC_TURN_USERNAME` | TURN 用户名 |
+| `SPARK_WEBRTC_TURN_PASSWORD` | TURN 密码 |
+| `SPARK_WEBRTC_CODEC` | 视频编码器（`vp8` 或 `vp9`，默认：`vp8`） |

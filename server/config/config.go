@@ -14,13 +14,14 @@ type config struct {
 	Auth      map[string]string `json:"auth"`
 	Log       *log              `json:"log"`
 	TLS       *tls              `json:"tls"`
+	WebRTC    *webrtc           `json:"webrtc"`
 	SaltBytes []byte            `json:"-"`
 }
 
 type tls struct {
-	Enable   bool     `json:"enable"`
-	CertFile string   `json:"cert"`
-	KeyFile  string   `json:"key"`
+	Enable   bool      `json:"enable"`
+	CertFile string    `json:"cert"`
+	KeyFile  string    `json:"key"`
 	AutoCert *autoCert `json:"autocert"`
 }
 
@@ -34,6 +35,11 @@ type log struct {
 	Level string `json:"level"`
 	Path  string `json:"path"`
 	Days  uint   `json:"days"`
+}
+
+type webrtc struct {
+	Turn []string `json:"turn_servers"`
+	Stun []string `json:"stun_servers"`
 }
 
 // Commit is hash of this commit, for auto upgrade.

@@ -1,20 +1,25 @@
 import React, {useCallback, useEffect, useState} from 'react';
+import axios from "axios";
 import {encrypt, decrypt, formatSize, genRandHex, getBaseURL, translate, str2ua, hex2ua, ua2hex} from "../../utils/utils";
 import i18n from "../../locale/locale";
 import DraggableModal from "../modal";
 import {Button, message} from "antd";
-import {FullscreenOutlined, ReloadOutlined, LockOutlined, PoweroffOutlined} from "@ant-design/icons";
+import {FullscreenOutlined, ReloadOutlined, LockOutlined, PoweroffOutlined, VideoCameraOutlined} from "@ant-design/icons";
 
+// Global state
 let ws = null;
 let ctx = null;
 let conn = false;
 let canvas = null;
 let secret = null;
 let ticker = 0;
+let currentDeviceId = null;
 let frames = 0;
 let bytes = 0;
 let ticks = 0;
-let title = i18n.t('DESKTOP.TITLE');
+const title = i18n.t('DESKTOP.TITLE');
+
+// Input handling
 const inputFlushMs = 16;
 const inputBufferLimit = 32;
 let inputBuffer = [];
@@ -25,14 +30,202 @@ let inputFocused = false;
 let setPointerLockState = () => {};
 let inputAllowed = true;
 
+// WebRTC state
+let webrtcEnabled = true;
+let webrtcStateSetter = () => {};
+let webrtcState = 'off';
+let videoEl = null;
+let rtc = null;
+let iceRestartAttempts = 0;
+const maxIceRestartAttempts = 3;
+const defaultIceServers = [
+	{urls: 'stun:stun.l.google.com:19302'},
+	{urls: 'stun:stun.cloudflare.com:3478'},
+];
+
 function clamp(val, min, max) {
 	if (val < min) return min;
 	if (val > max) return max;
 	return val;
 }
 
+function updateWebRTCState(state) {
+	webrtcState = state;
+	webrtcStateSetter(state);
+}
+
+function clearRTC() {
+	if (rtc?.dc) {
+		try { rtc.dc.close(); } catch (_) {}
+	}
+	if (rtc?.pc) {
+		try { rtc.pc.close(); } catch (_) {}
+	}
+	rtc = null;
+}
+
+function stopWebRTC() {
+	clearRTC();
+	updateWebRTCState('off');
+	iceRestartAttempts = 0;
+	if (videoEl) {
+		videoEl.srcObject = null;
+	}
+}
+
+async function startWebRTC(deviceId, iceRestart = false) {
+	if (!webrtcEnabled || !ws || !conn) return;
+
+	if (!iceRestart) {
+		stopWebRTC();
+		iceRestartAttempts = 0;
+	}
+
+	updateWebRTCState('connecting');
+
+	// Fetch ICE servers from server config
+	let iceServers = defaultIceServers;
+	try {
+		const resp = await axios.get(getBaseURL(false, `/api/device/webrtc/config?device=${deviceId}`));
+		if (resp?.data?.data?.ice) {
+			const cfg = resp.data.data.ice;
+			const servers = [];
+			(cfg.stun || []).forEach((url) => servers.push({urls: url}));
+			(cfg.turn || []).forEach((url) => servers.push({urls: url}));
+			if (servers.length > 0) {
+				iceServers = servers;
+			}
+		}
+	} catch (e) {
+		console.warn('fallback to default ICE', e);
+	}
+
+	const pc = new RTCPeerConnection({iceServers});
+	rtc = {pc, dc: null};
+
+	pc.onicecandidate = (e) => {
+		if (e.candidate) {
+			// Send via WebSocket signaling
+			sendData({
+				act: 'DESKTOP_WEBRTC_ICE',
+				data: {
+					candidate: e.candidate.candidate,
+					sdpMid: e.candidate.sdpMid,
+					mLine: e.candidate.sdpMLineIndex,
+					desktop: deviceId
+				}
+			});
+		}
+	};
+
+	pc.oniceconnectionstatechange = () => {
+		const state = pc.iceConnectionState;
+		if (state === 'failed' && iceRestartAttempts < maxIceRestartAttempts) {
+			// Attempt ICE restart
+			iceRestartAttempts++;
+			console.log(`ICE restart attempt ${iceRestartAttempts}/${maxIceRestartAttempts}`);
+			restartICE(deviceId);
+		}
+	};
+
+	pc.onconnectionstatechange = () => {
+		const state = pc.connectionState;
+		if (state === 'connected') {
+			updateWebRTCState('connected');
+			iceRestartAttempts = 0;
+		}
+		if (state === 'failed' || state === 'closed') {
+			stopWebRTC();
+		}
+	};
+
+	pc.ondatachannel = (e) => {
+		const dc = e.channel;
+		rtc.dc = dc;
+		dc.onopen = () => {
+			updateWebRTCState('connected');
+		};
+		dc.onclose = () => {
+			if (rtc?.dc === dc) {
+				rtc.dc = null;
+			}
+		};
+		dc.onerror = (err) => {
+			console.error('Data channel error:', err);
+		};
+	};
+
+	pc.ontrack = (e) => {
+		if (!videoEl) return;
+		const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
+		if (videoEl.srcObject !== stream) {
+			videoEl.srcObject = stream;
+		}
+	};
+
+	try {
+		const offer = await pc.createOffer({iceRestart});
+		await pc.setLocalDescription(offer);
+		sendData({
+			act: 'DESKTOP_WEBRTC_OFFER',
+			data: {
+				sdp: offer.sdp,
+				type: offer.type,
+				desktop: deviceId
+			}
+		});
+	} catch (err) {
+		console.error('Failed to create offer:', err);
+		stopWebRTC();
+	}
+}
+
+async function restartICE(deviceId) {
+	if (!rtc?.pc || !conn) {
+		return startWebRTC(deviceId);
+	}
+
+	try {
+		const offer = await rtc.pc.createOffer({iceRestart: true});
+		await rtc.pc.setLocalDescription(offer);
+		sendData({
+			act: 'DESKTOP_WEBRTC_OFFER',
+			data: {
+				sdp: offer.sdp,
+				type: offer.type,
+				desktop: deviceId,
+				retry: iceRestartAttempts
+			}
+		});
+	} catch (err) {
+		console.error('ICE restart failed:', err);
+		stopWebRTC();
+	}
+}
+
+function handleRTCAnswer(data) {
+	if (!rtc?.pc || !data?.sdp) return;
+	rtc.pc.setRemoteDescription({
+		type: data.type || 'answer',
+		sdp: data.sdp
+	}).catch((err) => {
+		console.error('Failed to set remote description:', err);
+	});
+}
+
+function handleRTCCandidate(data) {
+	if (!rtc?.pc || !data?.candidate) return;
+	rtc.pc.addIceCandidate({
+		candidate: data.candidate,
+		sdpMid: data.sdpMid,
+		sdpMLineIndex: data.mLine ?? data.sdpMLineIndex
+	}).catch((err) => {
+		console.error('Failed to add ICE candidate:', err);
+	});
+}
+
 function sendData(data) {
-	if (conn) {
+	if (conn && ws && ws.readyState === WebSocket.OPEN) {
 		let body = encrypt(str2ua(JSON.stringify(data)), secret);
 		let buffer = new Uint8Array(body.length + 8);
 		buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
@@ -54,10 +247,18 @@ function flushInputBuffer() {
 	if (!conn || !inputActive || inputBuffer.length === 0) {
 		return;
 	}
-	sendData({
-		act: 'DESKTOP_INPUT',
-		data: {events: inputBuffer}
-	});
+	// Prefer data channel for lower latency when WebRTC is connected
+	if (rtc?.dc && rtc.dc.readyState === 'open') {
+		try {
+			rtc.dc.send(JSON.stringify({events: inputBuffer}));
+			inputBuffer = [];
+			return;
+		} catch (err) {
+			console.warn('Data channel send failed, falling back to WebSocket:', err);
+		}
+	}
+	// Fallback to WebSocket
+	sendData({act: 'DESKTOP_INPUT', data: {events: inputBuffer}});
 	inputBuffer = [];
 }
 
@@ -79,8 +280,8 @@ function stopInputPipeline() {
 		clearInterval(inputTimer);
 		inputTimer = null;
 	}
-	if (document.pointerLockElement === canvas && document.exitPointerLock) {
-		document.exitPointerLock().catch(() => {});
+	if (document.pointerLockElement && document.exitPointerLock) {
+		document.exitPointerLock()?.catch?.(() => {});
 	}
 	setPointerLockState(false);
 }
@@ -102,14 +303,16 @@ function attachInputHandlers() {
 }
 
 function detachInputHandlers() {
-	if (!canvas || !inputAttached) {
+	if (!inputAttached) {
 		return;
 	}
-	canvas.removeEventListener('mousemove', handleMouseMove);
-	canvas.removeEventListener('mousedown', handleMouseDown);
-	canvas.removeEventListener('mouseup', handleMouseUp);
-	canvas.removeEventListener('mouseleave', handleMouseLeave);
-	canvas.removeEventListener('wheel', handleWheel);
+	if (canvas) {
+		canvas.removeEventListener('mousemove', handleMouseMove);
+		canvas.removeEventListener('mousedown', handleMouseDown);
+		canvas.removeEventListener('mouseup', handleMouseUp);
+		canvas.removeEventListener('mouseleave', handleMouseLeave);
+		canvas.removeEventListener('wheel', handleWheel, {passive: false});
+	}
 	window.removeEventListener('keydown', handleKeyDown);
 	window.removeEventListener('keyup', handleKeyUp);
 	document.removeEventListener('pointerlockchange', handlePointerLockChange);
@@ -214,18 +417,34 @@ function handlePointerLockError() {
 	setPointerLockState(false);
 	message.warn(i18n.t('COMMON.UNKNOWN_ERROR'));
 }
+
 function ScreenModal(props) {
 	const [resolution, setResolution] = useState('0x0');
 	const [bandwidth, setBandwidth] = useState(0);
 	const [fps, setFps] = useState(0);
+	const [webrtcUiState, setWebrtcUiState] = useState('off');
+	const [webrtcToggle, setWebrtcToggle] = useState(true);
 	const [pointerLocked, setPointerLocked] = useState(false);
 	const [controlEnabled, setControlEnabled] = useState(true);
+
 	useEffect(() => {
 		setPointerLockState = setPointerLocked;
+		webrtcStateSetter = setWebrtcUiState;
 		return () => {
 			setPointerLockState = () => {};
+			webrtcStateSetter = () => {};
 		};
 	}, []);
+
+	useEffect(() => {
+		webrtcEnabled = webrtcToggle;
+		if (!webrtcToggle) {
+			stopWebRTC();
+		} else if (conn && currentDeviceId) {
+			startWebRTC(currentDeviceId).catch(() => stopWebRTC());
+		}
+	}, [webrtcToggle, props.device?.id]);
+
 	useEffect(() => {
 		inputAllowed = controlEnabled;
 		if (!controlEnabled) {
@@ -234,15 +453,18 @@ function ScreenModal(props) {
 			startInputPipeline();
 		}
 	}, [controlEnabled]);
+
 	const canvasRef = useCallback((e) => {
 		if (e && props.open && !conn && !canvas) {
 			secret = hex2ua(genRandHex(32));
 			canvas = e;
+			canvas.tabIndex = 0;
 			inputAttached = false;
 			initCanvas(canvas);
 			construct(canvas);
 		}
 	}, [props]);
+
 	const toggleControl = () => {
 		setControlEnabled((prev) => {
 			if (prev) {
@@ -253,15 +475,17 @@ function ScreenModal(props) {
 			return !prev;
 		});
 	};
+
 	const togglePointerLock = () => {
 		if (!canvas) return;
 		if (document.pointerLockElement === canvas) {
-			document.exitPointerLock?.().catch(() => {});
+			document.exitPointerLock?.()?.catch?.(() => {});
 			return;
 		}
 		if (!conn || !controlEnabled) return;
 		canvas.requestPointerLock?.();
 	};
+
 	useEffect(() => {
 		if (!props.open) {
 			stopInputPipeline();
@@ -273,6 +497,8 @@ function ScreenModal(props) {
 				ws.close();
 				conn = false;
 			}
+			stopWebRTC();
+			currentDeviceId = null;
 		}
 	}, [props.open]);
 
@@ -281,17 +507,22 @@ function ScreenModal(props) {
 		ctx = canvas.getContext('2d', {alpha: false});
 		ctx.imageSmoothingEnabled = false;
 	}
+
 	function construct() {
 		if (ctx !== null) {
 			if (ws !== null && conn) {
 				ws.close();
 			}
+			currentDeviceId = props.device.id;
 			ws = new WebSocket(getBaseURL(true, `api/device/desktop?device=${props.device.id}&secret=${ua2hex(secret)}`));
 			ws.binaryType = 'arraybuffer';
 			ws.onopen = () => {
 				conn = true;
 				startInputPipeline();
-			}
+				if (webrtcEnabled) {
+					startWebRTC(props.device.id).catch(() => stopWebRTC());
+				}
+			};
 			ws.onmessage = (e) => {
 				parseBlocks(e.data, canvas, ctx);
 			};
@@ -299,6 +530,7 @@ function ScreenModal(props) {
 				stopInputPipeline();
 				setPointerLocked(false);
 				clearInterval(ticker);
+				stopWebRTC();
 				if (conn) {
 					conn = false;
 					message.warn(i18n.t('COMMON.DISCONNECTED'));
@@ -309,6 +541,7 @@ function ScreenModal(props) {
 				stopInputPipeline();
 				setPointerLocked(false);
 				clearInterval(ticker);
+				stopWebRTC();
 				if (conn) {
 					conn = false;
 					message.warn(i18n.t('COMMON.DISCONNECTED'));
@@ -332,9 +565,11 @@ function ScreenModal(props) {
 			}, 1000);
 		}
 	}
+
 	function fullScreen() {
 		canvas.requestFullscreen().catch(console.error);
 	}
+
 	function refresh() {
 		if (canvas && props.open) {
 			if (!conn) {
@@ -347,21 +582,15 @@ function ScreenModal(props) {
 			}
 		}
 	}
-	function togglePointerLock() {
-		if (!canvas) return;
-		if (document.pointerLockElement === canvas) {
-			if (document.exitPointerLock) {
-				document.exitPointerLock().catch(() => {});
-			}
-		} else if (canvas.requestPointerLock) {
-			canvas.requestPointerLock();
-		}
-	}
 
 	function parseBlocks(ab, canvas, canvasCtx) {
 		ab = ab.slice(5);
 		let dv = new DataView(ab);
 		let op = dv.getUint8(0);
+		// When WebRTC video is connected, skip frame data (only handle resolution and JSON)
+		if (webrtcState === 'connected' && op !== 2 && op !== 3) {
+			return;
+		}
 		if (op === 3) {
 			handleJSON(ab.slice(1));
 			return;
@@ -392,6 +621,7 @@ function ScreenModal(props) {
 		}
 		dv = null;
 	}
+
 	function updateImage(ab, it, dx, dy, bw, bh, canvasCtx) {
 		switch (it) {
 			case 0:
@@ -407,11 +637,30 @@ function ScreenModal(props) {
 				break;
 		}
 	}
+
 	function handleJSON(ab) {
 		let data = decrypt(ab, secret);
 		try {
 			data = JSON.parse(data);
-		} catch (_) {}
+		} catch (_) {
+			return;
+		}
+		if (data?.act === 'DESKTOP_WEBRTC_ANSWER') {
+			if (data.code && data.code !== 0) {
+				message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				stopWebRTC();
+				return;
+			}
+			handleRTCAnswer(data.data || data);
+			return;
+		}
+		if (data?.act === 'DESKTOP_WEBRTC_ICE') {
+			if (data.code && data.code !== 0) {
+				return;
+			}
+			handleRTCCandidate(data.data || data);
+			return;
+		}
 		if (data?.act === 'DESKTOP_INPUT' && data.code && data.code !== 0) {
 			message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
 			return;
@@ -441,10 +690,28 @@ function ScreenModal(props) {
 			}}
 			{...props}
 		>
+			<video
+				ref={(el) => {videoEl = el;}}
+				style={{
+					position: 'absolute',
+					inset: 0,
+					width: '100%',
+					height: '100%',
+					objectFit: 'contain',
+					pointerEvents: 'none',
+					display: webrtcState === 'connected' ? 'block' : 'none',
+					background: '#000'
+				}}
+				muted
+				playsInline
+				autoPlay
+			/>
 			<canvas
 				id='painter'
 				ref={canvasRef}
-				style={{width: '100%', height: '100%'}}
+				onFocus={() => {inputFocused = true;}}
+				onBlur={() => {if (document.pointerLockElement !== canvas) {inputFocused = false;}}}
+				style={{width: '100%', height: '100%', visibility: webrtcState === 'connected' ? 'hidden' : 'visible'}}
 			/>
 			<Button
 				style={{right:'59px'}}
@@ -455,12 +722,36 @@ function ScreenModal(props) {
 			<Button
 				style={{right:'115px'}}
 				className='header-button'
-				type={pointerLocked ? 'primary' : 'default'}
-				icon={<LockOutlined />}
-				onClick={togglePointerLock}
+				type={controlEnabled ? 'primary' : 'default'}
+				danger={!controlEnabled}
+				icon={<PoweroffOutlined />}
+				onClick={toggleControl}
 			/>
 			<Button
 				style={{right:'171px'}}
+				className='header-button'
+				type={pointerLocked ? 'primary' : 'default'}
+				icon={<LockOutlined />}
+				disabled={!controlEnabled}
+				onClick={togglePointerLock}
+			/>
+			<Button
+				style={{right:'227px'}}
+				className='header-button'
+				type={webrtcUiState === 'connected' ? 'primary' : 'default'}
+				icon={<VideoCameraOutlined />}
+				onClick={() => {
+					if (webrtcState === 'connected' || webrtcState === 'connecting') {
+						stopWebRTC();
+					} else if (currentDeviceId) {
+						startWebRTC(currentDeviceId);
+					}
+				}}
+			>
+				{webrtcUiState === 'connected' ? 'WebRTC' : webrtcUiState === 'connecting' ? 'WebRTC...' : 'WebRTC Off'}
+			</Button>
+			<Button
+				style={{right:'283px'}}
 				className='header-button'
 				icon={<FullscreenOutlined />}
 				onClick={fullScreen}

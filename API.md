@@ -340,3 +340,165 @@ Parameters: `pid` and `device` (device ID)
     "msg": "${i18n|COMMON.DEVICE_NOT_EXIST}"
 }
 ```
+
+---
+
+## Desktop Remote Control
+
+The desktop remote control feature allows real-time screen viewing and input control of remote devices.
+
+### Desktop WebSocket: `/device/desktop`
+
+**Query Parameters**: `device` (device ID) and `secret` (32-character hex string)
+
+This is a WebSocket endpoint for real-time desktop streaming. The connection uses a binary protocol for efficiency.
+
+#### Connection Example
+```javascript
+const secret = crypto.getRandomValues(new Uint8Array(16));
+const secretHex = Array.from(secret).map(b => b.toString(16).padStart(2, '0')).join('');
+const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}&secret=${secretHex}`);
+ws.binaryType = 'arraybuffer';
+```
+
+#### Binary Protocol
+
+All messages use a binary format with a 5-byte magic header: `[34, 22, 19, 17, 20]`
+
+**Op Codes (6th byte):**
+| Code | Direction | Description |
+|------|-----------|-------------|
+| 0x00 | Server→Client | First part of a frame |
+| 0x01 | Server→Client | Rest parts of a frame |
+| 0x02 | Server→Client | Resolution information |
+| 0x03 | Both | JSON data (encrypted) |
+
+**Sending Messages:**
+```javascript
+function sendData(data) {
+    const json = JSON.stringify(data);
+    const encrypted = encrypt(json, secret); // XOR encryption
+    const buffer = new Uint8Array(encrypted.length + 8);
+    buffer.set([34, 22, 19, 17, 20, 3], 0);
+    buffer.set([encrypted.length >> 8, encrypted.length & 0xFF], 6);
+    buffer.set(encrypted, 8);
+    ws.send(buffer);
+}
+```
+
+#### Desktop Actions
+
+**Ping (keep-alive):**
+```json
+{"act": "DESKTOP_PING"}
+```
+
+**Request full frame refresh:**
+```json
+{"act": "DESKTOP_SHOT"}
+```
+
+**Kill desktop session:**
+```json
+{"act": "DESKTOP_KILL"}
+```
+
+**Send input events:**
+```json
+{
+    "act": "DESKTOP_INPUT",
+    "data": {
+        "events": [
+            {"type": "move", "x": 100, "y": 200},
+            {"type": "button", "button": "left", "down": true},
+            {"type": "button", "button": "left", "down": false},
+            {"type": "scroll", "deltaX": 0, "deltaY": -120},
+            {"type": "key", "key": "a", "keyCode": 65, "down": true}
+        ]
+    }
+}
+```
+
+**Input Event Types:**
+| Type | Fields | Description |
+|------|--------|-------------|
+| move | x, y | Absolute mouse position |
+| move | deltaX, deltaY | Relative mouse movement (pointer lock) |
+| button | button, down | Mouse button (left/middle/right) |
+| scroll | deltaX, deltaY | Mouse wheel scroll |
+| key | key, keyCode, down | Keyboard input |
+
+---
+
+### WebRTC Desktop: `/device/webrtc/config`
+
+**Query Parameters**: `device` (device ID)
+
+Get WebRTC ICE server configuration for the device.
+
+```
+{
+    "code": 0,
+    "data": {
+        "ice": {
+            "stun": ["stun:stun.l.google.com:19302"],
+            "turn": []
+        }
+    }
+}
+```
+
+#### WebRTC Signaling
+
+WebRTC signaling messages are sent through the desktop WebSocket connection.
+
+**Send WebRTC Offer:**
+```json
+{
+    "act": "DESKTOP_WEBRTC_OFFER",
+    "data": {
+        "sdp": "v=0\r\no=...",
+        "type": "offer"
+    }
+}
+```
+
+**Receive WebRTC Answer:**
+```json
+{
+    "act": "DESKTOP_WEBRTC_ANSWER",
+    "data": {
+        "sdp": "v=0\r\no=...",
+        "type": "answer"
+    }
+}
+```
+
+**Exchange ICE Candidates:**
+```json
+{
+    "act": "DESKTOP_WEBRTC_ICE",
+    "data": {
+        "candidate": "candidate:...",
+        "sdpMid": "0",
+        "mLine": 0
+    }
+}
+```
+
+#### WebRTC Features
+
+- **Video Track**: VP8 or VP9 encoded screen capture
+- **Data Channel**: `desktop-input` for low-latency input transmission
+- **ICE Restart**: Automatic reconnection on network changes
+
+#### Environment Variables (Client)
+
+| Variable | Description |
+|----------|-------------|
+| `SPARK_WEBRTC_ICE` | Custom ICE servers (format: `url\|user\|pass`) |
+| `SPARK_WEBRTC_STUN` | STUN server URLs (comma-separated) |
+| `SPARK_WEBRTC_TURN` | TURN server URLs (comma-separated) |
+| `SPARK_WEBRTC_TURN_USERNAME` | TURN username |
+| `SPARK_WEBRTC_TURN_PASSWORD` | TURN password |
+| `SPARK_WEBRTC_CODEC` | Video codec (`vp8` or `vp9`, default: `vp8`) |
