@@ -1,15 +1,17 @@
 package generate
 
 import (
+	clientcfg "Spark/client/config"
 	"Spark/modules"
 	"Spark/server/common"
-	"Spark/server/config"
+	servercfg "Spark/server/config"
 	"Spark/utils"
 	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
@@ -43,7 +45,7 @@ func CheckClient(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	_, err := os.Stat(fmt.Sprintf(config.BuiltPath, form.OS, form.Arch))
+	_, err := os.Stat(fmt.Sprintf(servercfg.BuiltPath, form.OS, form.Arch))
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusNotFound, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.NO_PREBUILT_FOUND}`})
 		return
@@ -80,14 +82,14 @@ func GenerateClient(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	tpl, err := os.Open(fmt.Sprintf(config.BuiltPath, form.OS, form.Arch))
+	tpl, err := os.Open(fmt.Sprintf(servercfg.BuiltPath, form.OS, form.Arch))
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusNotFound, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.NO_PREBUILT_FOUND}`})
 		return
 	}
 	defer tpl.Close()
 	clientUUID := utils.GetUUID()
-	clientKey, err := common.EncAES(clientUUID, config.Config.SaltBytes)
+	clientKey, err := common.EncAES(clientUUID, servercfg.Config.SaltBytes)
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.CONFIG_GENERATE_FAILED}`})
 		return
@@ -111,36 +113,19 @@ func GenerateClient(ctx *gin.Context) {
 	ctx.Header(`Accept-Ranges`, `none`)
 	ctx.Header(`Content-Transfer-Encoding`, `binary`)
 	ctx.Header(`Content-Type`, `application/octet-stream`)
+	trailerFooter := clientcfg.BuildTrailerFooter(cfgBytes)
 	if stat, err := tpl.Stat(); err == nil {
-		ctx.Header(`Content-Length`, strconv.FormatInt(stat.Size(), 10))
+		total := stat.Size() + int64(len(cfgBytes)) + int64(clientcfg.TrailerFooterSize)
+		ctx.Header(`Content-Length`, strconv.FormatInt(total, 10))
 	}
 	if form.OS == `windows` {
 		ctx.Header(`Content-Disposition`, `attachment; filename=client.exe; filename*=UTF-8''client.exe`)
 	} else {
 		ctx.Header(`Content-Disposition`, `attachment; filename=client; filename*=UTF-8''client`)
 	}
-	// Find and replace plain buffer with encrypted configuration.
-	cfgBuffer := bytes.Repeat([]byte{'\x19'}, 384)
-	prevBuffer := make([]byte, 0)
-	for {
-		thisBuffer := make([]byte, 1024)
-		n, err := tpl.Read(thisBuffer)
-		thisBuffer = thisBuffer[:n]
-		tempBuffer := append(prevBuffer, thisBuffer...)
-		bufIndex := bytes.Index(tempBuffer, cfgBuffer)
-		if bufIndex > -1 {
-			tempBuffer = bytes.Replace(tempBuffer, cfgBuffer, cfgBytes, -1)
-		}
-		ctx.Writer.Write(tempBuffer[:len(prevBuffer)])
-		prevBuffer = tempBuffer[len(prevBuffer):]
-		if err != nil {
-			break
-		}
-	}
-	if len(prevBuffer) > 0 {
-		ctx.Writer.Write(prevBuffer)
-		prevBuffer = nil
-	}
+	io.Copy(ctx.Writer, tpl)
+	ctx.Writer.Write(cfgBytes)
+	ctx.Writer.Write(trailerFooter)
 }
 
 func genConfig(cfg clientCfg) ([]byte, error) {
@@ -154,7 +139,7 @@ func genConfig(cfg clientCfg) ([]byte, error) {
 		return nil, err
 	}
 	final := append(key, data...)
-	if len(final) > 384-2 {
+	if len(final) > clientcfg.ConfigBufferSize-2 {
 		return nil, ErrTooLargeEntity
 	}
 
@@ -163,11 +148,11 @@ func genConfig(cfg clientCfg) ([]byte, error) {
 	dataLen := big.NewInt(int64(len(final))).Bytes()
 	dataLen = append(bytes.Repeat([]byte{'\x00'}, 2-len(dataLen)), dataLen...)
 
-	// If the length of encrypted buffer is less than 384,
+	// If the length of encrypted buffer is less than ConfigBufferSize,
 	// append the remaining bytes with random bytes.
 	final = append(dataLen, final...)
-	for len(final) < 384 {
+	for len(final) < clientcfg.ConfigBufferSize {
 		final = append(final, utils.GetUUID()...)
 	}
-	return final[:384], nil
+	return final[:clientcfg.ConfigBufferSize], nil
 }
