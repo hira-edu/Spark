@@ -281,7 +281,7 @@ GOOS=linux GOARCH=amd64 go build ...
 - [x] Add signaling endpoints in the server (offer/answer + ICE) with auth checks and configurable TURN list; bridge acts `DESKTOP_WEBRTC_OFFER/ANSWER/CANDIDATE` with size validation.
 - [x] Web frontend: negotiate WebRTC, render the video track, and send batched DESKTOP_INPUT over the data channel with reconnect handling and a disable toggle.
 - [ ] Add observability (connection state logs/metrics) and a first-class flag to disable WebRTC entirely (currently default-on with opt-out env only).
-- [ ] Secure share/guest desktop: tie share tokens to desktop sessions and enforce them on a guest-only WS endpoint that wraps the same WebRTC+WS desktop stream with view-only input gating; add TTL + single-use options, log token access, revoke on device disconnect, and optionally filter guest ICE config to TURN-only.
+- [x] Secure share/guest desktop: tie share tokens to desktop sessions and enforce them on a guest-only WS endpoint (`/api/share/desktop`) that wraps the same WebRTC+WS desktop stream with view-only input gating; TTL + single-use options, access logging, revoke on device disconnect, and TURN-only ICE filtering for guests.
 
 ### Phase 3: Optimizations
 - [x] Windows SendInput fast path with DPI awareness + wake (SetThreadDpiAwarenessContext + SetThreadExecutionState); further screensaver/idle tuning still possible.

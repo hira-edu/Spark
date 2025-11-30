@@ -10,6 +10,7 @@ import i18n from "./locale/locale";
 import './global.css';
 import 'antd/dist/antd.css';
 import Overview from "./pages/overview";
+import SharePage from "./pages/share";
 import {translate} from "./utils/utils";
 
 axios.defaults.baseURL = '.';
@@ -46,9 +47,10 @@ axios.interceptors.response.use(async res => {
 ReactDOM.render(
 	<Router>
 		<Routes>
-			<Route path="/" element={<Wrapper><Overview/></Wrapper>}/>
-			<Route path="*" element={<Err/>}/>
-		</Routes>
+            <Route path="/" element={<Wrapper><Overview/></Wrapper>}/>
+            <Route path="/share" element={<SharePage/>}/>
+            <Route path="*" element={<Err/>}/>
+        </Routes>
 	</Router>,
 	document.getElementById('root')
 );

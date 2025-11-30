@@ -6,6 +6,9 @@
 * Add: pointer lock mode for relative mouse movement.
 * Add: SDP and ICE candidate validation.
 * Add: WebSocket origin validation (CSWSH prevention).
+* Add: Desktop sharing with guest access (view-only, single-use, TTL).
+* Add: TURN-only ICE filtering for guest connections.
+* Add: Share access logging and token management.
 * Optimize: VPX encoder caching for better performance.
 * Optimize: input rate limiting with atomic operations.
 * Fix: race conditions in desktop session handling.
@@ -18,6 +21,9 @@
 * 新增：指针锁定模式支持相对鼠标移动。
 * 新增：SDP 和 ICE 候选验证。
 * 新增：WebSocket 来源验证（CSWSH 防护）。
+* 新增：桌面共享访客访问（仅查看、一次性、有效期）。
+* 新增：访客连接的TURN-only ICE过滤。
+* 新增：共享访问日志和令牌管理。
 * 优化：VPX 编码器缓存提升性能。
 * 优化：输入速率限制使用原子操作。
 * 修复：桌面会话处理中的竞态条件。

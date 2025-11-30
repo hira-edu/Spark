@@ -26,6 +26,7 @@ func InitRouter(ctx *gin.RouterGroup) {
 
 	// Public guest access endpoints (no auth required)
 	ctx.GET(`/share/validate`, share.ValidateShareToken)
+	ctx.GET(`/share/ice`, share.GetGuestICEConfig)
 	ctx.Any(`/share/desktop`, share.InitGuestDesktop)
 
 	group := ctx.Group(`/`, AuthHandler)
@@ -58,6 +59,7 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.GET(`/share/list`, share.ListShares)
 		group.GET(`/share/:id`, share.GetShare)
 		group.GET(`/share/:id/token`, share.GetShareToken)
+		group.GET(`/share/:id/access-log`, share.GetShareAccessLog)
 		group.POST(`/share/revoke`, share.RevokeShare)
 		group.POST(`/share/delete`, share.DeleteShare)
 	}

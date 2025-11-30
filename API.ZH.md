@@ -508,3 +508,172 @@ WebRTC 信令消息通过桌面 WebSocket 连接发送。
 | `SPARK_WEBRTC_TURN_USERNAME` | TURN 用户名 |
 | `SPARK_WEBRTC_TURN_PASSWORD` | TURN 密码 |
 | `SPARK_WEBRTC_CODEC` | 视频编码器（`vp8` 或 `vp9`，默认：`vp8`） |
+
+---
+
+## 桌面共享（访客访问）
+
+与外部用户共享桌面会话，无需身份验证。
+
+### 创建共享：`/share/create`（POST，需要认证）
+
+创建桌面会话的可共享链接。
+
+**参数：**
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| device | string | 设备ID（必填） |
+| desktop | string | 桌面会话ID（可选） |
+| ttlSeconds | int | 有效期（秒，默认：3600，最大：86400） |
+| singleUse | bool | 令牌只能使用一次（默认：false） |
+| viewOnly | bool | 访客只能查看，不能控制（默认：false） |
+| turnOnly | bool | 访客ICE配置仅使用TURN（默认：false） |
+
+**响应：**
+```json
+{
+    "code": 0,
+    "data": {
+        "share": {
+            "id": "share-uuid",
+            "device": "device-id",
+            "token": "guest-access-token",
+            "expiresAt": "2024-01-01T12:00:00Z",
+            "singleUse": false,
+            "viewOnly": true,
+            "turnOnly": false,
+            "createdAt": "2024-01-01T11:00:00Z"
+        }
+    }
+}
+```
+
+---
+
+### 列出共享：`/share/list`（GET，需要认证）
+
+列出所有活动的共享。
+
+```json
+{
+    "code": 0,
+    "data": {
+        "shares": [...]
+    }
+}
+```
+
+---
+
+### 获取共享：`/share/:id`（GET，需要认证）
+
+获取特定共享的详细信息。
+
+---
+
+### 获取共享令牌：`/share/:id/token`（GET，需要认证）
+
+获取共享的令牌（用于分享给访客）。
+
+```json
+{
+    "code": 0,
+    "data": {
+        "token": "guest-access-token",
+        "expiresAt": "2024-01-01T12:00:00Z",
+        "singleUse": false,
+        "used": false
+    }
+}
+```
+
+---
+
+### 获取共享访问日志：`/share/:id/access-log`（GET，需要认证）
+
+查看共享的访问记录。
+
+```json
+{
+    "code": 0,
+    "data": {
+        "accessLog": [
+            {
+                "timestamp": "2024-01-01T11:30:00Z",
+                "ip": "192.168.1.100",
+                "userAgent": "Mozilla/5.0...",
+                "success": true,
+                "reason": ""
+            }
+        ]
+    }
+}
+```
+
+---
+
+### 撤销共享：`/share/revoke`（POST，需要认证）
+
+撤销共享并断开所有活动的访客会话。
+
+**参数：**`id`（共享ID）
+
+---
+
+### 验证令牌：`/share/validate`（GET，公开）
+
+验证访客访问令牌。
+
+**查询参数：**`token`
+
+```json
+{
+    "code": 0,
+    "data": {
+        "share": {
+            "id": "share-uuid",
+            "device": "device-id",
+            "expiresAt": "2024-01-01T12:00:00Z",
+            "viewOnly": true
+        }
+    }
+}
+```
+
+---
+
+### 访客ICE配置：`/share/ice`（GET，公开）
+
+获取访客WebRTC连接的ICE服务器配置。
+
+**查询参数：**`token`
+
+如果共享设置了 `turnOnly: true`，STUN服务器将被排除。
+
+```json
+{
+    "code": 0,
+    "data": {
+        "ice": {
+            "stun": ["stun:stun.l.google.com:19302"],
+            "turn": []
+        }
+    }
+}
+```
+
+---
+
+### 访客桌面WebSocket：`/share/desktop`（公开）
+
+访客桌面访问的WebSocket端点。
+
+**查询参数：**
+- `token` - 访客访问令牌
+- `secret` - 32位十六进制加密密钥
+
+访客连接特性：
+- 使用与认证桌面连接相同的二进制协议
+- 仅查看模式的共享将拒绝 `DESKTOP_INPUT` 消息并返回错误码
+- 设备断开时共享自动撤销
+- 一次性令牌在首次连接时标记为已使用

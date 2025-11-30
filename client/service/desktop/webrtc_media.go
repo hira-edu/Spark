@@ -1,3 +1,6 @@
+//go:build !mediasrc
+// +build !mediasrc
+
 package desktop
 
 import (
@@ -111,5 +114,3 @@ func fill(img *image.RGBA, c color.RGBA) {
 		buf[i+3] = c.A
 	}
 }
-//go:build !mediasrc
-// +build !mediasrc

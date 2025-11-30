@@ -42,6 +42,8 @@ const defaultIceServers = [
 	{urls: 'stun:stun.l.google.com:19302'},
 	{urls: 'stun:stun.cloudflare.com:3478'},
 ];
+let iceInfoSetter = () => {};
+let currentIceInfo = 'default';
 
 function clamp(val, min, max) {
 	if (val < min) return min;
@@ -85,6 +87,7 @@ async function startWebRTC(deviceId, iceRestart = false) {
 
 	// Fetch ICE servers from server config
 	let iceServers = defaultIceServers;
+	let iceLabel = 'default';
 	try {
 		const resp = await axios.get(getBaseURL(false, `/api/device/webrtc/config?device=${deviceId}`));
 		if (resp?.data?.data?.ice) {
@@ -99,6 +102,19 @@ async function startWebRTC(deviceId, iceRestart = false) {
 	} catch (e) {
 		console.warn('fallback to default ICE', e);
 	}
+	try {
+		const urls = [];
+		iceServers.forEach((s) => {
+			if (Array.isArray(s.urls)) {
+				urls.push(...s.urls);
+			} else if (s.urls) {
+				urls.push(s.urls);
+			}
+		});
+		iceLabel = urls.join(', ') || iceLabel;
+		currentIceInfo = iceLabel;
+		iceInfoSetter(iceLabel);
+	} catch (_) {}
 
 	const pc = new RTCPeerConnection({iceServers});
 	rtc = {pc, dc: null};
@@ -426,13 +442,16 @@ function ScreenModal(props) {
 	const [webrtcToggle, setWebrtcToggle] = useState(true);
 	const [pointerLocked, setPointerLocked] = useState(false);
 	const [controlEnabled, setControlEnabled] = useState(true);
+	const [iceSummary, setIceSummary] = useState('default');
 
 	useEffect(() => {
 		setPointerLockState = setPointerLocked;
 		webrtcStateSetter = setWebrtcUiState;
+		iceInfoSetter = setIceSummary;
 		return () => {
 			setPointerLockState = () => {};
 			webrtcStateSetter = () => {};
+			iceInfoSetter = () => {};
 		};
 	}, []);
 
@@ -681,7 +700,7 @@ function ScreenModal(props) {
 			draggable={true}
 			maskClosable={false}
 			destroyOnClose={true}
-			modalTitle={`${title} ${resolution} ${formatSize(bandwidth)}/s FPS: ${fps}`}
+				modalTitle={`${title} ${resolution} ${formatSize(bandwidth)}/s FPS: ${fps} | RTC: ${webrtcUiState} (ICE: ${iceSummary})`}
 			footer={null}
 			height={480}
 			width={940}

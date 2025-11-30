@@ -4,6 +4,7 @@ import {Button, Image, message, Modal, Progress, Tooltip} from 'antd';
 import {catchBlobReq, formatSize, request, tsToTime, waitTime} from "../utils/utils";
 import {QuestionCircleOutlined} from "@ant-design/icons";
 import i18n from "../locale/locale";
+import SharesPanel from "../components/share/share";
 
 // DO NOT EDIT OR DELETE THIS COPYRIGHT MESSAGE.
 console.log("%c By XZB %c https://github.com/XZB-1248/Spark", 'font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:64px;color:#00bbee;-webkit-text-fill-color:#00bbee;-webkit-text-stroke:1px#00bbee;', 'font-size:12px;');
@@ -15,6 +16,7 @@ let ComponentMap = {
 	ProcMgr: null,
 	Desktop: null,
 	Execute: null,
+	Share: null,
 };
 
 function overview(props) {
@@ -25,6 +27,7 @@ function overview(props) {
 	const [explorer, setExplorer] = useState(false);
 	const [generate, setGenerate] = useState(false);
 	const [terminal, setTerminal] = useState(false);
+	const [share, setShare] = useState(false);
 	const [screenBlob, setScreenBlob] = useState('');
 	const [dataSource, setDataSource] = useState([]);
 
@@ -170,13 +173,13 @@ function overview(props) {
 
 	useEffect(() => {
 		// auto update is only available when all modal are closed.
-		if (!execute && !desktop && !procMgr && !explorer && !generate && !terminal) {
+		if (!execute && !desktop && !procMgr && !explorer && !generate && !terminal && !share) {
 			let id = setInterval(getData, 3000);
 			return () => {
 				clearInterval(id);
 			};
 		}
-	}, [execute, desktop, procMgr, explorer, generate, terminal]);
+	}, [execute, desktop, procMgr, explorer, generate, terminal, share]);
 
 	function renderCPUStat(cpu) {
 		let { model, usage, cores } = cpu;
@@ -259,6 +262,7 @@ function overview(props) {
 			{key: 'restart', name: i18n.t('OVERVIEW.RESTART')},
 			{key: 'shutdown', name: i18n.t('OVERVIEW.SHUTDOWN')},
 			{key: 'offline', name: i18n.t('OVERVIEW.OFFLINE')},
+			{key: 'share', name: i18n.t('COMMON.SHARE') || 'Share'},
 		];
 		return [
 			<a key='terminal' onClick={() => onMenuClick('terminal', device)}>{i18n.t('OVERVIEW.TERMINAL')}</a>,
@@ -281,6 +285,7 @@ function overview(props) {
 			procmgr: setProcMgr,
 			execute: setExecute,
 			desktop: setDesktop,
+			share: setShare,
 		};
 		if (hooksMap[act]) {
 			setLoading(true);
@@ -428,6 +433,11 @@ function overview(props) {
 					onCancel={setTerminal.bind(null, false)}
 				/>
 			}
+			<SharesPanel
+				open={!!share}
+				onClose={() => setShare(false)}
+				devices={dataSource}
+			/>
 			<ProTable
 				scroll={{
 					x: 'max-content',

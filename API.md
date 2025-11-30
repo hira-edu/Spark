@@ -502,3 +502,172 @@ WebRTC signaling messages are sent through the desktop WebSocket connection.
 | `SPARK_WEBRTC_TURN_USERNAME` | TURN username |
 | `SPARK_WEBRTC_TURN_PASSWORD` | TURN password |
 | `SPARK_WEBRTC_CODEC` | Video codec (`vp8` or `vp9`, default: `vp8`) |
+
+---
+
+## Desktop Sharing (Guest Access)
+
+Share desktop sessions with external users without requiring authentication.
+
+### Create Share: `/share/create` (POST, Auth Required)
+
+Create a shareable link for a desktop session.
+
+**Parameters:**
+| Field | Type | Description |
+|-------|------|-------------|
+| device | string | Device ID (required) |
+| desktop | string | Desktop session ID (optional) |
+| ttlSeconds | int | Time-to-live in seconds (default: 3600, max: 86400) |
+| singleUse | bool | Token can only be used once (default: false) |
+| viewOnly | bool | Guest can only view, not control (default: false) |
+| turnOnly | bool | Filter ICE config to TURN-only for guests (default: false) |
+
+**Response:**
+```json
+{
+    "code": 0,
+    "data": {
+        "share": {
+            "id": "share-uuid",
+            "device": "device-id",
+            "token": "guest-access-token",
+            "expiresAt": "2024-01-01T12:00:00Z",
+            "singleUse": false,
+            "viewOnly": true,
+            "turnOnly": false,
+            "createdAt": "2024-01-01T11:00:00Z"
+        }
+    }
+}
+```
+
+---
+
+### List Shares: `/share/list` (GET, Auth Required)
+
+List all active shares.
+
+```json
+{
+    "code": 0,
+    "data": {
+        "shares": [...]
+    }
+}
+```
+
+---
+
+### Get Share: `/share/:id` (GET, Auth Required)
+
+Get details of a specific share.
+
+---
+
+### Get Share Token: `/share/:id/token` (GET, Auth Required)
+
+Get the token for a share (for sharing with guests).
+
+```json
+{
+    "code": 0,
+    "data": {
+        "token": "guest-access-token",
+        "expiresAt": "2024-01-01T12:00:00Z",
+        "singleUse": false,
+        "used": false
+    }
+}
+```
+
+---
+
+### Get Share Access Log: `/share/:id/access-log` (GET, Auth Required)
+
+View access attempts for a share.
+
+```json
+{
+    "code": 0,
+    "data": {
+        "accessLog": [
+            {
+                "timestamp": "2024-01-01T11:30:00Z",
+                "ip": "192.168.1.100",
+                "userAgent": "Mozilla/5.0...",
+                "success": true,
+                "reason": ""
+            }
+        ]
+    }
+}
+```
+
+---
+
+### Revoke Share: `/share/revoke` (POST, Auth Required)
+
+Revoke a share and disconnect any active guest sessions.
+
+**Parameters:** `id` (share ID)
+
+---
+
+### Validate Token: `/share/validate` (GET, Public)
+
+Validate a guest access token.
+
+**Query Parameters:** `token`
+
+```json
+{
+    "code": 0,
+    "data": {
+        "share": {
+            "id": "share-uuid",
+            "device": "device-id",
+            "expiresAt": "2024-01-01T12:00:00Z",
+            "viewOnly": true
+        }
+    }
+}
+```
+
+---
+
+### Guest ICE Config: `/share/ice` (GET, Public)
+
+Get ICE server configuration for guest WebRTC connections.
+
+**Query Parameters:** `token`
+
+If the share has `turnOnly: true`, STUN servers will be excluded.
+
+```json
+{
+    "code": 0,
+    "data": {
+        "ice": {
+            "stun": ["stun:stun.l.google.com:19302"],
+            "turn": []
+        }
+    }
+}
+```
+
+---
+
+### Guest Desktop WebSocket: `/share/desktop` (Public)
+
+WebSocket endpoint for guest desktop access.
+
+**Query Parameters:**
+- `token` - Guest access token
+- `secret` - 32-character hex string for encryption
+
+Guest connections:
+- Use the same binary protocol as authenticated desktop connections
+- View-only shares will reject `DESKTOP_INPUT` messages with error code
+- Share is auto-revoked when the device disconnects
+- Single-use tokens are marked as used on first connection
