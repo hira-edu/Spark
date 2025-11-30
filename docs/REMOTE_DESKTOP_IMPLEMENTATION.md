@@ -22,6 +22,8 @@ This document outlines the implementation plan for adding full remote desktop co
 
 Add mouse and keyboard control using the RobotGo library.
 
+**Guardrails:** Prefer absolute coordinates when pointer lock is off, fall back to relative deltas when pointer lock is on, and always bound coordinates to the current display size. If a desktop session id is missing or stale, return `DESKTOP_INPUT` with a non-zero code and do not try to inject input.
+
 #### 1.1 Add RobotGo Dependency
 
 ```bash
@@ -307,6 +309,8 @@ window.addEventListener('keyup', (e) => {
 
 Replace WebSocket JPEG streaming with WebRTC for lower latency.
 
+**Guardrails:** Keep the existing binary header (magic + op + len) on the signaling JSON to avoid breaking older clients while rolling out. Do not send input over WebRTC until the data channel is open and negotiated; buffer and drop after 200 ms rather than blocking the render loop.
+
 #### 2.1 Add Pion WebRTC Dependency
 
 ```bash
@@ -519,30 +523,27 @@ GOOS=linux GOARCH=amd64 go build ...
 ## TODO Checklist
 
 ### Phase 1: Input Control
-- [ ] Add RobotGo to go.mod
-- [ ] Create `client/service/desktop/input.go`
-- [ ] Add key code mapping table
-- [ ] Register DESKTOP_INPUT handler in `client/core/handler.go`
-- [ ] Update `desktop.jsx` with input event listeners
-- [ ] Add input batching (16ms intervals)
-- [ ] Add pointer lock support for relative mouse movement
-- [ ] Test on Windows
-- [ ] Test on Linux
-- [ ] Test on macOS (accessibility permissions)
+- [ ] Define DESKTOP_INPUT payload: array of `{type, x, y, deltaX, deltaY, button, down, key, keyCode}` with a hard cap (e.g., 32 events) and keep the service/op headers (`0x14` + JSON `0x03`) unchanged.
+- [ ] Add RobotGo to `go.mod` (note CGO_ENABLED=1 in build docs) and author a key map from JS keyCode/key → RobotGo names (modifiers/function keys included).
+- [ ] Build `client/service/desktop/input.go`: parse/validate batches, clamp coordinates to display bounds, normalize scroll, drop unknown types, and short-circuit when sessions are missing or control is disabled.
+- [ ] Platform handling: implement Windows injection via RobotGo; return `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}` on non-Windows with a clear error surface; guard scroll granularity to prevent runaway deltas.
+- [ ] Wire `DESKTOP_INPUT` through `client/core/handler.go` with lightweight rate limiting (discard when >60Hz sustained) and callbacks on error.
+- [ ] Server bridge: accept `DESKTOP_INPUT` frames on the desktop websocket, attach the desktop UUID, validate payload size, and close or warn on malformed/oversized batches.
+- [ ] Web UI: add input enable/disable toggle + pointer-lock option, batch every 16 ms with a bounded buffer, scale coords using the remote resolution, and capture mouse move/button/wheel plus key down/up; clean up listeners on unmount.
+- [ ] Smoke test on Windows (move/click/scroll/modifier+char keys), note macOS Accessibility prompt requirement, and document Linux support status; add a short payload example to this doc once stabilized.
 
 ### Phase 2: WebRTC (Optional)
-- [ ] Add Pion WebRTC to go.mod
-- [ ] Create `client/service/desktop/webrtc.go`
-- [ ] Implement VP8 encoding
-- [ ] Add WebRTC signaling to server
-- [ ] Update web frontend for WebRTC
-- [ ] Add TURN server configuration
+- [ ] Add Pion WebRTC dependency and VP8/VP9 encoder (mediadevices/vpx or equivalent) with env-driven STUN/TURN.
+- [ ] Create `client/service/desktop/webrtc.go` to mirror JPEG cadence, reuse DESKTOP_INPUT over a data channel, and expose lifecycle hooks (offer/answer/ICE/state).
+- [ ] Add signaling endpoints in the server (offer/answer + ICE) with auth checks and a configurable TURN list.
+- [ ] Web frontend: negotiate WebRTC, render the video track, and send batched DESKTOP_INPUT over the data channel with reconnect handling and a disable toggle.
+- [ ] Add observability (connection state logs/metrics) and a flag to disable WebRTC entirely.
 
 ### Phase 3: Optimizations
-- [ ] Windows native input API
-- [ ] Hardware-accelerated encoding
-- [ ] Adaptive quality based on bandwidth
-- [ ] Multi-monitor support improvements
+- [ ] Windows native SendInput fast path (cursor + keyboard) with DPI awareness and screensaver wake.
+- [ ] Hardware-assisted encoding (NVENC/VAAPI/VideoToolbox) and adaptive quality/FPS based on bandwidth or dropped frames.
+- [ ] Multi-monitor selection with bounds offsets and cursor overlay.
+- [ ] Idle/keepalive cadence tweaks so capture drops to low-power mode when idle; add rate/permission guards and basic telemetry on drops/frame cadence.
 
 ---
 
@@ -557,7 +558,9 @@ GOOS=linux GOARCH=amd64 go build ...
 
 ## References
 
-- [RobotGo Documentation](https://github.com/go-vgo/robotgo)
-- [Pion WebRTC](https://github.com/pion/webrtc)
-- [webrtc-remote-desktop](https://pkg.go.dev/github.com/AJunior98/webrtc-remote-desktop)
-- [Spark Original](https://github.com/XZB-1248/Spark)
+- [RobotGo documentation](https://github.com/go-vgo/robotgo) and [key/mouse API](https://github.com/go-vgo/robotgo#keyboard)
+- [Pointer Lock API](https://developer.mozilla.org/en-US/docs/Web/API/Pointer_Lock_API) and [Wheel event](https://developer.mozilla.org/en-US/docs/Web/API/WheelEvent) normalization
+- [Pion WebRTC](https://github.com/pion/webrtc) and [datachannels guide](https://github.com/pion/webrtc/wiki/Examples#data-channels)
+- [Pion mediadevices VP8 codec](https://pkg.go.dev/github.com/pion/mediadevices/pkg/codec/vpx) and [TrackLocal](https://pkg.go.dev/github.com/pion/webrtc/v3#TrackLocal)
+- [WebRTC ICE/STUN/TURN primer](https://webrtc.org/getting-started/overview) and [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445)
+- [Spark original repository](https://github.com/XZB-1248/Spark) for baseline desktop pipeline
