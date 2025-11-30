@@ -22,6 +22,512 @@ This document focuses exclusively on **Phase 3: Remote Features** - the core fun
 
 ---
 
+## 0. Layout Stability & End-to-End Requirements
+
+### 0.1 Layout Stability Principles
+
+**CRITICAL: No Layout Shifts or Visual Jank**
+
+All components must maintain stable layouts with zero Cumulative Layout Shift (CLS).
+
+#### Fixed Dimensions Strategy
+
+```css
+/* ALL containers use fixed/constrained dimensions */
+
+/* Desktop Viewer - Fixed viewport */
+.desktop-viewer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: 48px 1fr 48px; /* Fixed toolbar + canvas + controls */
+  overflow: hidden;
+}
+
+/* Terminal - Fixed layout */
+.terminal-panel {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: 36px 40px 1fr 40px; /* Tabs + header + content + footer */
+  overflow: hidden;
+}
+
+/* File Explorer - Fixed layout */
+.file-explorer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: 48px 1fr 28px; /* Toolbar + content + status */
+  overflow: hidden;
+}
+```
+
+#### Reserved Space for Dynamic Content
+
+```css
+/* Stats display - reserve space even when loading */
+.stat-item {
+  min-width: 80px;  /* Reserve space for "9999 MB/s" */
+  height: 24px;
+}
+
+.stat-value {
+  display: inline-block;
+  min-width: 50px;
+  text-align: right;
+}
+
+/* Connection status - fixed width */
+.connection-status {
+  min-width: 140px; /* Reserve for "🟢 Connected 999ms" */
+}
+
+/* FPS counter - fixed width */
+.fps-display {
+  min-width: 60px;
+  font-variant-numeric: tabular-nums; /* Prevent number width changes */
+}
+```
+
+#### Skeleton Loaders (Not Spinners)
+
+```tsx
+// Always show skeleton with exact final dimensions
+const FileGridSkeleton: React.FC = () => (
+  <div className="file-grid">
+    {Array.from({ length: 12 }).map((_, i) => (
+      <div key={i} className="file-grid-item skeleton">
+        <div className="skeleton-icon" style={{ width: 48, height: 48 }} />
+        <div className="skeleton-name" style={{ width: 80, height: 14 }} />
+        <div className="skeleton-size" style={{ width: 40, height: 12 }} />
+      </div>
+    ))}
+  </div>
+);
+
+// Terminal skeleton maintains exact height
+const TerminalSkeleton: React.FC = () => (
+  <div className="terminal-content skeleton">
+    <div className="skeleton-cursor" />
+  </div>
+);
+```
+
+### 0.2 Component Placement Rules
+
+#### Z-Index Hierarchy (Strict Order)
+
+```css
+:root {
+  /* Base layers */
+  --z-base: 0;
+  --z-content: 10;
+
+  /* Interactive layers */
+  --z-toolbar: 100;
+  --z-controls: 100;
+  --z-statusbar: 100;
+
+  /* Overlay layers */
+  --z-dropdown: 200;
+  --z-tooltip: 300;
+  --z-context-menu: 400;
+  --z-modal-backdrop: 500;
+  --z-modal: 600;
+  --z-notification: 700;
+
+  /* Top layers */
+  --z-pointer-lock-indicator: 800;
+  --z-fullscreen-controls: 900;
+  --z-fullscreen: 1000;
+}
+```
+
+#### Absolute Positioning Rules
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ MODAL/PANEL CONTAINER (position: relative)                  │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ TOOLBAR (position: relative, z-index: 100)          │   │
+│  │ Height: 48px FIXED                                  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ MAIN CONTENT (position: relative, flex: 1)          │   │
+│  │                                                     │   │
+│  │   ┌─────────────────────────────────────────────┐   │   │
+│  │   │ Canvas/Terminal/FileList                    │   │   │
+│  │   │ (position: absolute, inset: 0)              │   │   │
+│  │   └─────────────────────────────────────────────┘   │   │
+│  │                                                     │   │
+│  │   ┌───────────────────┐ (position: absolute)       │   │
+│  │   │ Overlays          │ top: 16px, left: 50%       │   │
+│  │   │ (pointer-lock,    │ transform: translateX(-50%)│   │
+│  │   │  connection)      │ z-index: 800               │   │
+│  │   └───────────────────┘                            │   │
+│  │                                                     │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ CONTROL BAR (position: relative, z-index: 100)      │   │
+│  │ Height: 48px FIXED                                  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ┌───────────────────┐ (position: absolute)                │
+│  │ Monitor Selector  │ bottom: 60px, right: 16px          │
+│  │ (popup)           │ z-index: 200                       │
+│  └───────────────────┘                                     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 0.3 End-to-End Functionality Requirements
+
+**Every feature must be fully functional from UI to backend.**
+
+#### Desktop Viewer E2E Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        DESKTOP VIEWER E2E                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  USER ACTION              FRONTEND                 BACKEND              │
+│  ───────────             ─────────                ─────────             │
+│                                                                         │
+│  1. Open Desktop    →    Show skeleton      →    (waiting)              │
+│                          loading state                                  │
+│                                                                         │
+│  2. (auto)          →    Connect WebSocket  →    Accept connection      │
+│                          Send secret key         Validate session       │
+│                                                                         │
+│  3. (auto)          →    Receive frames     ←    Stream JPEG/WebP       │
+│                          Render to canvas        frames with diff       │
+│                                                                         │
+│  4. Move mouse      →    Batch input events →    Receive DESKTOP_INPUT  │
+│     Click                Send every 16ms         Execute via RobotGo    │
+│     Type                                                                │
+│                                                                         │
+│  5. Change quality  →    Send DESKTOP_CONFIG →   Adjust encoder         │
+│     Change FPS           {quality, fps}          quality/framerate      │
+│                                                                         │
+│  6. Take screenshot →    canvas.toDataURL() →    (client-side only)     │
+│                          Download PNG                                   │
+│                                                                         │
+│  7. Toggle input    →    Enable/disable      →   (client-side filter)   │
+│                          event handlers                                 │
+│                                                                         │
+│  8. Fullscreen      →    requestFullscreen() →   (client-side only)     │
+│                          Resize canvas                                  │
+│                                                                         │
+│  9. Disconnect      →    Close WebSocket     →   Clean up resources     │
+│     Close panel          Show disconnected       Stop screen capture    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Terminal E2E Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          TERMINAL E2E                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  USER ACTION              FRONTEND                 BACKEND              │
+│  ───────────             ─────────                ─────────             │
+│                                                                         │
+│  1. Open Terminal   →    Create XTerm        →    (waiting)             │
+│                          Show connecting                                │
+│                                                                         │
+│  2. (auto)          →    Connect WebSocket   →    Spawn PTY/ConPTY      │
+│                          Send terminal size       Set rows/cols         │
+│                                                                         │
+│  3. (auto)          →    Receive output      ←    PTY stdout/stderr     │
+│                          Write to XTerm           Stream to WS          │
+│                                                                         │
+│  4. Type command    →    Send TERMINAL_INPUT →    Write to PTY stdin    │
+│                          (encrypted)              Execute command       │
+│                                                                         │
+│  5. Resize window   →    FitAddon.fit()      →    Send TERMINAL_RESIZE  │
+│                          Calculate cols/rows      Resize PTY            │
+│                                                                         │
+│  6. Upload file     →    Zmodem sz           →    Receive Zmodem        │
+│     (drag/drop)          Send file chunks         Write to disk         │
+│                                                                         │
+│  7. Download file   →    Zmodem rz           ←    Send Zmodem           │
+│                          Receive chunks           Read from disk        │
+│                          Save file                                      │
+│                                                                         │
+│  8. New tab         →    Create new XTerm    →    Spawn new PTY         │
+│                          New WebSocket                                  │
+│                                                                         │
+│  9. Close tab       →    Dispose XTerm       →    Send TERMINAL_KILL    │
+│                          Close WebSocket          Kill PTY process      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### File Explorer E2E Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        FILE EXPLORER E2E                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  USER ACTION              FRONTEND                 BACKEND              │
+│  ───────────             ─────────                ─────────             │
+│                                                                         │
+│  1. Open Explorer   →    Show skeleton       →    (waiting)             │
+│                          loading                                        │
+│                                                                         │
+│  2. (auto)          →    GET /api/files/list →    Read directory        │
+│                          ?path=/                  Return file list      │
+│                                                                         │
+│  3. Navigate folder →    Update breadcrumb   →    GET /api/files/list   │
+│     (dbl-click)          Show loading            ?path=/new/path        │
+│                          Render new files                               │
+│                                                                         │
+│  4. Select files    →    Update selectedIds  →    (client-side only)    │
+│     (click/ctrl/shift)   Highlight items                                │
+│                                                                         │
+│  5. Download file   →    POST /api/files/    →    Read file             │
+│                          download                 Stream response       │
+│                          Save blob                                      │
+│                                                                         │
+│  6. Upload file     →    POST /api/files/    →    Write file            │
+│     (drag/drop)          upload                   Save to path          │
+│                          multipart/form-data      Return success        │
+│                          Show progress                                  │
+│                                                                         │
+│  7. Delete file     →    Confirm dialog      →    POST /api/files/      │
+│                          DELETE request           delete                │
+│                          Refresh list             Remove file           │
+│                                                                         │
+│  8. Rename file     →    Inline edit input   →    POST /api/files/      │
+│                          On blur/enter            rename                │
+│                          Refresh list             Rename file           │
+│                                                                         │
+│  9. Create folder   →    Dialog input        →    POST /api/files/      │
+│                          Submit name              mkdir                 │
+│                          Refresh list             Create directory      │
+│                                                                         │
+│  10. Context menu   →    Show at cursor pos  →    (client-side only)    │
+│      (right-click)       With file options                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 0.4 State Machine Definitions
+
+#### Desktop Viewer States
+
+```typescript
+type DesktopState =
+  | { status: 'idle' }
+  | { status: 'connecting'; attempt: number }
+  | { status: 'connected'; latency: number; fps: number; resolution: Resolution }
+  | { status: 'reconnecting'; attempt: number; lastError: string }
+  | { status: 'disconnected'; reason: 'user' | 'error' | 'timeout' }
+  | { status: 'error'; message: string; recoverable: boolean };
+
+// State transitions
+const transitions = {
+  'idle → connecting': 'user opens desktop viewer',
+  'connecting → connected': 'WebSocket opens successfully',
+  'connecting → error': 'connection fails after max retries',
+  'connected → disconnected': 'user closes or server closes',
+  'connected → reconnecting': 'connection lost unexpectedly',
+  'reconnecting → connected': 'reconnection successful',
+  'reconnecting → error': 'max reconnect attempts exceeded',
+  'error → connecting': 'user clicks retry',
+  'disconnected → connecting': 'user clicks reconnect',
+};
+```
+
+#### Terminal States
+
+```typescript
+type TerminalState =
+  | { status: 'initializing' }
+  | { status: 'connecting' }
+  | { status: 'connected'; shell: string; cwd: string }
+  | { status: 'disconnected'; reason: string }
+  | { status: 'error'; message: string };
+
+type SessionState = {
+  id: string;
+  state: TerminalState;
+  startTime: number;
+  terminal: Terminal | null;
+};
+```
+
+#### File Explorer States
+
+```typescript
+type ExplorerState =
+  | { status: 'loading'; path: string }
+  | { status: 'loaded'; path: string; files: FileItem[]; freeSpace: number }
+  | { status: 'error'; path: string; message: string }
+  | { status: 'uploading'; path: string; files: FileItem[]; progress: UploadProgress[] }
+  | { status: 'deleting'; path: string; files: FileItem[]; targets: string[] };
+```
+
+### 0.5 Error Handling & Recovery
+
+#### Connection Error Recovery
+
+```typescript
+const useConnectionRecovery = (maxAttempts = 5) => {
+  const [attempt, setAttempt] = useState(0);
+
+  const connect = async () => {
+    for (let i = 0; i < maxAttempts; i++) {
+      setAttempt(i + 1);
+      try {
+        await establishConnection();
+        setAttempt(0);
+        return;
+      } catch (error) {
+        const delay = Math.min(1000 * Math.pow(2, i), 30000); // Exponential backoff
+        await sleep(delay);
+      }
+    }
+    throw new Error('Max reconnection attempts exceeded');
+  };
+
+  return { attempt, connect };
+};
+```
+
+#### User Feedback for All States
+
+```tsx
+// Always show clear feedback
+const ConnectionOverlay: React.FC<{ state: ConnectionState }> = ({ state }) => {
+  switch (state.status) {
+    case 'connecting':
+      return (
+        <Overlay>
+          <Spinner />
+          <Text>Connecting to {state.device}...</Text>
+          {state.attempt > 1 && <Text>Attempt {state.attempt}</Text>}
+        </Overlay>
+      );
+
+    case 'reconnecting':
+      return (
+        <Overlay>
+          <Spinner />
+          <Text>Connection lost. Reconnecting...</Text>
+          <Text>Attempt {state.attempt} of 5</Text>
+          <Button onClick={cancel}>Cancel</Button>
+        </Overlay>
+      );
+
+    case 'disconnected':
+      return (
+        <Overlay>
+          <DisconnectedIcon />
+          <Text>Disconnected</Text>
+          <Button onClick={reconnect}>Reconnect</Button>
+        </Overlay>
+      );
+
+    case 'error':
+      return (
+        <Overlay variant="error">
+          <ErrorIcon />
+          <Text>{state.message}</Text>
+          {state.recoverable && <Button onClick={retry}>Try Again</Button>}
+          <Button onClick={close}>Close</Button>
+        </Overlay>
+      );
+
+    default:
+      return null;
+  }
+};
+```
+
+### 0.6 Performance Budgets
+
+| Metric | Budget | Measurement |
+|--------|--------|-------------|
+| First Contentful Paint | < 1s | Skeleton visible |
+| Time to Interactive | < 2s | All controls responsive |
+| Layout Shift (CLS) | 0 | No visible shifts |
+| Input Latency | < 50ms | Mouse/keyboard response |
+| Frame Drop | < 5% | Desktop viewer FPS |
+| Memory (per tab) | < 50MB | Chrome DevTools |
+
+### 0.7 Testing Checklist
+
+#### For Each Component
+
+```markdown
+## Desktop Viewer
+- [ ] Opens without layout shift
+- [ ] Shows loading skeleton immediately
+- [ ] Connects to WebSocket within 2s
+- [ ] Displays remote screen correctly
+- [ ] Mouse move updates remote cursor
+- [ ] Mouse click registers on remote
+- [ ] Keyboard input sends to remote
+- [ ] Quality slider updates stream quality
+- [ ] FPS selector changes framerate
+- [ ] Screenshot downloads PNG file
+- [ ] Fullscreen works and maintains aspect ratio
+- [ ] ESC releases pointer lock
+- [ ] Handles disconnect gracefully
+- [ ] Reconnects automatically on connection loss
+- [ ] Shows clear error messages
+
+## Terminal
+- [ ] Opens without layout shift
+- [ ] Shows cursor immediately
+- [ ] Connects and shows shell prompt
+- [ ] Keyboard input echoes correctly
+- [ ] Commands execute and show output
+- [ ] Terminal resizes correctly
+- [ ] Scrollback buffer works
+- [ ] Copy/paste works
+- [ ] Multiple tabs work independently
+- [ ] Closing tab kills PTY
+- [ ] Theme switcher updates colors
+- [ ] Quick commands work
+
+## File Explorer
+- [ ] Opens without layout shift
+- [ ] Shows file list immediately
+- [ ] Navigation updates breadcrumb
+- [ ] Grid/list view toggle works
+- [ ] File selection (click, ctrl, shift)
+- [ ] Double-click opens folder
+- [ ] Download button downloads file
+- [ ] Upload drag-drop shows progress
+- [ ] Delete with confirmation
+- [ ] Rename inline edit works
+- [ ] New folder dialog works
+- [ ] Context menu at cursor position
+- [ ] Search filters files
+- [ ] Sort by name/size/date works
+```
+
+---
+
 ## 1. Desktop Viewer Redesign
 
 ### 1.1 Architecture Overview
