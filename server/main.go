@@ -7,14 +7,17 @@ import (
 	"Spark/server/config"
 	"Spark/server/handler"
 	"Spark/server/handler/desktop"
+	"Spark/server/handler/share"
 	"Spark/server/handler/terminal"
 	"Spark/server/handler/utility"
 	"Spark/utils/cmap"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"github.com/rakyll/statik/fs"
+	"golang.org/x/crypto/acme/autocert"
 	"io"
 	"net"
 	"os"
@@ -71,16 +74,64 @@ func main() {
 			return ctx
 		},
 	}
+
+	// Configure TLS if enabled
+	tlsEnabled := false
+	tlsInfo := map[string]any{`listen`: config.Config.Listen}
+	if config.Config.TLS != nil && (config.Config.TLS.Enable || (config.Config.TLS.AutoCert != nil && config.Config.TLS.AutoCert.Enable)) {
+		tlsEnabled = true
+		tlsInfo[`tls`] = true
+
+		if config.Config.TLS.AutoCert != nil && config.Config.TLS.AutoCert.Enable {
+			// Let's Encrypt autocert
+			cacheDir := config.Config.TLS.AutoCert.CacheDir
+			if cacheDir == `` {
+				cacheDir = `./certs`
+			}
+			m := &autocert.Manager{
+				Cache:      autocert.DirCache(cacheDir),
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(config.Config.TLS.AutoCert.Domains...),
+				Email:      config.Config.TLS.AutoCert.Email,
+			}
+			srv.TLSConfig = m.TLSConfig()
+			srv.TLSConfig.MinVersion = tls.VersionTLS12
+			tlsInfo[`autocert`] = true
+			tlsInfo[`domains`] = config.Config.TLS.AutoCert.Domains
+
+			// Start HTTP->HTTPS redirect server on port 80
+			go func() {
+				redirectSrv := &http.Server{
+					Addr:    `:80`,
+					Handler: m.HTTPHandler(nil),
+				}
+				redirectSrv.ListenAndServe()
+			}()
+		} else {
+			// Manual cert/key files
+			tlsInfo[`cert`] = config.Config.TLS.CertFile
+			srv.TLSConfig = &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+	}
+
 	{
 		go func() {
-			err = srv.ListenAndServe()
+			if tlsEnabled {
+				if config.Config.TLS.AutoCert != nil && config.Config.TLS.AutoCert.Enable {
+					err = srv.ListenAndServeTLS(``, ``)
+				} else {
+					err = srv.ListenAndServeTLS(config.Config.TLS.CertFile, config.Config.TLS.KeyFile)
+				}
+			} else {
+				err = srv.ListenAndServe()
+			}
 		}()
 		if err != nil {
 			common.Fatal(nil, `SERVICE_INIT`, `fail`, err.Error(), nil)
 		} else {
-			common.Info(nil, `SERVICE_INIT`, ``, ``, map[string]any{
-				`listen`: config.Config.Listen,
-			})
+			common.Info(nil, `SERVICE_INIT`, ``, ``, tlsInfo)
 		}
 	}
 	quit := make(chan os.Signal, 3)
@@ -215,6 +266,7 @@ func wsOnDisconnect(session *melody.Session) {
 	if device, ok := common.Devices.Get(session.UUID); ok {
 		terminal.CloseSessionsByDevice(device.ID)
 		desktop.CloseSessionsByDevice(device.ID)
+		share.CloseGuestSessionsByDevice(device.ID)
 		common.Info(nil, `CLIENT_OFFLINE`, ``, ``, map[string]any{
 			`device`: map[string]any{
 				`name`: device.Hostname,

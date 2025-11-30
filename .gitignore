@@ -1,9 +1,29 @@
-/releases
-/built
-/tools
-/logs
-/.idea
+# Runtime files in releases
+/releases/*.exe
+/releases/*.log
+/releases/logs/
+/releases/shares.json
+/releases/config.json
+
+# But include prebuilt client binaries
+!/releases/built/
+
+# Runtime configuration/logs
 /config.json
-dist/
+/certs/
+/logs
+/server.log
+
+# Server release binaries
+/releases/*
+!/releases/built/
+!/releases/built/**
+/built
+
+# Tooling/build caches
+/tools
 node_modules/
+dist/
+
 .DS_Store
+/.idea

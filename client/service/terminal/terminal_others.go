@@ -68,7 +68,7 @@ func InitTerminal(pack modules.Packet) error {
 				buffer, _ = utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
 					`output`: hex.EncodeToString(buffer),
 				}})
-				buffer = utils.XOR(buffer, common.WSConn.GetSecret())
+				buffer = utils.StreamEncrypt(buffer, common.WSConn.GetSecret())
 				common.WSConn.SendRawData(session.rawEvent, buffer, 21, 01)
 			}
 
@@ -79,7 +79,7 @@ func InitTerminal(pack modules.Packet) error {
 					doKillTerminal(session)
 				}
 				data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`})
-				data = utils.XOR(data, common.WSConn.GetSecret())
+				data = utils.StreamEncrypt(data, common.WSConn.GetSecret())
 				common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
 				break
 			}
@@ -170,7 +170,7 @@ func KillTerminal(pack modules.Packet) {
 	}
 	terminals.Remove(uuid)
 	data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`, Msg: `${i18n|TERMINAL.SESSION_CLOSED}`})
-	data = utils.XOR(data, common.WSConn.GetSecret())
+	data = utils.StreamEncrypt(data, common.WSConn.GetSecret())
 	common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
 	session.escape = true
 	session.rawEvent = nil

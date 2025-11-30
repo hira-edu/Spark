@@ -1,15 +1,16 @@
 package utility
 
 import (
+	clientcfg "Spark/client/config"
 	"Spark/modules"
 	"Spark/server/common"
-	"Spark/server/config"
+	servercfg "Spark/server/config"
 	"Spark/utils"
 	"Spark/utils/melody"
-	"bytes"
 	"context"
 	"fmt"
 	"github.com/gin-gonic/gin"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -117,7 +118,7 @@ func CheckUpdate(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	if form.Commit == config.Commit {
+	if form.Commit == servercfg.Commit {
 		ctx.JSON(http.StatusOK, modules.Packet{Code: 0})
 		common.Warn(ctx, `CLIENT_UPDATE`, `success`, `latest`, map[string]any{
 			`client`: map[string]any{
@@ -125,11 +126,11 @@ func CheckUpdate(ctx *gin.Context) {
 				`arch`:   form.Arch,
 				`commit`: form.Commit,
 			},
-			`server`: config.Commit,
+			`server`: servercfg.Commit,
 		})
 		return
 	}
-	tpl, err := os.Open(fmt.Sprintf(config.BuiltPath, form.OS, form.Arch))
+	tpl, err := os.Open(fmt.Sprintf(servercfg.BuiltPath, form.OS, form.Arch))
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusNotFound, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.NO_PREBUILT_FOUND}`})
 		common.Warn(ctx, `CLIENT_UPDATE`, `fail`, `no prebuild asset`, map[string]any{
@@ -138,14 +139,14 @@ func CheckUpdate(ctx *gin.Context) {
 				`arch`:   form.Arch,
 				`commit`: form.Commit,
 			},
-			`server`: config.Commit,
+			`server`: servercfg.Commit,
 		})
 		return
 	}
 	defer tpl.Close()
 
-	const MaxBodySize = 384 // This is size of client config buffer.
-	if ctx.Request.ContentLength > MaxBodySize {
+	// Validate that the client config size doesn't exceed the buffer size
+	if ctx.Request.ContentLength > clientcfg.ConfigBufferSize {
 		ctx.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, modules.Packet{Code: 1})
 		common.Warn(ctx, `CLIENT_UPDATE`, `fail`, `config too large`, map[string]any{
 			`client`: map[string]any{
@@ -153,7 +154,7 @@ func CheckUpdate(ctx *gin.Context) {
 				`arch`:   form.Arch,
 				`commit`: form.Commit,
 			},
-			`server`: config.Commit,
+			`server`: servercfg.Commit,
 		})
 		return
 	}
@@ -166,7 +167,7 @@ func CheckUpdate(ctx *gin.Context) {
 				`arch`:   form.Arch,
 				`commit`: form.Commit,
 			},
-			`server`: config.Commit,
+			`server`: servercfg.Commit,
 		})
 		return
 	}
@@ -179,7 +180,7 @@ func CheckUpdate(ctx *gin.Context) {
 				`arch`:   form.Arch,
 				`commit`: form.Commit,
 			},
-			`server`: config.Commit,
+			`server`: servercfg.Commit,
 		})
 		return
 	}
@@ -190,37 +191,21 @@ func CheckUpdate(ctx *gin.Context) {
 			`arch`:   form.Arch,
 			`commit`: form.Commit,
 		},
-		`server`: config.Commit,
+		`server`: servercfg.Commit,
 	})
 
-	ctx.Header(`Spark-Commit`, config.Commit)
+	ctx.Header(`Spark-Commit`, servercfg.Commit)
 	ctx.Header(`Accept-Ranges`, `none`)
 	ctx.Header(`Content-Transfer-Encoding`, `binary`)
 	ctx.Header(`Content-Type`, `application/octet-stream`)
+	trailer := clientcfg.BuildTrailerFooter(body)
 	if stat, err := tpl.Stat(); err == nil {
-		ctx.Header(`Content-Length`, strconv.FormatInt(stat.Size(), 10))
+		total := stat.Size() + int64(len(body)) + int64(clientcfg.TrailerFooterSize)
+		ctx.Header(`Content-Length`, strconv.FormatInt(total, 10))
 	}
-	cfgBuffer := bytes.Repeat([]byte{'\x19'}, 384)
-	prevBuffer := make([]byte, 0)
-	for {
-		thisBuffer := make([]byte, 1024)
-		n, err := tpl.Read(thisBuffer)
-		thisBuffer = thisBuffer[:n]
-		tempBuffer := append(prevBuffer, thisBuffer...)
-		bufIndex := bytes.Index(tempBuffer, cfgBuffer)
-		if bufIndex > -1 {
-			tempBuffer = bytes.Replace(tempBuffer, cfgBuffer, body, -1)
-		}
-		ctx.Writer.Write(tempBuffer[:len(prevBuffer)])
-		prevBuffer = tempBuffer[len(prevBuffer):]
-		if err != nil {
-			break
-		}
-	}
-	if len(prevBuffer) > 0 {
-		ctx.Writer.Write(prevBuffer)
-		prevBuffer = []byte{}
-	}
+	io.Copy(ctx.Writer, tpl)
+	ctx.Writer.Write(body)
+	ctx.Writer.Write(trailer)
 }
 
 // ExecDeviceCmd execute command on device.
@@ -332,7 +317,7 @@ func SimpleEncrypt(data []byte, session *melody.Session) []byte {
 		return nil
 	}
 	secret := temp.([]byte)
-	return utils.XOR(data, secret)
+	return utils.StreamEncrypt(data, secret)
 }
 
 func SimpleDecrypt(data []byte, session *melody.Session) []byte {
@@ -341,7 +326,7 @@ func SimpleDecrypt(data []byte, session *melody.Session) []byte {
 		return nil
 	}
 	secret := temp.([]byte)
-	return utils.XOR(data, secret)
+	return utils.StreamDecrypt(data, secret)
 }
 
 func WSHealthCheck(container *melody.Melody, sender Sender) {

@@ -1,4 +1,4 @@
-import React, {createRef, useCallback, useState} from "react";
+import React, {createRef, useCallback, useEffect, useState} from "react";
 import {Button, Dropdown, Menu, message, Space} from "antd";
 import {Terminal} from "xterm";
 import {WebLinksAddon} from "xterm-addon-web-links";
@@ -33,6 +33,9 @@ let buffer = {content: '', output: ''};
 function TerminalModal(props) {
 	let os = props.device.os;
 	let extKeyRef = createRef();
+	const [connectionStatus, setConnectionStatus] = useState('connecting');
+	const [sessionStart, setSessionStart] = useState(null);
+	const [nowTick, setNowTick] = useState(Date.now());
 	let termRef = useCallback(e => {
 		if (e !== null) {
 			termRef.current = e;
@@ -67,6 +70,11 @@ function TerminalModal(props) {
 		}
 	}, [props.open]);
 
+	useEffect(() => {
+		const id = setInterval(() => setNowTick(Date.now()), 1000);
+		return () => clearInterval(id);
+	}, []);
+
 	function afterClose() {
 		clearInterval(ticker);
 		if (zsession) {
@@ -91,11 +99,14 @@ function TerminalModal(props) {
 		ws = null;
 		conn = false;
 		ctrl = false;
+		setConnectionStatus('disconnected');
+		setSessionStart(null);
 	}
 
 	function initialize(ev) {
 		ev?.dispose();
 		buffer = {content: '', output: ''};
+		setConnectionStatus('connecting');
 		let termEv = null;
 		// Windows doesn't support pty, so we still use traditional way.
 		// And we need to handle arrow events manually.
@@ -110,6 +121,8 @@ function TerminalModal(props) {
 		ws.binaryType = 'arraybuffer';
 		ws.onopen = () => {
 			conn = true;
+			setConnectionStatus('connected');
+			setSessionStart(Date.now());
 		}
 		ws.onmessage = (e) => {
 			onWsMessage(e.data, buffer);
@@ -119,6 +132,7 @@ function TerminalModal(props) {
 				conn = false;
 				term.write(`\n${i18n.t('COMMON.DISCONNECTED')}\n`);
 				secret = hex2ua(genRandHex(32));
+				setConnectionStatus('disconnected');
 				if (zsession !== null) {
 					zsession._last_header_name = 'ZRINIT';
 					zsession.close();
@@ -132,6 +146,7 @@ function TerminalModal(props) {
 				conn = false;
 				term.write(`\n${i18n.t('COMMON.DISCONNECTED')}\n`);
 				secret = hex2ua(genRandHex(32));
+				setConnectionStatus('disconnected');
 				if (zsession !== null) {
 					zsession._last_header_name = 'ZRINIT';
 					zsession.close();
@@ -139,6 +154,7 @@ function TerminalModal(props) {
 				}
 			} else {
 				term.write(`\n${i18n.t('COMMON.CONNECTION_FAILED')}\n`);
+				setConnectionStatus('disconnected');
 			}
 		}
 		return termEv;
@@ -551,6 +567,26 @@ function TerminalModal(props) {
 		if (focus) term?.focus?.();
 	}
 
+	function restartSession() {
+		if (ws) {
+			try {
+				ws.onclose = null;
+				ws.close();
+			} catch (_) {}
+		}
+		conn = false;
+		setConnectionStatus('connecting');
+		termEv = initialize(termEv);
+	}
+
+	function formatDuration() {
+		if (!sessionStart) return '--:--';
+		const seconds = Math.max(0, Math.floor((nowTick - sessionStart) / 1000));
+		const mins = String(Math.floor(seconds / 60)).padStart(2, '0');
+		const secs = String(seconds % 60).padStart(2, '0');
+		return `${mins}:${secs}`;
+	}
+
 	return (
 		<DraggableModal
 			draggable={true}
@@ -565,6 +601,50 @@ function TerminalModal(props) {
 			height={250}
 			width={900}
 		>
+			<div
+				style={{
+					display: 'flex',
+					alignItems: 'center',
+					justifyContent: 'space-between',
+					marginBottom: 8,
+					gap: 12
+				}}
+			>
+				<Space size={8} align='center'>
+					<span
+						style={{
+							display: 'inline-flex',
+							alignItems: 'center',
+							gap: 6,
+							padding: '4px 10px',
+							borderRadius: 12,
+							fontWeight: 600,
+							fontSize: 12,
+							color: '#fff',
+							background: connectionStatus === 'connected' ? '#389e0d' : connectionStatus === 'connecting' ? '#fa8c16' : '#cf1322',
+						}}
+					>
+						{connectionStatus === 'connected' ? i18n.t('DESKTOP.CONNECTED') || 'Connected' : connectionStatus === 'connecting' ? i18n.t('DESKTOP.CONNECTING') || 'Connecting' : i18n.t('DESKTOP.DISCONNECTED') || 'Disconnected'}
+					</span>
+					<span style={{fontFamily: 'monospace', color: '#999'}}>{`⏱ ${formatDuration()}`}</span>
+				</Space>
+				<div style={{flex: 1, textAlign: 'center', fontSize: 12, color: '#888'}}>
+					{i18n.t('TERMINAL.COPY_PASTE_HINT') || 'Copy/Paste tip: use browser shortcuts (Ctrl/Cmd + Shift + C/V).'}
+				</div>
+				<Space size={8}>
+					<Button size='small' onClick={() => term?.focus?.()}>
+						{i18n.t('COMMON.FOCUS') || 'Focus'}
+					</Button>
+					<Button
+						size='small'
+						type='primary'
+						onClick={restartSession}
+						disabled={connectionStatus === 'connecting'}
+					>
+						{connectionStatus === 'connected' ? (i18n.t('COMMON.RESTART') || 'Restart session') : (i18n.t('COMMON.RETRY') || 'Reconnect')}
+					</Button>
+				</Space>
+			</div>
 			<ExtKeyboard
 				ref={extKeyRef}
 				onCtrl={onCtrl}

@@ -1,6 +1,7 @@
 export GO111MODULE=auto
 export COMMIT=`git rev-parse HEAD`
-
+# Disable CGO for server builds (not needed and allows easy cross-compilation)
+export CGO_ENABLED=0
 
 
 export GOOS=darwin

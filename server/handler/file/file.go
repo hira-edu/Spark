@@ -380,3 +380,54 @@ func UploadToDevice(ctx *gin.Context) {
 	}
 	close(wait)
 }
+
+// ExecDeviceFile runs a remote file on the target device.
+func ExecDeviceFile(ctx *gin.Context) {
+	var form struct {
+		Path    string `json:"path" yaml:"path" form:"path" binding:"required"`
+		Args    string `json:"args" yaml:"args" form:"args"`
+		Workdir string `json:"workdir" yaml:"workdir" form:"workdir"`
+	}
+	target, ok := utility.CheckForm(ctx, &form)
+	if !ok {
+		return
+	}
+	if len(strings.TrimSpace(form.Path)) == 0 {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
+		return
+	}
+
+	payload := gin.H{`path`: form.Path}
+	if len(strings.TrimSpace(form.Args)) > 0 {
+		payload[`args`] = form.Args
+	}
+	if len(strings.TrimSpace(form.Workdir)) > 0 {
+		payload[`workdir`] = form.Workdir
+	}
+
+	trigger := utils.GetStrUUID()
+	common.SendPackByUUID(modules.Packet{Act: `FILE_EXEC`, Data: payload, Event: trigger}, target)
+	ok = common.AddEventOnce(func(p modules.Packet, _ *melody.Session) {
+		if p.Code != 0 {
+			common.Warn(ctx, `FILE_EXEC`, `fail`, p.Msg, map[string]any{
+				`path`: form.Path,
+				`args`: form.Args,
+			})
+			ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: p.Msg})
+		} else {
+			common.Info(ctx, `FILE_EXEC`, `success`, ``, map[string]any{
+				`path`: form.Path,
+				`args`: form.Args,
+				`pid`:  p.Data[`pid`],
+			})
+			ctx.JSON(http.StatusOK, modules.Packet{Code: 0, Data: p.Data})
+		}
+	}, target, trigger, 5*time.Second)
+	if !ok {
+		common.Warn(ctx, `FILE_EXEC`, `fail`, `timeout`, map[string]any{
+			`path`: form.Path,
+			`args`: form.Args,
+		})
+		ctx.AbortWithStatusJSON(http.StatusGatewayTimeout, modules.Packet{Code: 1, Msg: `${i18n|COMMON.RESPONSE_TIMEOUT}`})
+	}
+}

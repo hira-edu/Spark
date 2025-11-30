@@ -1,20 +1,14 @@
 import i18n from 'i18next';
-import zhCN from './zh-CN';
 import en from './en';
 
 const resources = {
-	'en': {
+	en: {
 		translation: en
-	},
-	'en-US': {
-		translation: en
-	},
-	'zh-CN': {
-		translation: zhCN
-	},
+	}
 };
-const lang = navigator.language && navigator.language.length ? navigator.language : 'en';
-const locale = resources[lang] ? lang : 'en';
+
+const lang = 'en';
+const locale = 'en';
 
 i18n.init({
 	lng: lang,

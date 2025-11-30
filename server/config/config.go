@@ -13,7 +13,22 @@ type config struct {
 	Salt      string            `json:"salt"`
 	Auth      map[string]string `json:"auth"`
 	Log       *log              `json:"log"`
+	TLS       *tls              `json:"tls"`
 	SaltBytes []byte            `json:"-"`
+}
+
+type tls struct {
+	Enable   bool     `json:"enable"`
+	CertFile string   `json:"cert"`
+	KeyFile  string   `json:"key"`
+	AutoCert *autoCert `json:"autocert"`
+}
+
+type autoCert struct {
+	Enable   bool     `json:"enable"`
+	Domains  []string `json:"domains"`
+	Email    string   `json:"email"`
+	CacheDir string   `json:"cache_dir"`
 }
 type log struct {
 	Level string `json:"level"`
@@ -36,6 +51,12 @@ func init() {
 		username, password       string
 		logLevel, logPath        string
 		logDays                  uint
+		tlsEnable                bool
+		tlsCert, tlsKey          string
+		tlsAutoCert              bool
+		tlsDomains               string
+		tlsEmail                 string
+		tlsCacheDir              string
 	)
 	flag.StringVar(&configPath, `config`, `config.json`, `config file path, default: config.json`)
 	flag.StringVar(&listen, `listen`, `:8000`, `required, listen address, default: :8000`)
@@ -45,6 +66,13 @@ func init() {
 	flag.StringVar(&logLevel, `log-level`, `info`, `log level, default: info`)
 	flag.StringVar(&logPath, `log-path`, `./logs`, `log file path, default: ./logs`)
 	flag.UintVar(&logDays, `log-days`, 7, `max days of logs, default: 7`)
+	flag.BoolVar(&tlsEnable, `tls`, false, `enable TLS/HTTPS`)
+	flag.StringVar(&tlsCert, `tls-cert`, ``, `path to TLS certificate file`)
+	flag.StringVar(&tlsKey, `tls-key`, ``, `path to TLS private key file`)
+	flag.BoolVar(&tlsAutoCert, `tls-autocert`, false, `enable automatic Let's Encrypt certificates`)
+	flag.StringVar(&tlsDomains, `tls-domains`, ``, `comma-separated list of domains for autocert`)
+	flag.StringVar(&tlsEmail, `tls-email`, ``, `email for Let's Encrypt notifications`)
+	flag.StringVar(&tlsCacheDir, `tls-cache`, `./certs`, `directory to cache Let's Encrypt certificates`)
 	flag.Parse()
 
 	if len(configPath) > 0 {
@@ -88,6 +116,27 @@ func init() {
 				Path:  logPath,
 				Days:  logDays,
 			},
+		}
+		if tlsEnable || tlsAutoCert {
+			Config.TLS = &tls{
+				Enable:   tlsEnable,
+				CertFile: tlsCert,
+				KeyFile:  tlsKey,
+			}
+			if tlsAutoCert {
+				domains := []string{}
+				if len(tlsDomains) > 0 {
+					for _, d := range bytes.Split([]byte(tlsDomains), []byte(`,`)) {
+						domains = append(domains, string(bytes.TrimSpace(d)))
+					}
+				}
+				Config.TLS.AutoCert = &autoCert{
+					Enable:   true,
+					Domains:  domains,
+					Email:    tlsEmail,
+					CacheDir: tlsCacheDir,
+				}
+			}
 		}
 	}
 

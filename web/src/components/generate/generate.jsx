@@ -1,11 +1,13 @@
-import React from 'react';
+import React, {useState} from 'react';
 import {ModalForm, ProFormCascader, ProFormDigit, ProFormGroup, ProFormText} from '@ant-design/pro-form';
 import {post, request} from "../../utils/utils";
 import prebuilt from '../../config/prebuilt.json';
 import i18n from "../../locale/locale";
+import {Alert} from "antd";
 
 function Generate(props) {
 	const initValues = getInitValues();
+	const [notice, setNotice] = useState('');
 
 	async function onFinish(form) {
 		if (form?.ArchOS?.length === 2) {
@@ -18,15 +20,22 @@ function Generate(props) {
 		request(basePath + 'check', form).then(res => {
 			if (res.data.code === 0) {
 				post(basePath += 'generate', form);
+				setNotice(i18n.t('GENERATOR.NEXT_STEPS') || 'Download starts in your browser. Run the binary on the target and keep this host/port reachable.');
 			}
-		}).catch();
+		}).catch(() => {
+			setNotice('');
+		});
 	}
 
 	function getInitValues() {
+		let pathname = location.pathname || `/`;
+		if (!pathname.startsWith(`/`)) {
+			pathname = `/` + pathname;
+		}
 		let initValues = {
 			host: location.hostname,
 			port: location.port,
-			path: location.pathname,
+			path: pathname,
 			ArchOS: ['windows', 'amd64']
 		};
 		if (String(location.port).length === 0) {
@@ -48,6 +57,16 @@ function Generate(props) {
 			}}
 			{...props}
 		>
+			{
+				notice &&
+				<Alert
+					type='info'
+					showIcon
+					message={notice}
+					description={i18n.t('GENERATOR.NEXT_STEPS_DESC') || 'If download is blocked, copy the generated link and fetch it from a host behind your firewall. Keep the port open so the client can call home.'}
+					style={{marginBottom: 12}}
+				/>
+			}
 			<ProFormGroup>
 				<ProFormText
 					width="md"

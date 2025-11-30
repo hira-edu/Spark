@@ -80,6 +80,74 @@ The configuration file `config.json` should be in the same directory as the exec
 
 ---
 
+## 🔒 HTTPS/TLS Deployment
+
+Spark supports native HTTPS with manual certificates or automatic Let's Encrypt certificates.
+
+### Option 1: Manual Certificates
+
+**Command Line:**
+```bash
+./spark-server -tls -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem -listen :443
+```
+
+**Config File:**
+```json
+{
+    "listen": ":443",
+    "salt": "your-salt",
+    "tls": {
+        "enable": true,
+        "cert": "/path/to/cert.pem",
+        "key": "/path/to/key.pem"
+    }
+}
+```
+
+### Option 2: Let's Encrypt (Automatic)
+
+**Command Line:**
+```bash
+./spark-server -tls-autocert -tls-domains "spark.yourdomain.com" -tls-email "you@example.com" -listen :443
+```
+
+**Config File:**
+```json
+{
+    "listen": ":443",
+    "salt": "your-salt",
+    "tls": {
+        "autocert": {
+            "enable": true,
+            "domains": ["spark.yourdomain.com"],
+            "email": "you@example.com",
+            "cache_dir": "./certs"
+        }
+    }
+}
+```
+
+### TLS Command Line Flags
+
+| Flag | Description |
+|------|-------------|
+| `-tls` | Enable TLS/HTTPS with manual certificates |
+| `-tls-cert` | Path to TLS certificate file |
+| `-tls-key` | Path to TLS private key file |
+| `-tls-autocert` | Enable automatic Let's Encrypt certificates |
+| `-tls-domains` | Comma-separated list of domains for autocert |
+| `-tls-email` | Email for Let's Encrypt notifications |
+| `-tls-cache` | Directory to cache certificates (default: `./certs`) |
+
+> For the production `gapict.com` deployment, follow `docs/TLS_SETUP.md` to reproduce the DNS, firewall, and validation steps used to keep the real certificate healthy.
+
+**Notes:**
+- With autocert, an HTTP server on port 80 handles ACME challenges and redirects to HTTPS
+- Certificates are cached in the `cache_dir` directory and renewed automatically
+- No client code changes needed - clients connect via `wss://` automatically when using HTTPS
+
+---
+
 ## 🛠️ Features
 
 | Feature/OS        | Windows | Linux | MacOS |
@@ -157,6 +225,39 @@ mkdir ./releases
 ./scripts/build.server.sh
 ```
 
+### Client Configuration Trailer
+
+Spark uses a **binary trailer approach** (Sliver-style) for embedding client configuration into executables. This design works identically across Windows, Linux, and macOS, providing a robust and maintainable solution.
+
+**Key Benefits:**
+- **Platform-Independent**: Works with PE, ELF, and Mach-O formats using identical code
+- **Immutable Templates**: Base binaries remain unchanged and can be code-signed
+- **Simple & Reliable**: No complex binary patching or compiler-dependent placeholders
+- **Single-File Distribution**: Self-contained executables with embedded config
+
+**Format Overview:**
+```
+[Original Binary] → [384-byte Encrypted Config Payload] → [20-byte Footer]
+```
+
+The footer contains:
+- Magic: `SPARKCFG` (8 bytes) - Identifier
+- Version: `1` (uint16) - Format version
+- Reserved: `0` (uint16) - Future use
+- Length: `384` (uint32) - Payload size
+- CRC32: Checksum (uint32) - Integrity verification
+
+Each client binary receives a unique AES-encrypted configuration with randomly generated credentials. The client reads this trailer at runtime to discover its server, port, and authentication keys.
+
+**For detailed technical documentation**, see [TRAILER_FORMAT.md](./TRAILER_FORMAT.md) which covers:
+- Complete binary format specification
+- Encryption and security details
+- Generation and reading workflows
+- Cross-platform compatibility
+- Comparison with alternative approaches
+
+**Important:** Clean templates in `releases/built` must remain trailer-free. Configuration is appended only during client generation or updates.
+
 ## Custom Features
 
 If you need to customize some features, please contact me via [**i@1248.ink**](mailto:i@1248.ink).
@@ -202,8 +303,10 @@ Some major dependencies are listed below.
 ### Acknowledgements
 
 * [natpass](https://github.com/lwch/natpass) (MIT License)
+* Image difference algorithm inspired by natpass.
 
 [![VPS.Town](https://vps.town/static/images/sponsor.png)](https://vps.town "VPS.Town - Trust, Effortlessly. Your Cloud, Reimagined.")
+[![Powered by DartNode](https://dartnode.com/branding/DN-Open-Source-sm.png)](https://dartnode.com "Powered by DartNode - Free VPS for Open Source")
 
 ---
 

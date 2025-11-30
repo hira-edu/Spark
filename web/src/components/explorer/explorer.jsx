@@ -1,6 +1,6 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
 import ProTable, {TableDropdown} from "@ant-design/pro-table";
-import {Breadcrumb, Button, Image, message, Modal, Popconfirm, Space} from "antd";
+import {Breadcrumb, Button, Image, Input, message, Modal, Popconfirm, Space, Tag} from "antd";
 import {catchBlobReq, formatSize, orderCompare, post, request, waitTime} from "../../utils/utils";
 import dayjs from "dayjs";
 import i18n from "../../locale/locale";
@@ -38,6 +38,7 @@ function FileBrowser(props) {
 	const [editingFile, setEditingFile] = useState('');
 	const [editingContent, setEditingContent] = useState('');
 	const [selectedRowKeys, setSelectedRowKeys] = useState([]);
+	const [keyword, setKeyword] = useState('');
 	const columns = [
 		{
 			key: 'Name',
@@ -115,11 +116,12 @@ function FileBrowser(props) {
 
 	function renderOperation(file) {
 		let menus = [
+			{key: 'execute', name: i18n.t('EXPLORER.EXECUTE')},
 			{key: 'editAsText', name: i18n.t('EXPLORER.EDIT_AS_TEXT')},
 			{key: 'delete', name: i18n.t('EXPLORER.DELETE')},
 		];
 		if (file.type === 1) {
-			menus.shift();
+			menus = menus.filter(item => item.key === 'delete');
 		} else if (file.type === 2) {
 			return [];
 		}
@@ -157,6 +159,9 @@ function FileBrowser(props) {
 				break;
 			case 'editAsText':
 				textEdit(file);
+				break;
+			case 'execute':
+				executeFile(file);
 		}
 	}
 	function onRowClick(file) {
@@ -191,6 +196,54 @@ function FileBrowser(props) {
 			}
 		}
 		downloadFiles(file.name);
+	}
+
+	function executeFile(file) {
+		const separator = isWindows ? '\\' : '/';
+		const basePath = position.endsWith(separator) ? position : (position + separator);
+		const fullPath = basePath + file.name;
+		let argsVal = '';
+		let workdirVal = position;
+		Modal.confirm({
+			title: i18n.t('EXPLORER.EXECUTE'),
+			okText: i18n.t('EXPLORER.EXECUTE'),
+			cancelText: i18n.t('EXPLORER.CANCEL'),
+			content: (
+				<div>
+					<p style={{marginBottom: 8}}>{i18n.t('EXPLORER.EXECUTE_DESC')}</p>
+					<Input
+						placeholder={i18n.t('EXPLORER.EXECUTE_ARGS_PLACEHOLDER')}
+						onChange={(e) => argsVal = e.target.value}
+					/>
+					<Input
+						style={{marginTop: 8}}
+						defaultValue={workdirVal}
+						placeholder={i18n.t('EXPLORER.EXECUTE_WORKDIR_PLACEHOLDER')}
+						onChange={(e) => workdirVal = e.target.value}
+					/>
+				</div>
+			),
+			onOk: () => {
+				let payload = {device: props.device.id, path: fullPath};
+				if (argsVal.trim().length > 0) {
+					payload.args = argsVal.trim();
+				}
+				if (workdirVal.trim().length > 0) {
+					payload.workdir = workdirVal.trim();
+				}
+				return request('/api/device/file/exec', payload).then(res => {
+					let pid = res?.data?.data?.pid ?? res?.data?.pid;
+					if (pid) {
+						message.success(i18n.t('EXPLORER.EXECUTE_SUCCESS_WITH_PID').replace('{0}', pid));
+					} else {
+						message.success(i18n.t('EXPLORER.EXECUTE_SUCCESS'));
+					}
+				}).catch(err => {
+					catchBlobReq(err);
+					throw err;
+				});
+			}
+		});
 	}
 	function imgPreview(file) {
 		setLoading(true);
@@ -304,6 +357,11 @@ function FileBrowser(props) {
 		setDraggable(true);
 	}
 
+	function handleSearch(val) {
+		setKeyword(val.trim());
+		tableRef.current?.reload();
+	}
+
 	function downloadFiles(items) {
 		if (path === '/' || path === '\\' || path.length === 0) {
 			if (isWindows) {
@@ -414,6 +472,25 @@ function FileBrowser(props) {
 			}}
 			{...props}
 		>
+			<div className='explorer-toolbar'>
+				<Input.Search
+					allowClear
+					placeholder={i18n.t('EXPLORER.SEARCH_PLACEHOLDER') || 'Search files (wildcards * and ? supported)'}
+					onSearch={handleSearch}
+					onChange={(e) => {
+						if (e.target.value.length === 0) handleSearch('');
+					}}
+					style={{maxWidth: 280}}
+				/>
+				<div className='explorer-hint'>
+					{i18n.t('EXPLORER.NAV_HINT') || 'Double-click a folder to open. Use Enter to download files.'}
+				</div>
+				{uploading ? (
+					<Tag color='blue'>
+						{i18n.t('EXPLORER.UPLOADING') || 'Uploading'} {uploading.name || ''}
+					</Tag>
+				) : null}
+			</div>
 			<ProTable
 				rowKey='name'
 				tableStyle={{
@@ -446,9 +523,13 @@ function FileBrowser(props) {
 				options={options}
 				columns={columns}
 				request={getData}
+				params={{keyword}}
 				pagination={false}
 				actionRef={tableRef}
 				components={virtualTable}
+				locale={{
+					emptyText: i18n.t('EXPLORER.EMPTY_STATE') || 'No files here yet. Double-click folders to open.'
+				}}
 			/>
 			<Button
 				style={{right:'59px'}}

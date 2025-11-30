@@ -19,11 +19,11 @@ go build -ldflags "-s -w -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/li
 set GOOS=windows
 
 set GOARCH=386
-go build -ldflags "-s -w -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_i386 Spark/client
+go build -ldflags "-s -w -H=windowsgui -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_i386.exe Spark/client
 set GOARCH=arm64
-go build -ldflags "-s -w -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_arm64 Spark/client
+go build -ldflags "-s -w -H=windowsgui -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_arm64.exe Spark/client
 set GOARCH=amd64
-go build -ldflags "-s -w -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_amd64 Spark/client
+go build -ldflags "-s -w -H=windowsgui -X 'Spark/client/config.Commit=%COMMIT%'" -o ./built/windows_amd64.exe Spark/client
 
 
 
