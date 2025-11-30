@@ -5,13 +5,18 @@ import (
 	"Spark/client/config"
 	"Spark/modules"
 	"Spark/utils"
+	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	ws "github.com/gorilla/websocket"
@@ -21,13 +26,46 @@ import (
 // simplified type of map
 type smap map[string]any
 
-var stop bool
+const handshakeErrorSnippetLimit = 512
+
 var (
 	errNoSecretHeader = errors.New(`can not find secret header`)
+	mu                sync.Mutex
+	cancel            context.CancelFunc
+	stopFlag          atomic.Bool
 )
 
+// Start runs the main loop (backwards compatible)
 func Start() {
-	for !stop {
+	ctx, cancelFn := context.WithCancel(context.Background())
+	mu.Lock()
+	cancel = cancelFn
+	mu.Unlock()
+	StartWithContext(ctx)
+}
+
+// StartWithContext runs the main loop with context for graceful shutdown
+func StartWithContext(ctx context.Context) error {
+	stopFlag.Store(false)
+	golog.Info("run loop start")
+	for {
+		golog.Info("attempting websocket connect")
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			if common.WSConn != nil {
+				common.Mutex.Lock()
+				common.WSConn.Close()
+				common.Mutex.Unlock()
+			}
+			return ctx.Err()
+		default:
+		}
+
+		if stopFlag.Load() {
+			return nil
+		}
+
 		var err error
 		if common.WSConn != nil {
 			common.Mutex.Lock()
@@ -37,47 +75,132 @@ func Start() {
 		common.Mutex.Lock()
 		common.WSConn, err = connectWS()
 		common.Mutex.Unlock()
-		if err != nil && !stop {
-			golog.Error(`Connection error: `, err)
-			<-time.After(3 * time.Second)
+		if err != nil && !stopFlag.Load() {
+			golog.Errorf(`Connection error: %v`, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
 			continue
 		}
 
 		err = reportWS(common.WSConn)
-		if err != nil && !stop {
-			golog.Error(`Register error: `, err)
-			<-time.After(3 * time.Second)
+		if err != nil && !stopFlag.Load() {
+			golog.Errorf(`Register error: %v`, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
 			continue
 		}
 
+		golog.Info("connected and registered with server")
 		checkUpdate(common.WSConn)
 
 		err = handleWS(common.WSConn)
-		if err != nil && !stop {
-			golog.Error(`Execution error: `, err)
-			<-time.After(3 * time.Second)
+		if err != nil && !stopFlag.Load() {
+			golog.Errorf(`Execution error: %v`, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
 			continue
 		}
 	}
 }
 
+// Stop gracefully stops the main loop
+func Stop() {
+	mu.Lock()
+	defer mu.Unlock()
+	stopFlag.Store(true)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// stopAndExit cancels the run loop, closes connections, and exits
+func stopAndExit(wsConn *common.Conn, code int) {
+	Stop()
+	if wsConn != nil {
+		wsConn.Close()
+	} else {
+		common.Mutex.Lock()
+		if common.WSConn != nil {
+			common.WSConn.Close()
+		}
+		common.Mutex.Unlock()
+	}
+	os.Exit(code)
+}
+
 func connectWS() (*common.Conn, error) {
-	wsConn, wsResp, err := ws.DefaultDialer.Dial(config.GetBaseURL(true)+`/ws`, http.Header{
+	baseURL := config.GetBaseURL(true)
+	// Remove trailing slash to avoid double slash when appending /ws
+	if len(baseURL) > 0 && baseURL[len(baseURL)-1] == '/' {
+		baseURL = baseURL[:len(baseURL)-1]
+	}
+	wsURL := baseURL + `/ws`
+	golog.Infof("core: Connecting to WebSocket: %s", wsURL)
+	golog.Infof("core: UUID: %s", config.Config.UUID)
+
+	// Create custom dialer with TLS config for self-signed certificates
+	dialer := &ws.Dialer{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Accept self-signed certificates
+		},
+	}
+
+	wsConn, wsResp, err := dialer.Dial(wsURL, http.Header{
 		`UUID`: []string{config.Config.UUID},
 		`Key`:  []string{config.Config.Key},
 	})
 	if err != nil {
+		if wsResp != nil && wsResp.Body != nil {
+			body, _ := io.ReadAll(wsResp.Body)
+			_ = wsResp.Body.Close()
+			golog.Warnf("core: WebSocket handshake failed status=%d snippet=%s", wsResp.StatusCode, truncateForLog(body))
+		}
+		golog.Errorf("core: WebSocket dial failed: %v", err)
 		return nil, err
 	}
+	defer func() {
+		if wsResp != nil && wsResp.Body != nil {
+			_ = wsResp.Body.Close()
+		}
+	}()
+	if wsResp != nil {
+		golog.Infof("core: WebSocket connected, response status: %s", wsResp.Status)
+	}
+
 	header, find := wsResp.Header[`Secret`]
 	if !find || len(header) == 0 {
+		golog.Error("core: No Secret header in WebSocket response")
 		return nil, errNoSecretHeader
 	}
+	golog.Debug("core: Secret header found")
+
 	secret, err := hex.DecodeString(header[0])
 	if err != nil {
+		golog.Errorf("core: Failed to decode secret: %v", err)
 		return nil, err
 	}
+
+	golog.Info("core: WebSocket connection established successfully")
 	return common.CreateConn(wsConn, secret), nil
+}
+
+func truncateForLog(data []byte) string {
+	if len(data) == 0 {
+		return "<empty>"
+	}
+	if len(data) > handshakeErrorSnippetLimit {
+		return string(data[:handshakeErrorSnippetLimit]) + "..."
+	}
+	return string(data)
 }
 
 func reportWS(wsConn *common.Conn) error {
@@ -115,8 +238,12 @@ func checkUpdate(wsConn *common.Conn) error {
 	if len(config.Commit) == 0 {
 		return nil
 	}
+	rawCfg, err := config.RawConfig()
+	if err != nil || len(rawCfg) == 0 {
+		return nil
+	}
 	resp, err := common.HTTP.R().
-		SetBody(config.ConfigBuffer).
+		SetBody(rawCfg).
 		SetQueryParam(`os`, runtime.GOOS).
 		SetQueryParam(`arch`, runtime.GOARCH).
 		SetQueryParam(`commit`, config.Commit).
@@ -144,9 +271,7 @@ func checkUpdate(wsConn *common.Conn) error {
 			if err != nil {
 				return err
 			}
-			stop = true
-			wsConn.Close()
-			os.Exit(0)
+			stopAndExit(wsConn, 0)
 		}
 		return nil
 	}

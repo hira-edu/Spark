@@ -1,14 +1,16 @@
 module Spark
 
-go 1.18
+go 1.23.0
 
 require (
 	github.com/creack/pty v1.1.18
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/gin-gonic/gin v1.7.7
+	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/gorilla/websocket v1.5.0
 	github.com/imroc/req/v3 v3.8.2
 	github.com/json-iterator/go v1.1.12
+	github.com/kardianos/service v1.2.2
 	github.com/kataras/golog v0.1.7
 	github.com/kbinani/screenshot v0.0.0-20210720154843-7d3a670d8329
 	github.com/kirides/go-d3d v1.0.0
@@ -16,6 +18,7 @@ require (
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil/v3 v3.22.2
 	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
+	golang.org/x/sys v0.34.0
 )
 
 require (
@@ -41,7 +44,6 @@ require (
 	github.com/ugorji/go/codec v1.1.7 // indirect
 	github.com/yusufpapurcu/wmi v1.2.2 // indirect
 	golang.org/x/net v0.0.0-20220111093109-d55c255bac03 // indirect
-	golang.org/x/sys v0.3.0 // indirect
 	golang.org/x/text v0.3.7 // indirect
 	gopkg.in/yaml.v2 v2.2.8 // indirect
 )

