@@ -23,7 +23,7 @@ Status: Implemented for Windows via Win32 `SendInput`; non-Windows uses RobotGo 
 
 - Device: `client/service/desktop/input.go` parses/bounds batches (32 max), rate-limits per second, and injects via `client/service/desktop/input_windows.go` (SendInput) on Windows or `client/service/desktop/input_nonwindows_cgo.go` (RobotGo) on macOS/Linux CGO builds. Non-Windows without CGO uses the stub in `input_nonwindows_stub.go`.
 - Server: `server/handler/desktop/desktop.go` clamps incoming batches to 32, rejects malformed payloads, and tags with desktop UUID.
-- Web: `web/src/components/desktop/desktop.jsx` batches mouse move/button/wheel and key up/down every 16 ms (32-cap buffer), supports pointer lock, and cleans up listeners on unmount. A simple enable toggle remains to add.
+- Web: `web/src/components/features/desktop` (DesktopViewer + hooks) batches mouse move/button/wheel and key up/down every 16 ms (32-cap buffer), supports pointer lock, and cleans up listeners on unmount; `allowControl` gates view-only share sessions by skipping input capture.
 
 **Guardrails:** Prefer absolute coordinates when pointer lock is off, fall back to relative deltas when pointer lock is on, and always bound coordinates to the current display size. If a desktop session id is missing or stale, return `DESKTOP_INPUT` with a non-zero code and do not try to inject input.
 
@@ -118,6 +118,8 @@ window.addEventListener('keyup', (e) => {
 Replace WebSocket JPEG streaming with WebRTC for lower latency and move DESKTOP_INPUT to the WebRTC data channel, with automatic fallback to the WS JPEG path.
 
 **Guardrails:** Keep the existing binary header (magic + op + len) on signaling JSON to avoid breaking older clients; gate WebRTC behind a feature flag; do not send input over WebRTC until the data channel is open; drop buffered inputs after 200 ms instead of blocking render.
+
+**Observability/flags TODO:** Add connection metrics/logging and a first-class disable toggle; WebRTC is default-on today with only the `SPARK_WEBRTC_ENABLED` opt-out env.
 
 #### 2.1 Signaling Contract
 - Add server/device acts for `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, and `DESKTOP_WEBRTC_CANDIDATE`, wrapped in the existing WS service header (`0x14` + JSON op `0x03`) and tagged with the desktop UUID.

@@ -2,7 +2,7 @@ const path = require("path");
 const esbuild = require('esbuild');
 const HtmlWebpackPlugin = require("html-webpack-plugin");
 const CopyWebpackPlugin = require("copy-webpack-plugin");
-const {ESBuildMinifyPlugin} = require("esbuild-loader");
+const {EsbuildPlugin} = require("esbuild-loader");
 const {CleanWebpackPlugin} = require("clean-webpack-plugin");
 const AntdDayjsWebpackPlugin = require("antd-dayjs-webpack-plugin");
 const CompressionPlugin = require("compression-webpack-plugin");
@@ -97,7 +97,7 @@ module.exports = (env, args) => {
         optimization: {
             minimize: mode === 'production',
             minimizer: [
-                new ESBuildMinifyPlugin({
+                new EsbuildPlugin({
                     css: true,
                     target: 'es2015',
                     implementation: esbuild,

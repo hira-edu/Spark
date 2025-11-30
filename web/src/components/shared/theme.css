@@ -1,0 +1,87 @@
+/* Theme CSS Variables */
+:root {
+  /* Base colors - Dark theme (default) */
+  --color-bg-primary: #1a1a1a;
+  --color-bg-secondary: #242424;
+  --color-bg-tertiary: #2d2d2d;
+  --color-bg-elevated: #333333;
+
+  --color-text-primary: #ffffff;
+  --color-text-secondary: #a0a0a0;
+  --color-text-muted: #666666;
+
+  --color-border: #3d3d3d;
+  --color-border-focus: #4a9eff;
+
+  /* Accent colors */
+  --color-accent: #4a9eff;
+  --color-accent-hover: #66aeff;
+  --color-success: #52c41a;
+  --color-warning: #faad14;
+  --color-error: #ff4d4f;
+
+  /* Status colors */
+  --color-connected: #52c41a;
+  --color-connecting: #faad14;
+  --color-disconnected: #ff4d4f;
+
+  /* Z-index layers */
+  --z-base: 0;
+  --z-content: 10;
+  --z-toolbar: 100;
+  --z-controls: 100;
+  --z-statusbar: 100;
+  --z-dropdown: 200;
+  --z-tooltip: 300;
+  --z-context-menu: 400;
+  --z-modal-backdrop: 500;
+  --z-modal: 600;
+  --z-notification: 700;
+  --z-pointer-lock-indicator: 800;
+  --z-fullscreen-controls: 900;
+  --z-fullscreen: 1000;
+
+  /* Spacing */
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 12px;
+  --spacing-lg: 16px;
+  --spacing-xl: 24px;
+
+  /* Border radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-normal: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  /* Typography */
+  --font-mono: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5);
+}
+
+/* Light theme */
+[data-theme="light"] {
+  --color-bg-primary: #ffffff;
+  --color-bg-secondary: #f5f5f5;
+  --color-bg-tertiary: #ebebeb;
+  --color-bg-elevated: #ffffff;
+
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #666666;
+  --color-text-muted: #999999;
+
+  --color-border: #e0e0e0;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.15);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.2);
+}

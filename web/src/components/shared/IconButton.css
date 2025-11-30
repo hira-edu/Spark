@@ -1,0 +1,73 @@
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.icon-button:hover:not(:disabled) {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+
+.icon-button:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+.icon-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Sizes */
+.icon-button--sm {
+  width: 28px;
+  height: 28px;
+  font-size: 14px;
+}
+
+.icon-button--md {
+  width: 32px;
+  height: 32px;
+  font-size: 16px;
+}
+
+.icon-button--lg {
+  width: 40px;
+  height: 40px;
+  font-size: 20px;
+}
+
+/* Variants */
+.icon-button--primary {
+  color: var(--color-accent);
+}
+
+.icon-button--primary:hover:not(:disabled) {
+  background: rgba(74, 158, 255, 0.15);
+  color: var(--color-accent-hover);
+}
+
+.icon-button--danger {
+  color: var(--color-error);
+}
+
+.icon-button--danger:hover:not(:disabled) {
+  background: rgba(255, 77, 79, 0.15);
+}
+
+/* Active state */
+.icon-button--active {
+  background: var(--color-accent);
+  color: white;
+}
+
+.icon-button--active:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+  color: white;
+}

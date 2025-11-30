@@ -1,5 +1,5 @@
 import React, {useEffect, useMemo, useState} from 'react';
-import {Button, Form, Input, InputNumber, message, Modal, Space, Table, Tag, Tooltip} from 'antd';
+import {Button, Form, Input, InputNumber, Switch, message, Modal, Space, Table, Tag, Tooltip} from 'antd';
 import {CopyOutlined, PlusOutlined, ReloadOutlined, StopOutlined} from '@ant-design/icons';
 import axios from 'axios';
 import i18n from '../../locale/locale';
@@ -12,14 +12,17 @@ function Share(props) {
 	const [creating, setCreating] = useState(false);
 	const [shares, setShares] = useState([]);
 
-	const guestBase = useMemo(() => `${location.origin}${location.pathname}#/guest?token=`, []);
+	const guestBase = useMemo(() => `${location.origin}${location.pathname}#/share?token=`, []);
 
 	useEffect(() => {
 		if (open) {
 			form.setFieldsValue({
 				device: device?.id ?? '',
 				desktop: device?.desktop ?? '',
-				ttlSeconds: 3600
+				ttlSeconds: 3600,
+				viewOnly: true,
+				singleUse: false,
+				turnOnly: false,
 			});
 			loadShares();
 		}
@@ -30,27 +33,52 @@ function Share(props) {
 		{title: i18n.t('COMMON.DEVICE'), dataIndex: 'device', key: 'device', ellipsis: true},
 		{title: 'Desktop', dataIndex: 'desktop', key: 'desktop', ellipsis: true},
 		{
+			title: 'Access',
+			key: 'access',
+			render: (_, row) => (
+				<Space size={4} wrap>
+					<Tag color={row.viewOnly ? 'gold' : 'green'}>
+						{row.viewOnly ? (i18n.t('COMMON.READ_ONLY') || 'View-only') : (i18n.t('COMMON.CONTROL') || 'Control')}
+					</Tag>
+					{row.singleUse && (
+						<Tag color={row.used ? 'red' : 'blue'}>
+							{row.used ? (i18n.t('SHARE.TOKEN_ALREADY_USED') || 'Used') : (i18n.t('COMMON.SINGLE_USE') || 'Single-use')}
+						</Tag>
+					)}
+					{row.turnOnly && (
+						<Tag color='purple'>TURN only</Tag>
+					)}
+				</Space>
+			)
+		},
+		{
 			title: i18n.t('COMMON.EXPIRES_AT'),
 			dataIndex: 'expiresAt',
 			key: 'expiresAt',
-			render: (v) => new Date(v).toLocaleString()
+			render: (v) => {
+				const date = v ? new Date(v) : null;
+				if (!date || Number.isNaN(date.getTime()) || date.getFullYear() <= 1) {
+					return i18n.t('SHARE.NEVER') || 'Never';
+				}
+				return date.toLocaleString();
+			}
 		},
 		{
 			title: 'Token',
 			dataIndex: 'token',
 			key: 'token',
 			render: (token) => (
-				<Space>
-					<Tag color='blue'>{token.slice(0, 8)}…</Tag>
-					<Tooltip title={i18n.t('COMMON.COPY')}>
-						<Button size='small' icon={<CopyOutlined />} onClick={() => copyText(token)} />
-					</Tooltip>
-					<Tooltip title={i18n.t('COMMON.COPY') + ' URL'}>
-						<Button size='small' icon={<CopyOutlined />} onClick={() => copyText(guestBase + token)} />
-					</Tooltip>
-				</Space>
-			)
-		},
+					<Space>
+						<Tag color='blue'>{token.slice(0, 8)}…</Tag>
+						<Tooltip title={i18n.t('COMMON.COPY')}>
+							<Button size='small' icon={<CopyOutlined />} onClick={() => copyText(token)} />
+						</Tooltip>
+						<Tooltip title={i18n.t('COMMON.COPY') + ' URL'}>
+							<Button size='small' icon={<CopyOutlined />} onClick={() => copyText(guestBase + encodeURIComponent(token))} />
+						</Tooltip>
+					</Space>
+				)
+			},
 		{
 			title: i18n.t('COMMON.OPERATIONS'),
 			key: 'ops',
@@ -96,6 +124,9 @@ function Share(props) {
 			device: values.device,
 			desktop: values.desktop,
 			ttlSeconds: values.ttlSeconds,
+			viewOnly: !!values.viewOnly,
+			singleUse: !!values.singleUse,
+			turnOnly: !!values.turnOnly,
 		}).then(res => {
 			if (res.data.code === 0) {
 				message.success(i18n.t('COMMON.OPERATION_SUCCESS'));
@@ -131,15 +162,37 @@ function Share(props) {
 				>
 					<Input placeholder='device id' style={{width: 180}} />
 				</Form.Item>
-				<Form.Item label='Desktop' name='desktop'>
-					<Input placeholder='desktop id (optional)' style={{width: 160}} />
-				</Form.Item>
+			<Form.Item label='Desktop' name='desktop'>
+				<Input placeholder='desktop id (optional)' style={{width: 160}} />
+			</Form.Item>
+			<Form.Item
+				label={i18n.t('COMMON.READ_ONLY') || 'View-only'}
+				name='viewOnly'
+				valuePropName='checked'
+			>
+				<Switch />
+			</Form.Item>
+			<Form.Item
+				label={i18n.t('COMMON.SINGLE_USE') || 'Single-use'}
+				name='singleUse'
+				valuePropName='checked'
+			>
+				<Switch />
+			</Form.Item>
+			<Form.Item
+				label='TURN only'
+				name='turnOnly'
+				valuePropName='checked'
+				tooltip='Force TURN-only ICE for restricted networks'
+			>
+				<Switch />
+			</Form.Item>
 				<Form.Item
 					label={i18n.t('SHARE.DURATION_TIP') ?? 'TTL (s)'}
 					name='ttlSeconds'
 					rules={[{required: true}]}
 				>
-					<InputNumber min={60} max={86400} step={60} />
+					<InputNumber min={0} max={86400} step={60} />
 				</Form.Item>
 				<Form.Item>
 					<Space>

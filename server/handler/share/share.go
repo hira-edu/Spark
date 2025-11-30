@@ -3,6 +3,7 @@ package share
 import (
 	"Spark/modules"
 	"Spark/server/common"
+	servercfg "Spark/server/config"
 	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/melody"
@@ -19,19 +20,19 @@ import (
 
 // ShareEntry represents a desktop sharing session
 type ShareEntry struct {
-	ID         string    `json:"id"`
-	Device     string    `json:"device"`
-	Desktop    string    `json:"desktop"`
-	Token      string    `json:"token"`
-	ExpiresAt  time.Time `json:"expiresAt"`
-	SingleUse  bool      `json:"singleUse"`
-	ViewOnly   bool      `json:"viewOnly"`
-	TurnOnly   bool      `json:"turnOnly"`
-	Used       bool      `json:"used"`
-	UsedAt     time.Time `json:"usedAt,omitempty"`
-	UsedBy     string    `json:"usedBy,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	AccessLog  []AccessLogEntry `json:"accessLog,omitempty"`
+	ID        string           `json:"id"`
+	Device    string           `json:"device"`
+	Desktop   string           `json:"desktop"`
+	Token     string           `json:"token"`
+	ExpiresAt time.Time        `json:"expiresAt"`
+	SingleUse bool             `json:"singleUse"`
+	ViewOnly  bool             `json:"viewOnly"`
+	TurnOnly  bool             `json:"turnOnly"`
+	Used      bool             `json:"used"`
+	UsedAt    time.Time        `json:"usedAt,omitempty"`
+	UsedBy    string           `json:"usedBy,omitempty"`
+	CreatedAt time.Time        `json:"createdAt"`
+	AccessLog []AccessLogEntry `json:"accessLog,omitempty"`
 }
 
 // AccessLogEntry records guest access attempts
@@ -59,13 +60,12 @@ var (
 )
 
 const (
-	maxGuestMessageSize = 1 << 20 // 1MB
-	defaultTTLSeconds   = 3600    // 1 hour
-	maxTTLSeconds       = 86400   // 24 hours
+	defaultTTLSeconds = 3600  // 1 hour
+	maxTTLSeconds     = 86400 // 24 hours
 )
 
 func init() {
-	guestSessions.Config.MaxMessageSize = maxGuestMessageSize
+	guestSessions.Config.MaxMessageSize = common.MaxMessageSize
 	guestSessions.HandleConnect(onGuestConnect)
 	guestSessions.HandleMessage(onGuestMessage)
 	guestSessions.HandleMessageBinary(onGuestMessage)
@@ -74,18 +74,74 @@ func init() {
 	go cleanupExpiredShares()
 }
 
+func isExpired(entry *ShareEntry, now time.Time) bool {
+	if entry == nil {
+		return true
+	}
+	if entry.ExpiresAt.IsZero() {
+		return false
+	}
+	return now.After(entry.ExpiresAt)
+}
+
+func ensureDesktop(entry *ShareEntry) string {
+	if entry == nil || entry.ID == "" {
+		return ""
+	}
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	current, ok := store[entry.ID]
+	if !ok || isExpired(current, time.Now()) {
+		return ""
+	}
+	if current.Desktop == "" {
+		current.Desktop = utils.GetStrUUID()
+	}
+	return current.Desktop
+}
+
+func guestICEConfig(entry *ShareEntry) gin.H {
+	ice := gin.H{
+		`stun`: []string{},
+		`turn`: []string{},
+	}
+	if entry == nil {
+		return ice
+	}
+	if cfg := servercfg.Config.WebRTC; cfg != nil {
+		if !entry.TurnOnly {
+			ice[`stun`] = append(ice[`stun`].([]string), cfg.Stun...)
+		}
+		ice[`turn`] = append(ice[`turn`].([]string), cfg.Turn...)
+		return ice
+	}
+	if !entry.TurnOnly {
+		ice[`stun`] = []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun.cloudflare.com:3478",
+		}
+	}
+	return ice
+}
+
 // cleanupExpiredShares periodically removes expired share entries
 func cleanupExpiredShares() {
 	ticker := time.NewTicker(5 * time.Minute)
 	for range ticker.C {
 		now := time.Now()
+		expired := make([]string, 0)
 		storeMu.Lock()
 		for id, s := range store {
-			if now.After(s.ExpiresAt) {
+			if isExpired(s, now) {
+				expired = append(expired, id)
 				delete(store, id)
 			}
 		}
 		storeMu.Unlock()
+		// Close any guest sessions tied to expired shares
+		for _, id := range expired {
+			closeGuestSessionsByShare(id)
+		}
 	}
 }
 
@@ -112,14 +168,19 @@ func ValidateShareToken(ctx *gin.Context) {
 	}
 
 	logAccess(token, ctx, true, "")
+	desktopID := ensureDesktop(entry)
 
 	// Return sanitized entry (without internal fields)
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{
 		`share`: gin.H{
 			`id`:        entry.ID,
 			`device`:    entry.Device,
+			`desktop`:   desktopID,
 			`expiresAt`: entry.ExpiresAt,
 			`viewOnly`:  entry.ViewOnly,
+			`turnOnly`:  entry.TurnOnly,
+			`singleUse`: entry.SingleUse,
+			`used`:      entry.Used,
 		},
 	}})
 }
@@ -161,6 +222,12 @@ func InitGuestDesktop(ctx *gin.Context) {
 		return
 	}
 
+	desktopUUID := ensureDesktop(entry)
+	if desktopUUID == "" {
+		ctx.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
 	// Check single-use
 	if entry.SingleUse && entry.Used {
 		logAccess(token, ctx, false, "single-use token already used")
@@ -185,13 +252,15 @@ func InitGuestDesktop(ctx *gin.Context) {
 	golog.Infof("Guest desktop connection: share=%s device=%s ip=%s", entry.ID, entry.Device, ctx.ClientIP())
 
 	guestSessions.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
-		`Secret`:   secret,
-		`ShareID`:  entry.ID,
-		`Device`:   entry.Device,
-		`ViewOnly`: entry.ViewOnly,
-		`TurnOnly`: entry.TurnOnly,
-		`ConnUUID`: connUUID,
-		`LastPack`: utils.Unix,
+		`Secret`:    secret,
+		`ShareID`:   entry.ID,
+		`Device`:    entry.Device,
+		`ViewOnly`:  entry.ViewOnly,
+		`TurnOnly`:  entry.TurnOnly,
+		`ConnUUID`:  connUUID,
+		`LastPack`:  utils.Unix,
+		`ExpiresAt`: entry.ExpiresAt,
+		`Desktop`:   desktopUUID,
 	})
 }
 
@@ -206,28 +275,25 @@ func GetGuestICEConfig(ctx *gin.Context) {
 
 	entry := getByToken(token)
 	if entry == nil {
+		logAccess(token, ctx, false, "token not found or expired for ice")
 		ctx.AbortWithStatusJSON(401, modules.Packet{Code: 1, Msg: `${i18n|COMMON.UNAUTHORIZED}`})
 		return
 	}
 
-	// Get base ICE config
-	ice := gin.H{
-		`stun`: []string{},
-		`turn`: []string{},
+	if entry.SingleUse && entry.Used {
+		logAccess(token, ctx, false, "single-use token already used")
+		ctx.AbortWithStatusJSON(401, modules.Packet{Code: 1, Msg: `${i18n|SHARE.TOKEN_ALREADY_USED}`})
+		return
 	}
 
-	// If not TURN-only, include STUN servers
-	if !entry.TurnOnly {
-		ice[`stun`] = []string{
-			"stun:stun.l.google.com:19302",
-			"stun:stun.cloudflare.com:3478",
-		}
+	if desktop := ensureDesktop(entry); desktop == "" {
+		ctx.AbortWithStatusJSON(401, modules.Packet{Code: 1, Msg: `${i18n|COMMON.UNAUTHORIZED}`})
+		return
 	}
 
-	// TODO: Add configured TURN servers from config
-	// For now, TURN servers would need to be configured server-side
+	logAccess(token, ctx, true, "ice")
 
-	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`ice`: ice}})
+	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`ice`: guestICEConfig(entry)}})
 }
 
 // CreateShare creates a new desktop sharing session
@@ -251,11 +317,16 @@ func CreateShare(ctx *gin.Context) {
 		return
 	}
 
-	if body.TTL <= 0 {
-		body.TTL = defaultTTLSeconds
+	ttl := body.TTL
+	if ttl < 0 {
+		ttl = defaultTTLSeconds
 	}
-	if body.TTL > maxTTLSeconds {
-		body.TTL = maxTTLSeconds
+	if ttl > maxTTLSeconds {
+		ttl = maxTTLSeconds
+	}
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 	}
 
 	entry := &ShareEntry{
@@ -263,7 +334,7 @@ func CreateShare(ctx *gin.Context) {
 		Device:    body.Device,
 		Desktop:   body.Desktop,
 		Token:     utils.GetStrUUID(),
-		ExpiresAt: time.Now().Add(time.Duration(body.TTL) * time.Second),
+		ExpiresAt: expiresAt,
 		SingleUse: body.SingleUse,
 		ViewOnly:  body.ViewOnly,
 		TurnOnly:  body.TurnOnly,
@@ -276,7 +347,7 @@ func CreateShare(ctx *gin.Context) {
 	storeMu.Unlock()
 
 	golog.Infof("Share created: id=%s device=%s singleUse=%v viewOnly=%v turnOnly=%v ttl=%ds",
-		entry.ID, entry.Device, entry.SingleUse, entry.ViewOnly, entry.TurnOnly, body.TTL)
+		entry.ID, entry.Device, entry.SingleUse, entry.ViewOnly, entry.TurnOnly, ttl)
 
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`share`: entry}})
 }
@@ -288,7 +359,7 @@ func ListShares(ctx *gin.Context) {
 	now := time.Now()
 	var items []ShareEntry
 	for id, s := range store {
-		if now.After(s.ExpiresAt) {
+		if isExpired(s, now) {
 			delete(store, id)
 			continue
 		}
@@ -306,7 +377,7 @@ func GetShare(ctx *gin.Context) {
 	}
 	storeMu.RLock()
 	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok && time.Now().Before(s.ExpiresAt) {
+	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
 		ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`share`: s}})
 		return
 	}
@@ -322,7 +393,7 @@ func GetShareToken(ctx *gin.Context) {
 	}
 	storeMu.RLock()
 	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok && time.Now().Before(s.ExpiresAt) {
+	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
 		ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{
 			`token`:     s.Token,
 			`expiresAt`: s.ExpiresAt,
@@ -423,12 +494,25 @@ func closeGuestSessionsByShare(shareID string) {
 func getByToken(token string) *ShareEntry {
 	storeMu.RLock()
 	defer storeMu.RUnlock()
+	now := time.Now()
 	for _, s := range store {
-		if s.Token == token && time.Now().Before(s.ExpiresAt) {
+		if s.Token == token && !isExpired(s, now) {
 			return s
 		}
 	}
 	return nil
+}
+
+func isShareActive(id string) bool {
+	if id == "" {
+		return false
+	}
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
+		return true
+	}
+	return false
 }
 
 func markTokenUsed(id string, ctx *gin.Context) {
@@ -444,10 +528,14 @@ func markTokenUsed(id string, ctx *gin.Context) {
 func logAccess(token string, ctx *gin.Context, success bool, reason string) {
 	storeMu.Lock()
 	defer storeMu.Unlock()
+	now := time.Now()
 	for _, s := range store {
 		if s.Token == token {
+			if isExpired(s, now) {
+				continue
+			}
 			s.AccessLog = append(s.AccessLog, AccessLogEntry{
-				Timestamp: time.Now(),
+				Timestamp: now,
 				IP:        ctx.ClientIP(),
 				UserAgent: ctx.GetHeader("User-Agent"),
 				Success:   success,
@@ -460,6 +548,25 @@ func logAccess(token string, ctx *gin.Context, success bool, reason string) {
 			return
 		}
 	}
+}
+
+func expiredSession(session *melody.Session, shareID string) bool {
+	if session == nil {
+		return true
+	}
+	if expVal, ok := session.Get(`ExpiresAt`); ok {
+		if expAt, ok := expVal.(time.Time); ok && !expAt.IsZero() && time.Now().After(expAt) {
+			sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`}, session)
+			session.Close()
+			return true
+		}
+	}
+	if shareID == "" || isShareActive(shareID) {
+		return false
+	}
+	sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
+	session.Close()
+	return true
 }
 
 // Guest WebSocket handlers
@@ -475,6 +582,13 @@ func onGuestConnect(session *melody.Session) {
 	device, _ := session.Get(`Device`)
 	connUUID, _ := session.Get(`ConnUUID`)
 	viewOnly, _ := session.Get(`ViewOnly`)
+	desktopVal, _ := session.Get(`Desktop`)
+	desktopUUID, _ := desktopVal.(string)
+	if desktopUUID == "" {
+		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		session.Close()
+		return
+	}
 
 	deviceConn, ok := common.Melody.GetSessionByUUID(connUUID.(string))
 	if !ok {
@@ -482,14 +596,14 @@ func onGuestConnect(session *melody.Session) {
 		session.Close()
 		return
 	}
-
-	desktopUUID := utils.GetStrUUID()
+	shareIDStr := shareID.(string)
+	viewOnlyBool, _ := viewOnly.(bool)
 	guest := &guestDesktop{
-		shareID:    shareID.(string),
+		shareID:    shareIDStr,
 		device:     device.(string),
 		srcConn:    session,
 		deviceConn: deviceConn,
-		viewOnly:   viewOnly.(bool),
+		viewOnly:   viewOnlyBool,
 	}
 	session.Set(`Guest`, guest)
 	session.Set(`DesktopUUID`, desktopUUID)
@@ -502,7 +616,7 @@ func onGuestConnect(session *melody.Session) {
 		`desktop`: desktopUUID,
 	}, Event: desktopUUID}, deviceConn)
 
-	golog.Infof("Guest connected: share=%s desktop=%s viewOnly=%v", shareID, desktopUUID, viewOnly)
+	golog.Infof("Guest connected: share=%s desktop=%s viewOnly=%v", shareIDStr, desktopUUID, viewOnlyBool)
 }
 
 func onGuestMessage(session *melody.Session, data []byte) {
@@ -512,6 +626,9 @@ func onGuestMessage(session *melody.Session, data []byte) {
 	}
 	guest := val.(*guestDesktop)
 	desktopUUID, _ := session.Get(`DesktopUUID`)
+	if expiredSession(session, guest.shareID) {
+		return
+	}
 
 	service, op, isBinary := utils.CheckBinaryPack(data)
 	if !isBinary || service != 20 {
@@ -567,8 +684,9 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		common.SendPack(modules.Packet{
 			Act: `DESKTOP_INPUT`,
 			Data: gin.H{
-				`events`:  events,
-				`desktop`: desktopUUID,
+				`events`:       events,
+				`desktop`:      desktopUUID,
+				`allowControl`: !guest.viewOnly,
 			},
 			Event: desktopUUID.(string),
 		}, guest.deviceConn)
@@ -705,9 +823,9 @@ func isLocalhost(host string) bool {
 // Helper functions for validation (same as desktop handler)
 
 const (
-	maxGuestInputBatch   = 32
-	maxSDPLength         = 1 << 15
-	maxCandidateLength   = 4096
+	maxGuestInputBatch = 32
+	maxSDPLength       = 1 << 15
+	maxCandidateLength = 4096
 )
 
 func normalizeInputEvents(data map[string]any) ([]any, bool) {

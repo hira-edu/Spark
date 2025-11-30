@@ -37,7 +37,18 @@ function overview(props) {
 			title: i18n.t('OVERVIEW.HOSTNAME'),
 			dataIndex: 'hostname',
 			ellipsis: true,
-			width: 100
+			width: 100,
+			fixed: 'left'
+		},
+		{
+			key: 'option',
+			title: i18n.t('OVERVIEW.OPERATIONS'),
+			dataIndex: 'id',
+			valueType: 'option',
+			ellipsis: false,
+			render: (_, device) => renderOperation(device),
+			width: 170,
+			fixed: 'left'
 		},
 		{
 			key: 'username',
@@ -134,15 +145,6 @@ function overview(props) {
 			title: i18n.t('OVERVIEW.NETWORK'),
 			ellipsis: true,
 			renderText: (_, v) => renderNetworkIO(v),
-			width: 170
-		},
-		{
-			key: 'option',
-			title: i18n.t('OVERVIEW.OPERATIONS'),
-			dataIndex: 'id',
-			valueType: 'option',
-			ellipsis: false,
-			render: (_, device) => renderOperation(device),
 			width: 170
 		},
 	];

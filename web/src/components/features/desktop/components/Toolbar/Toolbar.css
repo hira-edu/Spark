@@ -1,0 +1,104 @@
+/* Desktop Toolbar */
+.desktop-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 var(--spacing-lg);
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  z-index: var(--z-toolbar);
+  flex-shrink: 0;
+}
+
+.desktop-toolbar-left,
+.desktop-toolbar-center,
+.desktop-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.desktop-toolbar-left {
+  flex: 1;
+}
+
+.desktop-toolbar-center {
+  flex: 0 0 auto;
+}
+
+.desktop-toolbar-right {
+  flex: 1;
+  justify-content: flex-end;
+}
+
+.toolbar-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--color-border);
+  margin: 0 var(--spacing-sm);
+}
+
+/* Device Indicator */
+.device-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.device-indicator-icon {
+  font-size: 18px;
+  color: var(--color-text-secondary);
+}
+
+.device-indicator-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--color-text-primary);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Connection Status */
+.connection-status {
+  min-width: 140px;
+}
+
+/* Stats Display */
+.stats-display {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 70px;
+}
+
+.stat-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+}
+
+.stat-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 50px;
+  text-align: right;
+}
+
+.stat-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--color-border);
+  margin: 0 var(--spacing-xs);
+}

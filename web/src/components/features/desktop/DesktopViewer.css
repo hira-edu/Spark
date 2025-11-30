@@ -1,0 +1,134 @@
+/* Import theme variables */
+@import '../../shared/theme.css';
+
+/* Desktop Viewer Container */
+.desktop-viewer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-primary);
+  overflow: hidden;
+}
+
+/* Fullscreen mode */
+.desktop-viewer--fullscreen {
+  position: fixed;
+  z-index: var(--z-fullscreen);
+}
+
+.desktop-viewer--fullscreen .desktop-toolbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  opacity: 0;
+  transform: translateY(-100%);
+  transition: opacity var(--transition-normal), transform var(--transition-normal);
+  z-index: var(--z-fullscreen-controls);
+}
+
+.desktop-viewer--fullscreen:hover .desktop-toolbar,
+.desktop-viewer--fullscreen .desktop-toolbar:focus-within {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.desktop-viewer--fullscreen .control-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  opacity: 0;
+  transform: translateY(100%);
+  transition: opacity var(--transition-normal), transform var(--transition-normal);
+  z-index: var(--z-fullscreen-controls);
+}
+
+.desktop-viewer--fullscreen:hover .control-bar,
+.desktop-viewer--fullscreen .control-bar:focus-within {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Content area */
+.desktop-viewer-content {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  overflow: hidden;
+}
+
+/* Skeleton loader for initial state */
+.desktop-viewer-skeleton {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-secondary);
+}
+
+.desktop-viewer-skeleton-box {
+  width: 80%;
+  max-width: 800px;
+  aspect-ratio: 16 / 9;
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-tertiary) 0%,
+    var(--color-bg-elevated) 50%,
+    var(--color-bg-tertiary) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-lg);
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .desktop-toolbar {
+    padding: 0 var(--spacing-md);
+  }
+
+  .desktop-toolbar-center {
+    display: none;
+  }
+
+  .control-bar {
+    padding: 0 var(--spacing-md);
+  }
+
+  .control-bar-left {
+    flex: 0 0 auto;
+  }
+
+  .quality-slider-input {
+    width: 80px;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats-display {
+    display: none;
+  }
+
+  .control-bar-left .control-divider,
+  .control-bar-left .fps-selector {
+    display: none;
+  }
+}

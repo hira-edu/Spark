@@ -1,0 +1,85 @@
+/* Import theme variables */
+@import '../../shared/theme.css';
+
+/* Terminal Panel Container */
+.terminal-panel {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg-primary);
+  overflow: hidden;
+}
+
+/* Terminal Content */
+.terminal-panel-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #1a1a1a;
+}
+
+/* Skeleton loading state */
+.terminal-panel-skeleton {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-secondary);
+}
+
+.terminal-panel-skeleton-cursor {
+  width: 10px;
+  height: 20px;
+  background: var(--color-accent);
+  animation: cursor-blink 1s step-end infinite;
+}
+
+@keyframes cursor-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Connection overlay */
+.terminal-connection-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-lg);
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(10px);
+  z-index: var(--z-modal);
+}
+
+.terminal-connection-overlay-text {
+  color: white;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.terminal-connection-overlay-button {
+  background: var(--color-accent);
+  color: white;
+  border: none;
+  padding: var(--spacing-sm) var(--spacing-xl);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.terminal-connection-overlay-button:hover {
+  background: var(--color-accent-hover);
+}
