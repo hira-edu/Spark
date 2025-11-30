@@ -18,9 +18,9 @@ This document outlines the implementation plan for adding full remote desktop co
 
 ## Implementation Phases
 
-### Phase 1: Input Control with RobotGo (Priority: HIGH)
+### Phase 1: Input Control (Priority: HIGH)
 
-Add mouse and keyboard control using the RobotGo library.
+Current implementation uses Win32 `SendInput` for Windows; the RobotGo steps below remain as a fallback plan for cross-platform support.
 
 **Guardrails:** Prefer absolute coordinates when pointer lock is off, fall back to relative deltas when pointer lock is on, and always bound coordinates to the current display size. If a desktop session id is missing or stale, return `DESKTOP_INPUT` with a non-zero code and do not try to inject input.
 
@@ -483,6 +483,8 @@ web/
 
 ## Build Requirements
 
+The current Windows-only input path relies on Win32 `SendInput` and does not require RobotGo or additional CGO toolchains. If a cross-platform RobotGo path is reintroduced, use the dependency notes below.
+
 ### RobotGo Dependencies
 
 **Windows:**
@@ -523,14 +525,12 @@ GOOS=linux GOARCH=amd64 go build ...
 ## TODO Checklist
 
 ### Phase 1: Input Control
-- [ ] Define DESKTOP_INPUT payload: array of `{type, x, y, deltaX, deltaY, button, down, key, keyCode}` with a hard cap (e.g., 32 events) and keep the service/op headers (`0x14` + JSON `0x03`) unchanged.
-- [ ] Add RobotGo to `go.mod` (note CGO_ENABLED=1 in build docs) and author a key map from JS keyCode/key → RobotGo names (modifiers/function keys included).
-- [ ] Build `client/service/desktop/input.go`: parse/validate batches, clamp coordinates to display bounds, normalize scroll, drop unknown types, and short-circuit when sessions are missing or control is disabled.
-- [ ] Platform handling: implement Windows injection via RobotGo; return `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}` on non-Windows with a clear error surface; guard scroll granularity to prevent runaway deltas.
-- [ ] Wire `DESKTOP_INPUT` through `client/core/handler.go` with lightweight rate limiting (discard when >60Hz sustained) and callbacks on error.
-- [ ] Server bridge: accept `DESKTOP_INPUT` frames on the desktop websocket, attach the desktop UUID, validate payload size, and close or warn on malformed/oversized batches.
-- [ ] Web UI: add input enable/disable toggle + pointer-lock option, batch every 16 ms with a bounded buffer, scale coords using the remote resolution, and capture mouse move/button/wheel plus key down/up; clean up listeners on unmount.
-- [ ] Smoke test on Windows (move/click/scroll/modifier+char keys), note macOS Accessibility prompt requirement, and document Linux support status; add a short payload example to this doc once stabilized.
+- [x] Define and parse DESKTOP_INPUT payloads in `client/service/desktop/input.go`, clamping coordinates to display bounds, normalizing scroll, and dropping unknown events with a 256-event cap.
+- [x] Implement Windows input injection via Win32 `SendInput` (`client/service/desktop/input_windows.go`); return a clear unsupported error on non-Windows platforms.
+- [x] Wire DESKTOP_INPUT through `client/core/handler.go` and the server desktop bridge so payloads keep the existing WS headers (`0x14` + JSON `0x03`) and attach the desktop UUID.
+- [x] Web UI: capture mouse move/button/wheel and key down/up with pointer-lock support, batch every 16 ms with a bounded buffer, scale coords to the remote resolution, and clean up listeners on unmount (`web/src/components/desktop/desktop.jsx`).
+- [ ] Surface an explicit enable/disable toggle in the UI and relay device-side input errors back to the modal.
+- [ ] Smoke test on Windows (move/click/scroll/modifier+char keys); document macOS/Linux as unsupported until a RobotGo/X11 path is added.
 
 ### Phase 2: WebRTC (Optional)
 - [ ] Add Pion WebRTC dependency and VP8/VP9 encoder (mediadevices/vpx or equivalent) with env-driven STUN/TURN.
@@ -540,7 +540,7 @@ GOOS=linux GOARCH=amd64 go build ...
 - [ ] Add observability (connection state logs/metrics) and a flag to disable WebRTC entirely.
 
 ### Phase 3: Optimizations
-- [ ] Windows native SendInput fast path (cursor + keyboard) with DPI awareness and screensaver wake.
+- [ ] Windows native SendInput fast path (cursor + keyboard) with DPI awareness and screensaver wake. *(Basic SendInput is in place; DPI/screensaver handling still pending.)*
 - [ ] Hardware-assisted encoding (NVENC/VAAPI/VideoToolbox) and adaptive quality/FPS based on bandwidth or dropped frames.
 - [ ] Multi-monitor selection with bounds offsets and cursor overlay.
 - [ ] Idle/keepalive cadence tweaks so capture drops to low-power mode when idle; add rate/permission guards and basic telemetry on drops/frame cadence.

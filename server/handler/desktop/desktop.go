@@ -20,6 +20,8 @@ type desktop struct {
 
 var desktopSessions = melody.New()
 
+const maxDesktopInputBatch = 32
+
 func init() {
 	desktopSessions.Config.MaxMessageSize = common.MaxMessageSize
 	desktopSessions.HandleConnect(onDesktopConnect)
@@ -114,6 +116,10 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			common.Info(desktop.srcConn, `DESKTOP_QUIT`, `success`, ``, map[string]any{
 				`deviceConn`: desktop.deviceConn,
 			})
+		case `DESKTOP_INPUT`:
+			if pack.Code != 0 {
+				sendPack(pack, desktop.srcConn)
+			}
 		}
 	}
 }
@@ -201,6 +207,27 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			`desktop`: desktop.uuid,
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
+	case `DESKTOP_INPUT`:
+		events, ok := normalizeInputEvents(pack.Data)
+		if !ok {
+			common.Warn(desktop.srcConn, `DESKTOP_INPUT`, `fail`, `invalid events payload`, map[string]any{
+				`desktop`: desktop.uuid,
+			})
+			return
+		}
+		if len(events) == 0 {
+			return
+		}
+
+		common.SendPack(modules.Packet{
+			Act: `DESKTOP_INPUT`,
+			Data: gin.H{
+				`events`:  events,
+				`desktop`: desktop.uuid,
+			},
+			Event: desktop.uuid,
+		}, desktop.deviceConn)
+		return
 	}
 	session.Close()
 }
@@ -256,5 +283,36 @@ func CloseSessionsByDevice(deviceID string) {
 	})
 	for _, session := range queue {
 		session.Close()
+	}
+}
+
+func normalizeInputEvents(data map[string]any) ([]any, bool) {
+	if data == nil {
+		return nil, false
+	}
+
+	rawEvents, ok := data[`events`]
+	if !ok {
+		return nil, false
+	}
+
+	switch events := rawEvents.(type) {
+	case []any:
+		if len(events) > maxDesktopInputBatch {
+			return events[:maxDesktopInputBatch], true
+		}
+		return events, true
+	case []interface{}:
+		if len(events) == 0 {
+			return nil, true
+		}
+		if len(events) > maxDesktopInputBatch {
+			events = events[:maxDesktopInputBatch]
+		}
+		out := make([]any, len(events))
+		copy(out, events)
+		return out, true
+	default:
+		return nil, false
 	}
 }
