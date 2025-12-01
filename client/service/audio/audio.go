@@ -4,8 +4,8 @@
 package audio
 
 import (
-	"Spark/client/common"
-	"Spark/modules"
+	"Rocket/client/common"
+	"Rocket/modules"
 	"encoding/base64"
 	"errors"
 	"fmt"

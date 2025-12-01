@@ -1,4 +1,4 @@
-# Spark Transport Fallback System
+# Rocket Transport Fallback System
 
 ## Overview
 Industrial-grade C2 transport system with automatic fallback for firewall bypass and network resilience in pentesting engagements.
@@ -41,8 +41,8 @@ Makes C2 traffic appear as legitimate web browsing:
 #### Long Polling (HTTP/HTTPS)
 - HTTP POST/GET fallback
 - Works through most corporate proxies
-- Automatic chunking for large messages
-- Session-based with secret authentication
+- Session-based with per-session secret
+- Authenticated via UUID/Key check (same as WebSocket handshake)
 
 #### DNS Tunneling
 - Base32-encoded data in DNS queries
@@ -50,25 +50,26 @@ Makes C2 traffic appear as legitimate web browsing:
 - Chunked transmission for large payloads
 - Configurable DNS server
 - Works even in highly restrictive networks
+- Nonce + HMAC on every query to prevent hijack/replay
 
 ## Implementation Files
 
 ### Client-Side
 
 #### Core Transport Files
-- `/root/Spark/client/transport/transport.go` - Transport abstraction and manager
-- `/root/Spark/client/transport/websocket.go` - WebSocket (WS/WSS) implementation
-- `/root/Spark/client/transport/quic.go` - QUIC protocol implementation
-- `/root/Spark/client/transport/longpoll.go` - HTTP long polling implementation
-- `/root/Spark/client/transport/dns.go` - DNS tunneling implementation
-- `/root/Spark/client/transport/adapters.go` - Transport adapters for non-WebSocket transports
+- `/root/Rocket/client/transport/transport.go` - Transport abstraction and manager
+- `/root/Rocket/client/transport/websocket.go` - WebSocket (WS/WSS) implementation
+- `/root/Rocket/client/transport/quic.go` - QUIC protocol implementation
+- `/root/Rocket/client/transport/longpoll.go` - HTTP long polling implementation
+- `/root/Rocket/client/transport/dns.go` - DNS tunneling implementation
+- `/root/Rocket/client/transport/adapters.go` - Transport adapters for non-WebSocket transports
 
 #### Integration Files
-- `/root/Spark/client/core/transport_connect.go` - Transport manager integration
-- `/root/Spark/client/core/core.go` - Modified to use transport fallback
-- `/root/Spark/client/common/common.go` - Extended to support transport adapters
-- `/root/Spark/client/common/transport_adapter.go` - Transport adapter interface
-- `/root/Spark/client/config/config.go` - Added transport configuration fields
+- `/root/Rocket/client/core/transport_connect.go` - Transport manager integration
+- `/root/Rocket/client/core/core.go` - Modified to use transport fallback
+- `/root/Rocket/client/common/common.go` - Extended to support transport adapters
+- `/root/Rocket/client/common/transport_adapter.go` - Transport adapter interface
+- `/root/Rocket/client/config/config.go` - Added transport configuration fields
 
 ## Configuration
 
@@ -77,10 +78,13 @@ Makes C2 traffic appear as legitimate web browsing:
 ```go
 EnableTransportFallback bool   // Enable automatic transport fallback
 EnableQUIC              bool   // Enable QUIC protocol
+EnableLongPoll          bool   // Enable HTTP long polling
+EnableDNS               bool   // Enable DNS tunneling
 QUICPort                int    // QUIC port (default: 443)
-DNSTunnelDomain         string // DNS domain for tunneling
+DNSDomain               string // DNS domain for tunneling
 DNSServer               string // DNS server (default: "8.8.8.8:53")
 EnableMimicry           bool   // Enable protocol mimicry
+InsecureSkipVerify      bool   // Skip TLS verification (off by default)
 ```
 
 ### Example Configuration
@@ -94,11 +98,14 @@ EnableMimicry           bool   // Enable protocol mimicry
   "uuid": "client-uuid-here",
   "key": "client-key-here",
   "enable_transport_fallback": true,
+  "enable_longpoll": true,
   "enable_quic": true,
   "quic_port": 443,
-  "dns_tunnel_domain": "c2.example.com",
+  "enable_dns": true,
+  "dns_domain": "c2.example.com",
   "dns_server": "8.8.8.8:53",
-  "enable_mimicry": true
+  "enable_mimicry": true,
+  "insecure_skip_verify": false
 }
 ```
 
@@ -117,31 +124,11 @@ The client will automatically:
 ### Disable Fallback (Legacy Mode)
 Set `EnableTransportFallback: false` to use WebSocket only (original behavior).
 
-## Server-Side Implementation (TODO)
+## Server-Side Implementation
 
-### Required Server Changes
-
-1. **Long Polling Endpoints** (`/api/longpoll/`)
-   - `/api/longpoll/handshake` - Initial handshake
-   - `/api/longpoll/poll` - Poll for messages
-   - `/api/longpoll/send` - Send messages
-
-2. **QUIC Listener**
-   - Listen on UDP port (default: 443)
-   - Handle QUIC connections
-   - Implement stream-based message handling
-
-3. **DNS Server**
-   - DNS server to handle TXT queries
-   - Parse base32-encoded requests
-   - Return TXT records with responses
-   - Implement DNS query routing
-
-### Server Implementation Files Needed
-- `/root/Spark/server/handler/longpoll/longpoll.go`
-- `/root/Spark/server/handler/quic/quic.go`
-- `/root/Spark/server/handler/dns/dns.go`
-- `/root/Spark/server/main.go` - Add QUIC and DNS listeners
+- **Long Polling**: `/api/longpoll/{handshake,poll,send}` with per-session secrets and UUID/Key validation (same AES check as WebSocket).
+- **QUIC**: UDP listener (configurable), TLS 1.3, per-session derived secret, UUID/Key validation, registry integration for server→client sends.
+- **DNS**: TXT-based tunneling with base32 payloads, nonce+HMAC on every poll/send, chunk reassembly, and rate limiting; UUID/Key validated at handshake.
 
 ## Testing Strategy
 
@@ -243,4 +230,4 @@ Set `EnableTransportFallback: false` to use WebSocket only (original behavior).
 - Verify all transports configured
 
 ## Contact
-For questions or issues, refer to Spark documentation or create an issue in the repository.
+For questions or issues, refer to Rocket documentation or create an issue in the repository.

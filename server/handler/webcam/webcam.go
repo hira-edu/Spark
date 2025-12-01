@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
@@ -45,7 +45,7 @@ func init() {
 
 // InitWebcam handles webcam websocket handshake event
 func InitWebcam(ctx *gin.Context) {
-	tr := otel.Tracer("spark-server/webcam")
+	tr := otel.Tracer("rocket-server/webcam")
 	ctxSpan, span := tr.Start(ctx.Request.Context(), "webcam.handshake")
 	defer span.End()
 	ctx.Request = ctx.Request.WithContext(ctxSpan)

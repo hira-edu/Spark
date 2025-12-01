@@ -1,9 +1,9 @@
 package bridge
 
 import (
-	"Spark/modules"
-	"Spark/utils"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
 	"github.com/gin-gonic/gin"
 	"io"
 	"net"

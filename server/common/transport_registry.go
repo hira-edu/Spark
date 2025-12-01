@@ -1,7 +1,7 @@
 package common
 
 import (
-	"Spark/modules"
+	"Rocket/modules"
 	"sync"
 
 	"github.com/kataras/golog"

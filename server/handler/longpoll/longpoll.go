@@ -1,12 +1,14 @@
 package longpoll
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/audio"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/server/handler/audio"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
@@ -57,7 +59,7 @@ type SessionManager struct {
 
 var (
 	sessionManager *SessionManager
-	tracer         = otel.Tracer("spark-server/longpoll")
+	tracer         = otel.Tracer("rocket-server/longpoll")
 )
 
 func init() {
@@ -186,22 +188,13 @@ func Handshake(ctx *gin.Context) {
 		return
 	}
 
-	// Verify device exists and get connection UUID
-	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
-	connUUID, ok := common.CheckDevice(deviceID, "")
-	if !ok {
+	connUUID, err := validateCredentials(deviceID, key)
+	if err != nil {
 		ctx.AbortWithStatus(http.StatusUnauthorized)
-		span.SetStatus(codes.Error, "device not found")
-		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "device_not_found", deviceID, nil)
-		return
-	}
-
-	// Verify the device key matches
-	device, ok := common.Devices.Get(connUUID)
-	if !ok || device.ID != deviceID {
-		ctx.AbortWithStatus(http.StatusUnauthorized)
-		span.SetStatus(codes.Error, "invalid device state")
-		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "invalid_device_state", deviceID, nil)
+		span.SetStatus(codes.Error, "invalid credentials")
+		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "invalid_credentials", deviceID, map[string]any{
+			"error": err.Error(),
+		})
 		return
 	}
 
@@ -513,6 +506,36 @@ func SendToLongPollClient(uuid string, packet *modules.Packet) bool {
 	}
 
 	return true
+}
+
+// validateCredentials verifies UUID/Key against server salt (same as WebSocket handshake)
+func validateCredentials(uuidHex, keyHex string) (string, error) {
+	uuidBytes, err := hex.DecodeString(uuidHex)
+	if err != nil || len(uuidBytes) != 16 {
+		return "", errors.New("invalid uuid")
+	}
+
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		return "", errors.New("invalid key")
+	}
+
+	decrypted, err := common.DecAES(keyBytes, servercfg.Config.SaltBytes)
+	if err != nil {
+		return "", err
+	}
+
+	if !bytes.Equal(decrypted, uuidBytes) {
+		return "", errors.New("uuid/key mismatch")
+	}
+
+	// Check device and register if needed - return connection UUID
+	connUUID, ok := common.CheckDevice(uuidHex, "")
+	if !ok {
+		return "", errors.New("device registration failed")
+	}
+
+	return connUUID, nil
 }
 
 // bytesEqual compares two byte slices in constant time

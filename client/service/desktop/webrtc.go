@@ -94,7 +94,7 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: mimeType},
 		"screen",
-		"spark-desktop",
+		"rocket-desktop",
 	)
 	if err != nil {
 		pc.Close()

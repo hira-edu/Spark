@@ -1,7 +1,7 @@
 package transport
 
 import (
-	"Spark/client/common"
+	"Rocket/client/common"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -71,7 +71,7 @@ func (t *QUICTransport) Connect(ctx context.Context, cfg *Config) (*common.Conn,
 	// Create TLS config for QUIC
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
-		NextProtos:         []string{"spark-quic", "h3"}, // ALPN
+		NextProtos:         []string{"rocket-quic", "h3"}, // ALPN
 		MinVersion:         tls.VersionTLS13, // QUIC requires TLS 1.3
 	}
 

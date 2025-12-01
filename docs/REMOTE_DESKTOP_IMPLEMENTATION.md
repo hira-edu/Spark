@@ -1,6 +1,6 @@
 # Full-Featured Remote Desktop Implementation Plan
 
-This document outlines the implementation plan for adding full remote desktop control (mouse + keyboard) to Spark. Phase 1 uses the existing WebSocket stream plus Windows-native SendInput; Phase 2 adds WebRTC (media + data channel) with graceful fallback to the WS JPEG path.
+This document outlines the implementation plan for adding full remote desktop control (mouse + keyboard) to Rocket. Phase 1 uses the existing WebSocket stream plus Windows-native SendInput; Phase 2 adds WebRTC (media + data channel) with graceful fallback to the WS JPEG path.
 
 ## Current State
 
@@ -308,4 +308,4 @@ GOOS=linux GOARCH=amd64 go build ...
 - [Pion WebRTC](https://github.com/pion/webrtc) and [datachannels guide](https://github.com/pion/webrtc/wiki/Examples#data-channels)
 - [Pion mediadevices VP8 codec](https://pkg.go.dev/github.com/pion/mediadevices/pkg/codec/vpx) and [TrackLocal](https://pkg.go.dev/github.com/pion/webrtc/v3#TrackLocal)
 - [WebRTC ICE/STUN/TURN primer](https://webrtc.org/getting-started/overview) and [RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445)
-- [Spark original repository](https://github.com/XZB-1248/Spark) for baseline desktop pipeline
+- [Rocket original repository](https://github.com/XZB-1248/Rocket) for baseline desktop pipeline

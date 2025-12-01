@@ -1,11 +1,11 @@
 package generate
 
 import (
-	clientcfg "Spark/client/config"
-	"Spark/modules"
-	"Spark/server/common"
-	servercfg "Spark/server/config"
-	"Spark/utils"
+	clientcfg "Rocket/client/config"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/utils"
 	"bytes"
 	"encoding/hex"
 	"errors"

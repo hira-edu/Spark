@@ -1,6 +1,6 @@
 package desktop
 
-import "Spark/modules"
+import "Rocket/modules"
 
 func HandleConfig(pack modules.Packet) error {
 	return nil

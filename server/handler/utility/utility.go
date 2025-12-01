@@ -1,12 +1,12 @@
 package utility
 
 import (
-	clientcfg "Spark/client/config"
-	"Spark/modules"
-	"Spark/server/common"
-	servercfg "Spark/server/config"
-	"Spark/utils"
-	"Spark/utils/melody"
+	clientcfg "Rocket/client/config"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"context"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -284,7 +284,7 @@ func CheckUpdate(ctx *gin.Context) {
 		`server`: servercfg.Commit,
 	})
 
-	ctx.Header(`Spark-Commit`, servercfg.Commit)
+	ctx.Header(`Rocket-Commit`, servercfg.Commit)
 	ctx.Header(`Accept-Ranges`, `none`)
 	ctx.Header(`Content-Transfer-Encoding`, `binary`)
 	ctx.Header(`Content-Type`, `application/octet-stream`)

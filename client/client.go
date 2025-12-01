@@ -1,11 +1,11 @@
 package main
 
 import (
-	"Spark/client/config"
-	"Spark/client/core"
-	"Spark/client/lifecycle"
-	"Spark/client/telemetry"
-	"Spark/utils"
+	"Rocket/client/config"
+	"Rocket/client/core"
+	"Rocket/client/lifecycle"
+	"Rocket/client/telemetry"
+	"Rocket/utils"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -92,7 +92,7 @@ func main() {
 	}
 
 	// Create application wrapper
-	app := &sparkApp{}
+	app := &rocketApp{}
 
 	// Create platform-specific components
 	installer := lifecycle.NewInstaller()
@@ -182,10 +182,10 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// sparkApp implements lifecycle.Application
-type sparkApp struct{}
+// rocketApp implements lifecycle.Application
+type rocketApp struct{}
 
-func (s *sparkApp) Run(ctx context.Context) error {
+func (s *rocketApp) Run(ctx context.Context) error {
 	return core.StartWithContext(ctx)
 }
 
@@ -256,7 +256,7 @@ func initLogging() {
 	}
 
 	// Fallback to temp dir
-	fallback := filepath.Join(os.TempDir(), "spark_client.log")
+	fallback := filepath.Join(os.TempDir(), "rocket_client.log")
 	if f, err := os.OpenFile(fallback, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
 		golog.SetOutput(f)
 		golog.Infof("Logging to %s (fallback)", fallback)

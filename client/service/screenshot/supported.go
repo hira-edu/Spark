@@ -3,8 +3,8 @@
 package screenshot
 
 import (
-	"Spark/client/common"
-	"Spark/client/config"
+	"Rocket/client/common"
+	"Rocket/client/config"
 	"bytes"
 	"errors"
 	"github.com/kbinani/screenshot"

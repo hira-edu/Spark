@@ -4,8 +4,8 @@
 package webcam
 
 import (
-	"Spark/client/common"
-	"Spark/modules"
+	"Rocket/client/common"
+	"Rocket/modules"
 	"bytes"
 	"encoding/base64"
 	"errors"

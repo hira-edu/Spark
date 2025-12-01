@@ -3,7 +3,7 @@
 package lifecycle
 
 import (
-	"Spark/client/telemetry"
+	"Rocket/client/telemetry"
 	"context"
 	"errors"
 	"fmt"

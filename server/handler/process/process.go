@@ -1,11 +1,11 @@
 package process
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"time"

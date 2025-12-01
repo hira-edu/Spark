@@ -2,11 +2,11 @@
 
 ---
 
-<h1>Spark</h1>
+<h1>Rocket</h1>
 
-**[Spark](https://github.com/XZB-1248/Spark)** is a free, safe, open-source, web-based, cross-platform, and full-featured RAT (Remote Administration Tool) that allows you to control all your devices via browser anywhere.
+**[Rocket](https://github.com/XZB-1248/Rocket)** is a free, safe, open-source, web-based, cross-platform, and full-featured RAT (Remote Administration Tool) that allows you to control all your devices via browser anywhere.
 
-✅ **No data collection**: Spark does not collect any user information.  
+✅ **No data collection**: Rocket does not collect any user information.  
 ✅ **No auto-updates**: The server will not update itself.  
 ✅ **Direct communication**: Clients communicate exclusively with your server.
 
@@ -14,10 +14,10 @@
 
 
 
-| ![GitHub repo size](https://img.shields.io/github/repo-size/XZB-1248/Spark?style=flat-square) | ![GitHub issues](https://img.shields.io/github/issues/XZB-1248/Spark?style=flat-square) | ![GitHub closed issues](https://img.shields.io/github/issues-closed/XZB-1248/Spark?style=flat-square) |
+| ![GitHub repo size](https://img.shields.io/github/repo-size/XZB-1248/Rocket?style=flat-square) | ![GitHub issues](https://img.shields.io/github/issues/XZB-1248/Rocket?style=flat-square) | ![GitHub closed issues](https://img.shields.io/github/issues-closed/XZB-1248/Rocket?style=flat-square) |
 |-----------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
 
-| [![GitHub downloads](https://img.shields.io/github/downloads/XZB-1248/Spark/total?style=flat-square)](https://github.com/XZB-1248/Spark/releases) | [![GitHub release (latest by date)](https://img.shields.io/github/downloads/XZB-1248/Spark/latest/total?style=flat-square)](https://github.com/XZB-1248/Spark/releases/latest) |
+| [![GitHub downloads](https://img.shields.io/github/downloads/XZB-1248/Rocket/total?style=flat-square)](https://github.com/XZB-1248/Rocket/releases) | [![GitHub release (latest by date)](https://img.shields.io/github/downloads/XZB-1248/Rocket/latest/total?style=flat-square)](https://github.com/XZB-1248/Rocket/releases/latest) |
 |---------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ---
@@ -38,7 +38,7 @@ If you find security vulnerabilities, **do not open an issue**. Contact me immed
 
 ### Binary Execution
 
-1. Download the executable from the [releases](https://github.com/XZB-1248/Spark/releases) page.
+1. Download the executable from the [releases](https://github.com/XZB-1248/Rocket/releases) page.
 2. Follow the [Configuration](#configuration) instructions.
 3. Run the executable and access the web interface at `http://IP:Port`.
 4. Generate a client and run it on the target device.
@@ -101,13 +101,13 @@ Add STUN/TURN lists to help WebRTC connections, especially when clients are behi
 
 ## 🔒 HTTPS/TLS Deployment
 
-Spark supports native HTTPS with manual certificates or automatic Let's Encrypt certificates.
+Rocket supports native HTTPS with manual certificates or automatic Let's Encrypt certificates.
 
 ### Option 1: Manual Certificates
 
 **Command Line:**
 ```bash
-./spark-server -tls -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem -listen :443
+./rocket-server -tls -tls-cert /path/to/cert.pem -tls-key /path/to/key.pem -listen :443
 ```
 
 **Config File:**
@@ -127,7 +127,7 @@ Spark supports native HTTPS with manual certificates or automatic Let's Encrypt 
 
 **Command Line:**
 ```bash
-./spark-server -tls-autocert -tls-domains "spark.yourdomain.com" -tls-email "you@example.com" -listen :443
+./rocket-server -tls-autocert -tls-domains "rocket.yourdomain.com" -tls-email "you@example.com" -listen :443
 ```
 
 **Config File:**
@@ -138,7 +138,7 @@ Spark supports native HTTPS with manual certificates or automatic Let's Encrypt 
     "tls": {
         "autocert": {
             "enable": true,
-            "domains": ["spark.yourdomain.com"],
+            "domains": ["rocket.yourdomain.com"],
             "email": "you@example.com",
             "cache_dir": "./certs"
         }
@@ -220,8 +220,8 @@ For OS support beyond Linux and Windows, additional C compilers may be required.
 
 ```bash
 # Clone the repository
-git clone https://github.com/XZB-1248/Spark
-cd ./Spark
+git clone https://github.com/XZB-1248/Rocket
+cd ./Rocket
 
 # Build the front-end
 cd ./web
@@ -246,7 +246,7 @@ mkdir ./releases
 
 ### Client Configuration Trailer
 
-Spark uses a **binary trailer approach** (Sliver-style) for embedding client configuration into executables. This design works identically across Windows, Linux, and macOS, providing a robust and maintainable solution.
+Rocket uses a **binary trailer approach** (Sliver-style) for embedding client configuration into executables. This design works identically across Windows, Linux, and macOS, providing a robust and maintainable solution.
 
 **Key Benefits:**
 - **Platform-Independent**: Works with PE, ELF, and Mach-O formats using identical code
@@ -285,7 +285,7 @@ If you need to customize some features, please contact me via [**i@1248.ink**](m
 
 ## Dependencies
 
-Spark contains many third-party open-source projects.
+Rocket contains many third-party open-source projects.
 
 Lists of dependencies can be found at `go.mod` and `package.json`.
 
@@ -331,7 +331,7 @@ Some major dependencies are listed below.
 
 ### Stargazers over time
 
-[![Stargazers over time](https://starchart.cc/XZB-1248/Spark.svg)](https://starchart.cc/XZB-1248/Spark)
+[![Stargazers over time](https://starchart.cc/XZB-1248/Rocket.svg)](https://starchart.cc/XZB-1248/Rocket)
 
 
 ---

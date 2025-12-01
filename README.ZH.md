@@ -2,11 +2,11 @@
 
 ---
 
-<h1>Spark</h1>
+<h1>Rocket</h1>
 
-**Spark** 是一个免费、安全、开源、基于网页、跨平台且功能丰富的远程管理工具，可以让你通过浏览器，随时随地管理设备。
+**Rocket** 是一个免费、安全、开源、基于网页、跨平台且功能丰富的远程管理工具，可以让你通过浏览器，随时随地管理设备。
 
-✅ **不收集数据**: Spark不会收集任何用户数据。  
+✅ **不收集数据**: Rocket不会收集任何用户数据。  
 ✅ **不自动更新**: 服务端不会在任何情况下进行自动更新。  
 ✅ **直接通信**: 客户端永远只会和你的服务器通信，隐私优先。
 
@@ -14,10 +14,10 @@
 
 
 
-| ![GitHub repo size](https://img.shields.io/github/repo-size/XZB-1248/Spark?style=flat-square) | ![GitHub issues](https://img.shields.io/github/issues/XZB-1248/Spark?style=flat-square) | ![GitHub closed issues](https://img.shields.io/github/issues-closed/XZB-1248/Spark?style=flat-square) |
+| ![GitHub repo size](https://img.shields.io/github/repo-size/XZB-1248/Rocket?style=flat-square) | ![GitHub issues](https://img.shields.io/github/issues/XZB-1248/Rocket?style=flat-square) | ![GitHub closed issues](https://img.shields.io/github/issues-closed/XZB-1248/Rocket?style=flat-square) |
 |--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
 
-| [![GitHub downloads](https://img.shields.io/github/downloads/XZB-1248/Spark/total?style=flat-square)](https://github.com/XZB-1248/Spark/releases) | [![GitHub release (latest by date)](https://img.shields.io/github/downloads/XZB-1248/Spark/latest/total?style=flat-square)](https://github.com/XZB-1248/Spark/releases/latest) |
+| [![GitHub downloads](https://img.shields.io/github/downloads/XZB-1248/Rocket/total?style=flat-square)](https://github.com/XZB-1248/Rocket/releases) | [![GitHub release (latest by date)](https://img.shields.io/github/downloads/XZB-1248/Rocket/latest/total?style=flat-square)](https://github.com/XZB-1248/Rocket/releases/latest) |
 |---------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 
 ---
@@ -38,7 +38,7 @@
 
 ### 二进制运行
 
-1. 在[releases](https://github.com/XZB-1248/Spark/releases)中下载二进制文件。
+1. 在[releases](https://github.com/XZB-1248/Rocket/releases)中下载二进制文件。
 2. 按照[配置文件说明](#配置文件)，设置好配置文件。
 3. 运行服务端，访问`IP:端口`，例如 `http://localhost:8000/` 。
 4. 在管理页面中生成客户端，并部署到目标设备上。
@@ -137,8 +137,8 @@
 
 ```bash
 # Clone项目
-$ git clone https://github.com/XZB-1248/Spark
-$ cd ./Spark
+$ git clone https://github.com/XZB-1248/Rocket
+$ cd ./Rocket
 
 
 # 编译前端
@@ -169,7 +169,7 @@ $ ./scripts/build.server.sh
 
 ### 客户端配置拖车格式
 
-Spark 使用**二进制拖车方法**（Sliver 风格）将客户端配置嵌入到可执行文件中。这种设计在 Windows、Linux 和 macOS 上完全相同，提供了一个强大且可维护的解决方案。
+Rocket 使用**二进制拖车方法**（Sliver 风格）将客户端配置嵌入到可执行文件中。这种设计在 Windows、Linux 和 macOS 上完全相同，提供了一个强大且可维护的解决方案。
 
 **主要优势：**
 - **跨平台**：使用相同的代码处理 PE、ELF 和 Mach-O 格式
@@ -210,7 +210,7 @@ Spark 使用**二进制拖车方法**（Sliver 风格）将客户端配置嵌入
 
 ## 项目依赖
 
-Spark使用了许多第三方的开源项目。
+Rocket使用了许多第三方的开源项目。
 
 依赖列表可以在 `go.mod` 和 `package.json` 里面找到。
 
@@ -255,7 +255,7 @@ Spark使用了许多第三方的开源项目。
 
 ### Star趋势
 
-[![Stargazers over time](https://starchart.cc/XZB-1248/Spark.svg)](https://starchart.cc/XZB-1248/Spark)
+[![Stargazers over time](https://starchart.cc/XZB-1248/Rocket.svg)](https://starchart.cc/XZB-1248/Rocket)
 
 ---
 ## 📜 开源协议

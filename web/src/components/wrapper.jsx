@@ -3,7 +3,10 @@ import ProLayout, {PageContainer} from '@ant-design/pro-layout';
 import zhCN from 'antd/lib/locale/zh_CN';
 import en from 'antd/lib/locale/en_US';
 import {getLang, getLocale} from "../locale/locale";
-import {Button, ConfigProvider, notification} from "antd";
+import {Button, ConfigProvider, notification, Dropdown, Avatar, Space} from "antd";
+import {LogoutOutlined, UserOutlined} from '@ant-design/icons';
+import {useNavigate} from 'react-router-dom';
+import {useAuth} from '../context/AuthContext';
 import version from "../config/version.json";
 import ReactMarkdown from "react-markdown";
 import i18n from "i18next";
@@ -15,10 +18,58 @@ if (enableUpdateCheck) {
 	promptUpdate();
 }
 function wrapper(props) {
+	const navigate = useNavigate();
+	const { user, logout } = useAuth();
+
+	const handleLogout = async () => {
+		await logout();
+		navigate('/login');
+	};
+
+	const userMenuItems = [
+		{
+			key: 'user-info',
+			label: (
+				<div style={{ padding: '4px 0' }}>
+					<div style={{ fontWeight: 600, color: '#ffffff' }}>{user?.username}</div>
+					{user?.email && (
+						<div style={{ fontSize: 12, color: 'rgba(255, 255, 255, 0.65)' }}>{user.email}</div>
+					)}
+				</div>
+			),
+			disabled: true
+		},
+		{
+			type: 'divider'
+		},
+		{
+			key: 'logout',
+			icon: <LogoutOutlined />,
+			label: 'Logout',
+			onClick: handleLogout,
+			danger: true
+		}
+	];
+
+	const UserMenu = () => (
+		<Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
+			<Space style={{ cursor: 'pointer', padding: '0 16px' }}>
+				<Avatar
+					size="small"
+					icon={<UserOutlined />}
+					style={{
+						background: 'linear-gradient(135deg, #60a5fa 0%, #a78bfa 100%)',
+					}}
+				/>
+				<span style={{ color: '#ffffff' }}>{user?.username}</span>
+			</Space>
+		</Dropdown>
+	);
+
 	return (
 		<ProLayout
 			loading={false}
-			title='Spark'
+			title='Rocket'
 			logo={null}
 			layout='top'
 			navTheme='dark'
@@ -27,6 +78,7 @@ function wrapper(props) {
 			contentWidth='fluid'
 			collapsedButtonRender={Title}
 			headerTheme='dark'
+			rightContentRender={() => <UserMenu />}
 			style={{
 				background: '#1a1a1a',
 			}}
@@ -59,13 +111,13 @@ function Title() {
 				fontWeight: 500
 			}}
 		>
-			Spark
+			Rocket
 		</div>
 	)
 }
 function promptUpdate() {
 	let latest = '';
-	axios('https://1248.ink/spark/update', {
+	axios('https://1248.ink/rocket/update', {
 		method: 'POST',
 		data: version
 	}).then(res => {

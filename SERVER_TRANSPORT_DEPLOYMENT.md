@@ -1,4 +1,4 @@
-# Spark Server Transport Deployment Guide
+# Rocket Server Transport Deployment Guide
 
 ## Overview
 Complete server-side implementation for multi-transport C2 communication with automatic fallback.
@@ -15,7 +15,8 @@ Complete server-side implementation for multi-transport C2 communication with au
   - Session management with automatic cleanup
   - Message queuing (1000 messages per session)
   - 30-second poll timeout with batching
-  - Secret-based authentication
+  - UUID/Key validation (same AES check as WebSocket)
+  - Per-session secret returned on handshake
   - Encrypted communication
 
 ### 2. QUIC Server (`server/handler/quic/`)
@@ -27,6 +28,7 @@ Complete server-side implementation for multi-transport C2 communication with au
   - Keep-alive (30 seconds)
   - Max idle timeout (5 minutes)
   - Automatic cleanup of dead connections
+  - UUID/Key validation and per-session secret derivation
 
 ### 3. DNS Tunneling Server (`server/handler/dns/`)
 - **Port:** UDP 53 (configurable)
@@ -34,8 +36,9 @@ Complete server-side implementation for multi-transport C2 communication with au
   - TXT record-based communication
   - Base32 encoding for DNS safety
   - Chunk reassembly for large messages
-  - Session management
-  - Automatic session expiration
+  - Session management with registry integration
+  - Nonce + HMAC on every poll/send (replay/tamper protection)
+  - Automatic session expiration and rate limiting
 
 ## Configuration
 
@@ -154,11 +157,11 @@ sudo ufw allow 53/udp
 
 ```bash
 # Build server
-cd /root/Spark
+cd /root/Rocket
 ./scripts/build.server.sh
 
 # Run with all transports enabled
-sudo ./spark-server -config config.json
+sudo ./rocket-server -config config.json
 ```
 
 **Note:** DNS server on port 53 requires root privileges or `CAP_NET_BIND_SERVICE` capability.
@@ -193,10 +196,10 @@ The server logs transport-specific events:
 
 ```bash
 # View real-time logs
-tail -f logs/spark.log | grep -E "LONGPOLL|QUIC|DNS"
+tail -f logs/rocket.log | grep -E "LONGPOLL|QUIC|DNS"
 
 # Count active sessions by transport
-grep "SESSION_CREATED" logs/spark.log | wc -l
+grep "SESSION_CREATED" logs/rocket.log | wc -l
 
 # Monitor QUIC connections
 sudo netstat -anu | grep :443
@@ -247,10 +250,10 @@ sudo tcpdump -i any udp port 53 -n
 - **Solutions:**
   ```bash
   # Option 1: Run as root
-  sudo ./spark-server
+  sudo ./rocket-server
 
   # Option 2: Grant capability
-  sudo setcap 'cap_net_bind_service=+ep' ./spark-server
+  sudo setcap 'cap_net_bind_service=+ep' ./rocket-server
 
   # Option 3: Use alternate port
   "dns": { "listen": ":5353" }

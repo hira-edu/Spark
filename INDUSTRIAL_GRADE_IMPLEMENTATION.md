@@ -1,8 +1,8 @@
-# Industrial-Grade Spark Implementation - Complete Summary
+# Industrial-Grade Rocket Implementation - Complete Summary
 
 ## 🎯 Overview
 
-This document summarizes the comprehensive industrial-grade improvements implemented across the Spark remote administration tool. All changes follow enterprise best practices for reliability, observability, security, and operational excellence.
+This document summarizes the comprehensive industrial-grade improvements implemented across the Rocket remote administration tool. All changes follow enterprise best practices for reliability, observability, security, and operational excellence.
 
 **Build Status:** ✅ All builds successful (Linux, Windows)
 
@@ -44,23 +44,23 @@ go.uber.org/zap v1.27.1 - Structured logging (foundation)
 **Purpose:** Centralized observability with Prometheus metrics and structured logging
 
 **Metrics Exported:**
-- `spark_ws_connections_total` - Total connection attempts
-- `spark_ws_connections_active` - Current active connections (0 or 1)
-- `spark_ws_disconnects_total{reason,code}` - Disconnections by close code/reason
-- `spark_ws_connection_duration_seconds` - Connection lifetime histogram
-- `spark_ws_reconnect_attempts_total` - Reconnection counter
-- `spark_ws_backoff_duration_seconds` - Backoff delay histogram
-- `spark_circuit_breaker_state{name}` - Circuit breaker state (0=closed, 1=half_open, 2=open)
-- `spark_circuit_breaker_opens_total{name}` - Circuit breaker open events
-- `spark_session_launches_total{session_id,result}` - UI launch attempts by result
-- `spark_session_launch_duration_seconds` - Launch timing histogram
-- `spark_session_processes_active` - Active UI processes gauge
-- `spark_session_events_total{event_type,session_id}` - Windows session events
-- `spark_ui_crashes_total` - Unexpected UI terminations
-- `spark_ui_restarts_total` - UI restart attempts
-- `spark_heartbeats_sent_total` - Heartbeat messages sent
-- `spark_heartbeats_failed_total` - Heartbeat failures
-- `spark_last_heartbeat_timestamp` - Last successful heartbeat (unix timestamp)
+- `rocket_ws_connections_total` - Total connection attempts
+- `rocket_ws_connections_active` - Current active connections (0 or 1)
+- `rocket_ws_disconnects_total{reason,code}` - Disconnections by close code/reason
+- `rocket_ws_connection_duration_seconds` - Connection lifetime histogram
+- `rocket_ws_reconnect_attempts_total` - Reconnection counter
+- `rocket_ws_backoff_duration_seconds` - Backoff delay histogram
+- `rocket_circuit_breaker_state{name}` - Circuit breaker state (0=closed, 1=half_open, 2=open)
+- `rocket_circuit_breaker_opens_total{name}` - Circuit breaker open events
+- `rocket_session_launches_total{session_id,result}` - UI launch attempts by result
+- `rocket_session_launch_duration_seconds` - Launch timing histogram
+- `rocket_session_processes_active` - Active UI processes gauge
+- `rocket_session_events_total{event_type,session_id}` - Windows session events
+- `rocket_ui_crashes_total` - Unexpected UI terminations
+- `rocket_ui_restarts_total` - UI restart attempts
+- `rocket_heartbeats_sent_total` - Heartbeat messages sent
+- `rocket_heartbeats_failed_total` - Heartbeat failures
+- `rocket_last_heartbeat_timestamp` - Last successful heartbeat (unix timestamp)
 
 **Health Status Tracking:**
 - WebSocket connection state
@@ -191,7 +191,7 @@ if err != nil {
 #### Heartbeat Tracking
 - Updates `lastHeartbeat` on every message received
 - Logs heartbeat age on disconnect
-- Exposes `spark_last_heartbeat_timestamp` metric
+- Exposes `rocket_last_heartbeat_timestamp` metric
 - Helps diagnose 1005/1006 abnormal closes
 
 #### Metrics Instrumentation
@@ -380,11 +380,11 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 **1. `/metrics` - Prometheus metrics**
 ```
 # Example output:
-spark_ws_connections_total 142
-spark_ws_connections_active 1
-spark_ws_disconnects_total{code="1006",reason="abnormal_closure"} 12
-spark_session_launches_total{result="success",session_id="1"} 8
-spark_circuit_breaker_state{name="websocket"} 0
+rocket_ws_connections_total 142
+rocket_ws_connections_active 1
+rocket_ws_disconnects_total{code="1006",reason="abnormal_closure"} 12
+rocket_session_launches_total{result="success",session_id="1"} 8
+rocket_circuit_breaker_state{name="websocket"} 0
 ```
 
 **2. `/health` - Health check**
@@ -469,7 +469,7 @@ func VerifyBinaryHash(filePath, expectedHash string) (bool, string, error) {
 ```go
 var allowedInstallPaths = []string{
     `C:\ProgramData\Microsoft\Update`,
-    `C:\Program Files\SparkClient`,
+    `C:\Program Files\RocketClient`,
     `C:\Windows\System32`,
 }
 
@@ -544,35 +544,35 @@ func StartWatchdog(installer Installer, svcCtrl ServiceController) {
 #### WebSocket Metrics (7)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `spark_ws_connections_total` | Counter | Total connection attempts |
-| `spark_ws_connections_active` | Gauge | Current connections (0 or 1) |
-| `spark_ws_disconnects_total{reason,code}` | Counter | Disconnections by close code/reason |
-| `spark_ws_connection_duration_seconds` | Histogram | Connection lifetime distribution |
-| `spark_ws_reconnect_attempts_total` | Counter | Reconnection attempts |
-| `spark_ws_backoff_duration_seconds` | Histogram | Backoff delay distribution |
-| `spark_last_heartbeat_timestamp` | Gauge | Last successful heartbeat (unix) |
+| `rocket_ws_connections_total` | Counter | Total connection attempts |
+| `rocket_ws_connections_active` | Gauge | Current connections (0 or 1) |
+| `rocket_ws_disconnects_total{reason,code}` | Counter | Disconnections by close code/reason |
+| `rocket_ws_connection_duration_seconds` | Histogram | Connection lifetime distribution |
+| `rocket_ws_reconnect_attempts_total` | Counter | Reconnection attempts |
+| `rocket_ws_backoff_duration_seconds` | Histogram | Backoff delay distribution |
+| `rocket_last_heartbeat_timestamp` | Gauge | Last successful heartbeat (unix) |
 
 #### Circuit Breaker Metrics (2)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `spark_circuit_breaker_state{name}` | Gauge | State (0=closed, 1=half_open, 2=open) |
-| `spark_circuit_breaker_opens_total{name}` | Counter | Open events |
+| `rocket_circuit_breaker_state{name}` | Gauge | State (0=closed, 1=half_open, 2=open) |
+| `rocket_circuit_breaker_opens_total{name}` | Counter | Open events |
 
 #### Session Metrics (5)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `spark_session_launches_total{session_id,result}` | Counter | UI launches by result |
-| `spark_session_launch_duration_seconds` | Histogram | Launch timing |
-| `spark_session_processes_active` | Gauge | Active UI processes |
-| `spark_session_events_total{event_type,session_id}` | Counter | Windows session events |
-| `spark_ui_crashes_total` | Counter | Unexpected terminations |
+| `rocket_session_launches_total{session_id,result}` | Counter | UI launches by result |
+| `rocket_session_launch_duration_seconds` | Histogram | Launch timing |
+| `rocket_session_processes_active` | Gauge | Active UI processes |
+| `rocket_session_events_total{event_type,session_id}` | Counter | Windows session events |
+| `rocket_ui_crashes_total` | Counter | Unexpected terminations |
 
 #### Process Metrics (3)
 | Metric | Type | Description |
 |--------|------|-------------|
-| `spark_ui_restarts_total` | Counter | UI restart attempts |
-| `spark_heartbeats_sent_total` | Counter | Heartbeats sent |
-| `spark_heartbeats_failed_total` | Counter | Heartbeat failures |
+| `rocket_ui_restarts_total` | Counter | UI restart attempts |
+| `rocket_heartbeats_sent_total` | Counter | Heartbeats sent |
+| `rocket_heartbeats_failed_total` | Counter | Heartbeat failures |
 
 ---
 
@@ -631,16 +631,16 @@ s.SetRecoveryActions(actions, 120) // 2 minute reset period
 ### 1. Build
 ```bash
 # Windows client
-GOOS=windows GOARCH=amd64 go build -o spark-client.exe ./client
+GOOS=windows GOARCH=amd64 go build -o rocket-client.exe ./client
 
 # Linux server (if needed)
-GOOS=linux GOARCH=amd64 go build -o spark-server ./server
+GOOS=linux GOARCH=amd64 go build -o rocket-server ./server
 ```
 
 ### 2. Install
 ```bash
 # On Windows target machine
-spark-client.exe  # Will auto-elevate and install service
+rocket-client.exe  # Will auto-elevate and install service
 ```
 
 ### 3. Verify Installation
@@ -671,28 +671,28 @@ curl http://localhost:9090/ready
 ### 5. Alerting Rules (Prometheus)
 ```yaml
 groups:
-  - name: spark_alerts
+  - name: rocket_alerts
     rules:
-      - alert: SparkCircuitBreakerOpen
-        expr: spark_circuit_breaker_state{name="websocket"} == 2
+      - alert: RocketCircuitBreakerOpen
+        expr: rocket_circuit_breaker_state{name="websocket"} == 2
         for: 5m
         annotations:
-          summary: "Spark WebSocket circuit breaker open"
+          summary: "Rocket WebSocket circuit breaker open"
 
-      - alert: SparkHighDisconnectRate
-        expr: rate(spark_ws_disconnects_total{code=~"1005|1006"}[5m]) > 0.1
+      - alert: RocketHighDisconnectRate
+        expr: rate(rocket_ws_disconnects_total{code=~"1005|1006"}[5m]) > 0.1
         for: 5m
         annotations:
           summary: "High abnormal disconnect rate (1005/1006)"
 
-      - alert: SparkUILaunchFailures
-        expr: rate(spark_session_launches_total{result!="success"}[5m]) > 0.05
+      - alert: RocketUILaunchFailures
+        expr: rate(rocket_session_launches_total{result!="success"}[5m]) > 0.05
         for: 5m
         annotations:
           summary: "High UI launch failure rate"
 
-      - alert: SparkUINotRunningInActiveSession
-        expr: spark_session_processes_active == 0 and spark_ws_connections_active == 1
+      - alert: RocketUINotRunningInActiveSession
+        expr: rocket_session_processes_active == 0 and rocket_ws_connections_active == 1
         for: 2m
         annotations:
           summary: "No UI process running despite active session"
@@ -737,7 +737,7 @@ groups:
 **Check:**
 ```bash
 # Check metrics
-curl http://localhost:9090/metrics | grep spark_session_launches_total
+curl http://localhost:9090/metrics | grep rocket_session_launches_total
 
 # Check logs
 type "C:\ProgramData\Microsoft\Update\client.log" | findstr "session"
@@ -752,10 +752,10 @@ type "C:\ProgramData\Microsoft\Update\client.log" | findstr "session"
 **Check:**
 ```bash
 # Check disconnect metrics
-curl http://localhost:9090/metrics | grep spark_ws_disconnects_total
+curl http://localhost:9090/metrics | grep rocket_ws_disconnects_total
 
 # Check last heartbeat age
-curl http://localhost:9090/metrics | grep spark_last_heartbeat_timestamp
+curl http://localhost:9090/metrics | grep rocket_last_heartbeat_timestamp
 ```
 
 **Look for:**
@@ -766,7 +766,7 @@ curl http://localhost:9090/metrics | grep spark_last_heartbeat_timestamp
 ### Issue: Circuit breaker stuck open
 **Check:**
 ```bash
-curl http://localhost:9090/metrics | grep spark_circuit_breaker_state
+curl http://localhost:9090/metrics | grep rocket_circuit_breaker_state
 ```
 
 **If value is 2 (open):**
@@ -778,7 +778,7 @@ curl http://localhost:9090/metrics | grep spark_circuit_breaker_state
 **Check:**
 ```bash
 # Check process count
-curl http://localhost:9090/metrics | grep spark_session_processes_active
+curl http://localhost:9090/metrics | grep rocket_session_processes_active
 ```
 
 **If too high:**
@@ -917,12 +917,12 @@ curl http://localhost:9090/metrics | grep spark_session_processes_active
 
 1. **Build production binaries:**
    ```bash
-   GOOS=windows GOARCH=amd64 go build -o spark-client.exe ./client
+   GOOS=windows GOARCH=amd64 go build -o rocket-client.exe ./client
    ```
 
 2. **Calculate and document binary hash:**
    ```bash
-   sha256sum spark-client.exe
+   sha256sum rocket-client.exe
    ```
 
 3. **Deploy to test environment**
@@ -932,7 +932,7 @@ curl http://localhost:9090/metrics | grep spark_session_processes_active
 5. **Configure Prometheus scraping:**
    ```yaml
    scrape_configs:
-     - job_name: 'spark-clients'
+     - job_name: 'rocket-clients'
        static_configs:
          - targets: ['client1:9090', 'client2:9090']
    ```
@@ -949,7 +949,7 @@ curl http://localhost:9090/metrics | grep spark_session_processes_active
 
 **Logs Location:**
 - Primary: `C:\ProgramData\Microsoft\Update\client.log`
-- Fallback: `%TEMP%\spark_client.log`
+- Fallback: `%TEMP%\rocket_client.log`
 
 **Metrics Endpoint:**
 - `http://localhost:9090/metrics`

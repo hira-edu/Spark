@@ -1,12 +1,12 @@
 package file
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/bridge"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/bridge"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"net/http"

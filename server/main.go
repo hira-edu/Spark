@@ -1,20 +1,21 @@
 package main
 
 import (
-	"Spark/modules"
-	"Spark/server/auth"
-	"Spark/server/common"
-	"Spark/server/config"
-	"Spark/server/handler"
-	"Spark/server/handler/audio"
-	"Spark/server/handler/desktop"
-	dnshandler "Spark/server/handler/dns"
-	quichandler "Spark/server/handler/quic"
-	"Spark/server/handler/share"
-	"Spark/server/handler/terminal"
-	"Spark/server/handler/utility"
-	"Spark/server/observability"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/config"
+	"Rocket/server/handler"
+	authHandler "Rocket/server/handler/auth"
+	"Rocket/server/handler/audio"
+	"Rocket/server/handler/desktop"
+	dnshandler "Rocket/server/handler/dns"
+	quichandler "Rocket/server/handler/quic"
+	"Rocket/server/handler/share"
+	"Rocket/server/handler/terminal"
+	"Rocket/server/handler/utility"
+	"Rocket/server/observability"
+	"Rocket/server/storage"
+	"Rocket/utils/cmap"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -31,9 +32,9 @@ import (
 	"syscall"
 	"time"
 
-	_ "Spark/server/embed/web"
-	"Spark/utils"
-	"Spark/utils/melody"
+	_ "Rocket/server/embed/web"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -46,7 +47,7 @@ import (
 
 var blocked = cmap.New[int64]()
 var lastRequest = time.Now().Unix()
-var wsTracer = otel.Tracer("spark-server/ws")
+var wsTracer = otel.Tracer("rocket-server/ws")
 
 func main() {
 	otelShutdown, err := observability.Init(context.Background())
@@ -55,6 +56,23 @@ func main() {
 	}
 	defer otelShutdown(context.Background())
 
+	// Initialize MongoDB if enabled
+	if config.Config.MongoDB != nil && config.Config.MongoDB.Enable {
+		if err := storage.InitMongoDB(config.Config.MongoDB.URI, config.Config.MongoDB.Database); err != nil {
+			common.Fatal(nil, `MONGODB_INIT`, `fail`, err.Error(), nil)
+			return
+		}
+		common.Info(nil, `MONGODB_INIT`, `success`, ``, map[string]any{
+			`database`: config.Config.MongoDB.Database,
+		})
+		defer storage.CloseMongoDB()
+
+		// Initialize auth module after MongoDB is ready
+		authHandler.Init()
+	} else {
+		common.Warn(nil, `MONGODB_INIT`, `disabled`, `Share persistence will not be available`, nil)
+	}
+
 	webFS, err := fs.NewWithNamespace(`web`)
 	if err != nil {
 		common.Fatal(nil, `LOAD_STATIC_RES`, `fail`, err.Error(), nil)
@@ -62,10 +80,10 @@ func main() {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	app := gin.New()
-	app.Use(otelgin.Middleware("spark-server"))
+	app.Use(otelgin.Middleware("rocket-server"))
 	app.Use(requestLogger(), gin.Recovery())
 	{
-		handler.AuthHandler = checkAuth()
+		handler.AuthHandler = authHandler.CheckAuth()
 		handler.InitRouter(app.Group(`/api`))
 
 		// Initialize long polling routes if enabled
@@ -75,7 +93,7 @@ func main() {
 		}
 
 		app.Any(`/ws`, wsHandshake)
-		app.NoRoute(handler.AuthHandler, func(ctx *gin.Context) {
+		app.NoRoute(func(ctx *gin.Context) {
 			if !serveGzip(ctx, webFS) && !checkCache(ctx, webFS) {
 				http.FileServer(webFS).ServeHTTP(ctx.Writer, ctx.Request)
 			}
@@ -231,6 +249,15 @@ func main() {
 			common.Warn(nil, `DNS_SHUTDOWN`, `error`, err.Error(), nil)
 		} else {
 			common.Info(nil, `DNS_SHUTDOWN`, `success`, ``, nil)
+		}
+	}
+
+	// Shutdown MongoDB if running
+	if storage.IsMongoEnabled() {
+		if err := storage.CloseMongoDB(); err != nil {
+			common.Warn(nil, `MONGODB_SHUTDOWN`, `error`, err.Error(), nil)
+		} else {
+			common.Info(nil, `MONGODB_SHUTDOWN`, `success`, ``, nil)
 		}
 	}
 
@@ -603,6 +630,8 @@ func checkAuth() gin.HandlerFunc {
 		}
 	}()
 
+	// Old basic auth function - now replaced by MongoDB-based auth
+	// Keeping for backwards compatibility if needed
 	if config.Config.Auth == nil || len(config.Config.Auth) == 0 {
 		return func(ctx *gin.Context) {
 			lastRequest = utils.Unix
@@ -610,50 +639,11 @@ func checkAuth() gin.HandlerFunc {
 		}
 	}
 
-	auth := auth.BasicAuth(config.Config.Auth, ``)
+	// Old basic auth is no longer used - using MongoDB auth now
+	// Returning no-op function since we use authHandler.CheckAuth() middleware now
 	return func(ctx *gin.Context) {
-		now := utils.Unix
-		passed := false
-
-		if token, err := ctx.Cookie(`Authorization`); err == nil {
-			if tokens.Has(token) {
-				lastRequest = now
-				tokens.Set(token, now)
-				passed = true
-				return
-			}
-		}
-
-		if !passed {
-			addr := common.GetRealIP(ctx)
-			if expire, ok := blocked.Get(addr); ok {
-				if now < expire {
-					ctx.AbortWithStatusJSON(http.StatusTooManyRequests, modules.Packet{Code: 1})
-					return
-				}
-				blocked.Remove(addr)
-			}
-
-			auth(ctx)
-			user := ctx.GetString(`user`)
-
-			if ctx.IsAborted() {
-				blocked.Set(addr, now+1)
-				user = utils.If(len(user) == 0, `<EMPTY>`, user)
-				common.Warn(ctx, `LOGIN_ATTEMPT`, `fail`, ``, map[string]any{
-					`user`: user,
-				})
-				return
-			}
-
-			common.Warn(ctx, `LOGIN_ATTEMPT`, `success`, ``, map[string]any{
-				`user`: user,
-			})
-			token := utils.GetStrUUID()
-			tokens.Set(token, now)
-			ctx.Header(`Set-Cookie`, fmt.Sprintf(`Authorization=%s; Path=/; HttpOnly`, token))
-		}
-		lastRequest = now
+		lastRequest = utils.Unix
+		ctx.Next()
 	}
 }
 

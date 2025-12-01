@@ -1,12 +1,14 @@
 package dns
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/audio"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/server/handler/audio"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	cryptoRand "crypto/rand"
@@ -37,6 +39,7 @@ const (
 	sessionTimeout       = 5 * time.Minute
 	maxChunks            = 100          // Max chunks per message
 	cleanupInterval      = 1 * time.Minute
+	dnsSigBytes          = 16           // Truncated HMAC size for DNS signatures
 
 	// Rate limiting constants
 	rateLimitQPS         = 10           // Queries per second per IP
@@ -82,7 +85,7 @@ type DNSServer struct {
 
 var (
 	dnsServer *DNSServer
-	tracer    = otel.Tracer("spark-server/dns")
+	tracer    = otel.Tracer("rocket-server/dns")
 )
 
 func init() {
@@ -208,7 +211,9 @@ func (s *DNSServer) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 	subdomain := strings.TrimSuffix(query, "."+s.domain)
 
 	// Parse subdomain to extract operation
-	// Format: <operation>.<seq>.<chunk>.<data>.<uuid>
+	// Format: handshake.<uuid>.<key>
+	//         poll.<seq>.<sig>.<uuid>
+	//         send.<seq>.<chunk>.<sig>.<data>.<uuid>
 	parts := strings.Split(subdomain, ".")
 
 	if len(parts) < 2 {
@@ -218,9 +223,11 @@ func (s *DNSServer) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 
 	operation := parts[0]
 
-	// Extract UUID and Key based on operation
-	// Format varies: handshake.<uuid>.<key> vs poll.<seq>.<uuid> vs send.<seq>.<chunk>.<data>.<uuid>
-	var uuid, key string
+	// Extract parameters based on operation
+	var (
+		uuid string
+		key  string
+	)
 	switch operation {
 	case "handshake":
 		// handshake.<uuid>.<key>.<domain>
@@ -230,8 +237,19 @@ func (s *DNSServer) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 		}
 		uuid = parts[1]
 		key = parts[2]
-	case "poll", "send":
-		// Last part is always UUID
+	case "poll":
+		// poll.<seq>.<sig>.<uuid>
+		if len(parts) < 4 {
+			common.Warn(nil, "DNS_INVALID_POLL", "", "insufficient parts", nil)
+			return
+		}
+		uuid = parts[len(parts)-1]
+	case "send":
+		// send.<seq>.<chunk>.<sig>.<data>.<uuid>
+		if len(parts) < 6 {
+			common.Warn(nil, "DNS_INVALID_SEND", "", "insufficient parts", nil)
+			return
+		}
 		uuid = parts[len(parts)-1]
 	default:
 		uuid = parts[len(parts)-1]
@@ -258,20 +276,42 @@ func (s *DNSServer) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 	}
 }
 
-// handleHandshake handles DNS handshake
-// Format: handshake.<deviceID>.<key>.<domain>
-func (s *DNSServer) handleHandshake(ctx context.Context, deviceID string, key string) string {
-	// Verify device exists and get connection UUID
-	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
-	connUUID, ok := common.CheckDevice(deviceID, "")
-	if !ok {
-		return "error=device_not_found"
+// validateCredentials verifies UUID/Key against server salt (same as WebSocket handshake)
+func validateCredentials(uuidHex, keyHex string) (string, error) {
+	uuidBytes, err := hex.DecodeString(uuidHex)
+	if err != nil || len(uuidBytes) != 16 {
+		return "", errors.New("invalid uuid")
 	}
 
-	// Verify the device exists in Devices map
-	device, ok := common.Devices.Get(connUUID)
-	if !ok || device.ID != deviceID {
-		return "error=invalid_device_state"
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		return "", errors.New("invalid key")
+	}
+
+	decrypted, err := common.DecAES(keyBytes, servercfg.Config.SaltBytes)
+	if err != nil {
+		return "", err
+	}
+
+	if !bytes.Equal(decrypted, uuidBytes) {
+		return "", errors.New("uuid/key mismatch")
+	}
+
+	// Check device and register if needed - return connection UUID
+	connUUID, ok := common.CheckDevice(uuidHex, "")
+	if !ok {
+		return "", errors.New("device registration failed")
+	}
+
+	return connUUID, nil
+}
+
+// handleHandshake handles DNS handshake
+// Format: handshake.<uuid>.<key>.<domain>
+func (s *DNSServer) handleHandshake(ctx context.Context, deviceID string, key string) string {
+	connUUID, err := validateCredentials(deviceID, key)
+	if err != nil {
+		return "error=invalid_credentials"
 	}
 
 	// Generate a fresh random secret for this session (security best practice)

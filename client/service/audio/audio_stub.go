@@ -6,7 +6,7 @@ package audio
 import (
 	"errors"
 
-	"Spark/modules"
+	"Rocket/modules"
 )
 
 var errUnsupported = errors.New("audio streaming is not implemented in this build")

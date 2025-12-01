@@ -1,11 +1,11 @@
 package core
 
 import (
-	"Spark/client/common"
-	"Spark/client/config"
-	"Spark/client/telemetry"
-	"Spark/modules"
-	"Spark/utils"
+	"Rocket/client/common"
+	"Rocket/client/config"
+	"Rocket/client/telemetry"
+	"Rocket/modules"
+	"Rocket/utils"
 	"context"
 	"crypto/tls"
 	"encoding/hex"

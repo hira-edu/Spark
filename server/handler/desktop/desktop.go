@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
@@ -46,7 +46,7 @@ func init() {
 
 // InitDesktop handles desktop websocket handshake event
 func InitDesktop(ctx *gin.Context) {
-	tr := otel.Tracer("spark-server/desktop")
+	tr := otel.Tracer("rocket-server/desktop")
 	ctxSpan, span := tr.Start(ctx.Request.Context(), "desktop.handshake")
 	defer span.End()
 	ctx.Request = ctx.Request.WithContext(ctxSpan)

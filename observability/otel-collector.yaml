@@ -1,4 +1,4 @@
-# OpenTelemetry Collector (contrib) baseline for Spark.
+# OpenTelemetry Collector (contrib) baseline for Rocket.
 # - Receives OTLP (logs/traces/metrics) from agents and server
 # - Tails server and Caddy access logs
 # - Exports traces to Tempo/Jaeger via OTLP
@@ -31,8 +31,8 @@ receivers:
   # Agent logs (Linux path).
   filelog/agent_linux:
     include:
-      - ${SPARK_AGENT_LOG_PATH_LINUX:-/var/log/spark_client.log}
-      - /opt/spark/logs/client.log
+      - ${SPARK_AGENT_LOG_PATH_LINUX:-/var/log/rocket_client.log}
+      - /opt/rocket/logs/client.log
     start_at: beginning
     include_file_path: true
     operators:
@@ -46,15 +46,15 @@ receivers:
         from: attributes.msg
         to: body
 
-  filelog/spark:
+  filelog/rocket:
     include:
-      - /var/log/spark/*.log
-      - /opt/spark/logs/*.log
+      - /var/log/rocket/*.log
+      - /opt/rocket/logs/*.log
     start_at: beginning
     include_file_path: true
     operators:
       - type: json_parser
-        id: spark_json
+        id: rocket_json
         timestamp:
           parse_from: attributes.time
           layout_type: strptime
@@ -129,6 +129,6 @@ service:
       exporters: [prometheusremotewrite]
 
     logs:
-      receivers: [otlp, filelog/spark, filelog/caddy, filelog/agent, filelog/agent_linux]
+      receivers: [otlp, filelog/rocket, filelog/caddy, filelog/agent, filelog/agent_linux]
       processors: [memory_limiter, batch, resource/defaults]
       exporters: [loki]

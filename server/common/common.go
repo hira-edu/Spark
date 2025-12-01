@@ -1,10 +1,10 @@
 package common
 
 import (
-	"Spark/modules"
-	"Spark/utils"
-	"Spark/utils/cmap"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
+	"Rocket/utils/melody"
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"

@@ -1,8 +1,8 @@
 package desktop
 
 import (
-	"Spark/client/common"
-	"Spark/modules"
+	"Rocket/client/common"
+	"Rocket/modules"
 	"errors"
 	"os"
 	"reflect"

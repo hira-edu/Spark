@@ -7,7 +7,7 @@ package webcam
 import (
 	"errors"
 
-	"Spark/modules"
+	"Rocket/modules"
 )
 
 var errUnsupported = errors.New("webcam streaming is not implemented in this build")

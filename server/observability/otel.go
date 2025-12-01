@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-// Init configures OpenTelemetry tracing for the Spark server.
+// Init configures OpenTelemetry tracing for the Rocket server.
 // It is intentionally lightweight: if OTEL_EXPORTER_OTLP_ENDPOINT is not set,
 // tracing stays disabled. When enabled, it uses parent-based sampling with a
 // configurable ratio.
@@ -49,7 +49,7 @@ func Init(ctx context.Context) (func(context.Context) error, error) {
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName("spark-server"),
+			semconv.ServiceName("rocket-server"),
 		),
 	)
 	if err != nil {

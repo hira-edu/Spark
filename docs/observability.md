@@ -22,7 +22,7 @@ Use the sample collector config at `observability/otel-collector.yaml` to stand 
 
 - Metrics and health: served locally at `:9090` (`/metrics`, `/health`, `/ready`) when running as a service.
 - Logs: written to `C:\ProgramData\Microsoft\Update\client.log` (or temp fallback). Ship via an OTel Collector/Fluent Bit on the host using filelog/forward. The collector config includes `filelog/agent` with an env override `SPARK_AGENT_LOG_PATH` for custom locations.
-- Linux agents: use `filelog/agent_linux` with `SPARK_AGENT_LOG_PATH_LINUX` override; defaults to `/var/log/spark_client.log` and `/opt/spark/logs/client.log`.
+- Linux agents: use `filelog/agent_linux` with `SPARK_AGENT_LOG_PATH_LINUX` override; defaults to `/var/log/rocket_client.log` and `/opt/rocket/logs/client.log`.
 - Traces: for now, rely on server spans + correlated logs; collector tails the client log to push into Loki.
 
 ## Caddy

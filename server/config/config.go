@@ -1,7 +1,7 @@
 package config
 
 import (
-	"Spark/utils"
+	"Rocket/utils"
 	"bytes"
 	"flag"
 	"github.com/kataras/golog"
@@ -16,6 +16,7 @@ type config struct {
 	TLS       *tls              `json:"tls"`
 	WebRTC    *webrtc           `json:"webrtc"`
 	Transport *transport        `json:"transport"` // Transport configuration
+	MongoDB   *mongodb          `json:"mongodb"`   // MongoDB configuration
 	SaltBytes []byte            `json:"-"`
 }
 
@@ -67,6 +68,12 @@ type dnsConfig struct {
 	Enable bool   `json:"enable"` // Enable DNS tunneling
 	Listen string `json:"listen"` // DNS listen address (e.g., ":53")
 	Domain string `json:"domain"` // Domain for DNS tunneling (e.g., "c2.example.com")
+}
+
+type mongodb struct {
+	Enable   bool   `json:"enable"`   // Enable MongoDB for persistent storage
+	URI      string `json:"uri"`      // MongoDB connection URI
+	Database string `json:"database"` // Database name
 }
 
 // Commit is hash of this commit, for auto upgrade.

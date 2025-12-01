@@ -15,94 +15,94 @@ import (
 var (
 	// WebSocket connection metrics
 	WSConnectionsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_ws_connections_total",
+		Name: "rocket_ws_connections_total",
 		Help: "Total WebSocket connection attempts",
 	})
 
 	WSConnectionsActive = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "spark_ws_connections_active",
+		Name: "rocket_ws_connections_active",
 		Help: "Currently active WebSocket connections (0 or 1)",
 	})
 
 	WSDisconnectsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "spark_ws_disconnects_total",
+		Name: "rocket_ws_disconnects_total",
 		Help: "WebSocket disconnections by reason and close code",
 	}, []string{"reason", "code"})
 
 	WSConnectionDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "spark_ws_connection_duration_seconds",
+		Name:    "rocket_ws_connection_duration_seconds",
 		Help:    "Duration of WebSocket connections",
 		Buckets: []float64{1, 5, 10, 30, 60, 300, 600, 1800, 3600},
 	})
 
 	WSReconnectAttempts = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_ws_reconnect_attempts_total",
+		Name: "rocket_ws_reconnect_attempts_total",
 		Help: "Total reconnection attempts after disconnect",
 	})
 
 	WSBackoffDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "spark_ws_backoff_duration_seconds",
+		Name:    "rocket_ws_backoff_duration_seconds",
 		Help:    "Backoff delay duration before reconnection",
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 60},
 	})
 
 	// Circuit breaker metrics
 	CircuitBreakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "spark_circuit_breaker_state",
+		Name: "rocket_circuit_breaker_state",
 		Help: "Circuit breaker state (0=closed, 1=half_open, 2=open)",
 	}, []string{"name"})
 
 	CircuitBreakerOpens = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "spark_circuit_breaker_opens_total",
+		Name: "rocket_circuit_breaker_opens_total",
 		Help: "Total circuit breaker open events",
 	}, []string{"name"})
 
 	// Session management metrics
 	SessionLaunchesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "spark_session_launches_total",
+		Name: "rocket_session_launches_total",
 		Help: "UI client launches by result (success, no_token, job_error, etc.)",
 	}, []string{"result"})
 
 	SessionLaunchDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "spark_session_launch_duration_seconds",
+		Name:    "rocket_session_launch_duration_seconds",
 		Help:    "Time to launch UI client",
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
 	})
 
 	SessionProcessesActive = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "spark_session_processes_active",
+		Name: "rocket_session_processes_active",
 		Help: "Number of active UI processes in user sessions",
 	})
 
 	SessionEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "spark_session_events_total",
+		Name: "rocket_session_events_total",
 		Help: "Windows session change events received by type",
 	}, []string{"event_type", "scope"})
 
 	// Process lifecycle metrics
 	UIProcessCrashesTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_ui_crashes_total",
+		Name: "rocket_ui_crashes_total",
 		Help: "Total unexpected UI process terminations",
 	})
 
 	UIProcessRestarts = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_ui_restarts_total",
+		Name: "rocket_ui_restarts_total",
 		Help: "Total UI process restart attempts",
 	})
 
 	// Heartbeat metrics
 	HeartbeatsSentTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_heartbeats_sent_total",
+		Name: "rocket_heartbeats_sent_total",
 		Help: "Total heartbeat/ping messages sent",
 	})
 
 	HeartbeatsFailedTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "spark_heartbeats_failed_total",
+		Name: "rocket_heartbeats_failed_total",
 		Help: "Total heartbeat/ping failures",
 	})
 
 	LastHeartbeatTimestamp = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "spark_last_heartbeat_timestamp",
+		Name: "rocket_last_heartbeat_timestamp",
 		Help: "Unix timestamp of last successful heartbeat",
 	})
 )

@@ -1,4 +1,4 @@
-# Spark GUI Overhaul - Remote Features Implementation
+# Rocket GUI Overhaul - Remote Features Implementation
 
 A focused implementation plan for redesigning Desktop Viewer, Terminal, and File Explorer components with modern UX patterns.
 

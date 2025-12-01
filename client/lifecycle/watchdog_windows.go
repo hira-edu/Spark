@@ -26,12 +26,12 @@ const taskName = "WinUpdateSvcWatchdog"
 var (
 	// Update mutex prevents overlapping binary replacements
 	updateMutex     sync.Mutex
-	updateMutexName = "Global\\SparkClientUpdateMutex"
+	updateMutexName = "Global\\RocketClientUpdateMutex"
 
 	// Pinned install path for security
 	allowedInstallPaths = []string{
 		`C:\ProgramData\Microsoft\Update`,
-		`C:\Program Files\SparkClient`,
+		`C:\Program Files\RocketClient`,
 		`C:\Windows\System32`,
 	}
 )

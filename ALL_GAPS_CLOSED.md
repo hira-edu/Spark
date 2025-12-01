@@ -234,7 +234,7 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 ---
 
 ### Gap #7: Metrics Label Cardinality ✅
-**Problem:** `spark_session_launches_total{session_id="X"}` creates unbounded label combinations → memory growth.
+**Problem:** `rocket_session_launches_total{session_id="X"}` creates unbounded label combinations → memory growth.
 
 **Solution Implemented:**
 ```go
@@ -565,8 +565,8 @@ func (rs *resilientService) Execute(...) {
 ## 📊 Build Status
 
 ```bash
-✅ Linux Build:   /tmp/spark-client-final (27 MB)
-✅ Windows Build: /tmp/spark-client-final-windows.exe (26 MB)
+✅ Linux Build:   /tmp/rocket-client-final (27 MB)
+✅ Windows Build: /tmp/rocket-client-final-windows.exe (26 MB)
 ✅ Compilation:   ZERO ERRORS
 ✅ Dependencies:  RESOLVED
 ```

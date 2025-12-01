@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
@@ -45,7 +45,7 @@ func init() {
 
 // InitAudio handles audio websocket handshake event
 func InitAudio(ctx *gin.Context) {
-	tr := otel.Tracer("spark-server/audio")
+	tr := otel.Tracer("rocket-server/audio")
 	ctxSpan, span := tr.Start(ctx.Request.Context(), "audio.handshake")
 	defer span.End()
 	ctx.Request = ctx.Request.WithContext(ctxSpan)

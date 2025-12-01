@@ -1,10 +1,10 @@
 package core
 
 import (
-	"Spark/client/common"
-	"Spark/client/config"
-	"Spark/client/telemetry"
-	"Spark/client/transport"
+	"Rocket/client/common"
+	"Rocket/client/config"
+	"Rocket/client/telemetry"
+	"Rocket/client/transport"
 	"context"
 	"fmt"
 	"time"
@@ -27,7 +27,8 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 	}
 
 	cfg := &transport.Config{
-		ServerURL:  config.GetBaseURL(true),
+		// Use HTTP(S) base URL; WebSocket transport will convert schemes.
+		ServerURL:  config.GetBaseURL(false),
 		UUID:       config.Config.UUID,
 		Key:        config.Config.Key,
 
@@ -37,7 +38,7 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 		WriteTimeout:    10 * time.Second,
 
 		// TLS settings
-		InsecureSkipVerify: true, // Accept self-signed certificates
+		InsecureSkipVerify: config.Config.InsecureSkipVerify,
 
 		// DNS tunneling config
 		DNSServer: dnsServer,
@@ -45,7 +46,7 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 
 		// Long polling config
 		LongPollTimeout: 30 * time.Second,
-		LongPollPath:    "/api/longpoll",
+		LongPollPath:    "/longpoll",
 
 		// QUIC config
 		QUICEnabled: config.Config.EnableQUIC,

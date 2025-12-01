@@ -4,7 +4,7 @@ This project now emits more detailed server-side logs by default. Use the follow
 
 For the full OpenTelemetry stack (logs + traces + metrics), see `docs/observability.md` and the reference collector config at `observability/otel-collector.yaml`.
 
-## Spark server (Go backend)
+## Rocket server (Go backend)
 
 - HTTP requests are logged with method, path, status, latency, UA, origin, and whether they attempted an Upgrade.
 - Desktop WebSocket handshakes log both success and failure reasons (missing query params, bad origin, bad secret, device not found, etc.).
@@ -50,7 +50,7 @@ After reloading Caddy, inspect `/var/log/caddy/access.log` for 4xx/5xx or failed
 Run the agent in the foreground and capture stdout/stderr when debugging:
 
 ```sh
-./spark-client -config ./client.json 2>&1 | tee client.log
+./rocket-client -config ./client.json 2>&1 | tee client.log
 ```
 
-If running as a service, ensure your service manager keeps stdout/stderr (e.g., `journalctl -u spark-client` for systemd).
+If running as a service, ensure your service manager keeps stdout/stderr (e.g., `journalctl -u rocket-client` for systemd).

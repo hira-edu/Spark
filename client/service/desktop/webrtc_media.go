@@ -20,7 +20,7 @@ func startWebcamTrack(rtc *DesktopWebRTC) (func(), error) {
 	track, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
 		"webcam",
-		"spark-webcam",
+		"rocket-webcam",
 	)
 	if err != nil {
 		return nil, err
@@ -70,7 +70,7 @@ func startAudioTrack(rtc *DesktopWebRTC) (func(), error) {
 	track, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000, Channels: 1},
 		"audio",
-		"spark-audio",
+		"rocket-audio",
 	)
 	if err != nil {
 		return nil, err

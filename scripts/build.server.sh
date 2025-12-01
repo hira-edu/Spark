@@ -7,30 +7,30 @@ export CGO_ENABLED=0
 export GOOS=darwin
 
 export GOARCH=arm64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_darwin_arm64 Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_darwin_arm64 Rocket/server
 export GOARCH=amd64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_darwin_amd64 Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_darwin_amd64 Rocket/server
 
 
 
 export GOOS=linux
 
 export GOARCH=arm
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_arm Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_arm Rocket/server
 export GOARCH=386
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_i386 Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_i386 Rocket/server
 export GOARCH=arm64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_arm64 Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_arm64 Rocket/server
 export GOARCH=amd64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_amd64 Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_linux_amd64 Rocket/server
 
 
 
 export GOOS=windows
 
 export GOARCH=386
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_i386.exe Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_i386.exe Rocket/server
 export GOARCH=arm64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_arm64.exe Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_arm64.exe Rocket/server
 export GOARCH=amd64
-go build -ldflags "-s -w -X 'Spark/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_amd64.exe Spark/server
+go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./releases/server_windows_amd64.exe Rocket/server

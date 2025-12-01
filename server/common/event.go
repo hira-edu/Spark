@@ -1,9 +1,9 @@
 package common
 
 import (
-	"Spark/modules"
-	"Spark/utils/cmap"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/utils/cmap"
+	"Rocket/utils/melody"
 	"time"
 )
 

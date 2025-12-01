@@ -1,11 +1,11 @@
 package terminal
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"encoding/hex"
 	"github.com/gin-gonic/gin"
 	"net/http"
@@ -37,7 +37,7 @@ func init() {
 
 // InitTerminal handles terminal websocket handshake event
 func InitTerminal(ctx *gin.Context) {
-	tr := otel.Tracer("spark-server/terminal")
+	tr := otel.Tracer("rocket-server/terminal")
 	ctxSpan, span := tr.Start(ctx.Request.Context(), "terminal.handshake")
 	defer span.End()
 	ctx.Request = ctx.Request.WithContext(ctxSpan)

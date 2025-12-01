@@ -1,12 +1,12 @@
 package webrtc
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	servercfg "Spark/server/config"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/melody"
 	"net/http"
 	"strings"
 	"time"

@@ -44,6 +44,7 @@ var Config struct {
 	DNSDomain      string `json:"dns_domain"`       // DNS domain for tunneling
 	DNSServer      string `json:"dns_server"`       // DNS server address
 	EnableMimicry  bool   `json:"enable_mimicry"`   // Enable protocol mimicry
+	InsecureSkipVerify bool `json:"insecure_skip_verify"` // Allow skipping TLS verification (default false)
 }
 
 type trailerFooter struct {

@@ -1,4 +1,4 @@
-# Spark Transport Fallback System - COMPLETE IMPLEMENTATION
+# Rocket Transport Fallback System - COMPLETE IMPLEMENTATION
 
 ## ✅ IMPLEMENTATION STATUS: COMPLETE
 
@@ -11,101 +11,107 @@ A production-grade, industrial-strength multi-transport C2 communication system 
 ### Client-Side Implementation
 
 #### Core Transport Files
-1. **`/root/Spark/client/transport/transport.go`**
+1. **`/root/Rocket/client/transport/transport.go`**
    - Transport abstraction layer
    - Transport manager with automatic fallback
    - Priority-based transport selection
    - Circuit breaker pattern
    - Error categorization
 
-2. **`/root/Spark/client/transport/websocket.go`**
+2. **`/root/Rocket/client/transport/websocket.go`**
    - WebSocket (WS) transport - Priority 10
    - WebSocket Secure (WSS) transport - Priority 15
    - Protocol mimicry (browser-like headers)
    - TLS fingerprint customization
 
-3. **`/root/Spark/client/transport/quic.go`**
+3. **`/root/Rocket/client/transport/quic.go`**
    - QUIC protocol (UDP-based) - Priority 20
    - HTTP/3 support
    - TLS 1.3 required
    - Bidirectional streaming
 
-4. **`/root/Spark/client/transport/longpoll.go`**
+4. **`/root/Rocket/client/transport/longpoll.go`**
    - HTTP long polling - Priority 30
    - Works through corporate proxies
    - Message queuing and batching
    - Session-based authentication
 
-5. **`/root/Spark/client/transport/dns.go`**
+5. **`/root/Rocket/client/transport/dns.go`**
    - DNS tunneling - Priority 40
    - Base32 encoding for DNS safety
    - TXT record communication
    - Works in highly restrictive networks
 
-6. **`/root/Spark/client/transport/adapters.go`**
+6. **`/root/Rocket/client/transport/adapters.go`**
    - Transport adapters for non-WebSocket protocols
    - Unified interface for all transports
 
 #### Integration Files
-7. **`/root/Spark/client/core/transport_connect.go`**
+7. **`/root/Rocket/client/core/transport_connect.go`**
    - Transport manager integration
    - Configuration builder
    - Feature flags
 
-8. **`/root/Spark/client/core/core.go`** (Modified)
+8. **`/root/Rocket/client/core/core.go`** (Modified)
    - Integrated transport fallback into connection logic
    - Feature flag: `EnableTransportFallback`
 
-9. **`/root/Spark/client/common/common.go`** (Extended)
+9. **`/root/Rocket/client/common/common.go`** (Extended)
    - Support for transport adapters
    - Unified Conn interface
 
-10. **`/root/Spark/client/common/transport_adapter.go`**
+10. **`/root/Rocket/client/common/transport_adapter.go`**
     - TransportAdapter interface
     - Adapter factory methods
 
-11. **`/root/Spark/client/config/config.go`** (Extended)
+11. **`/root/Rocket/client/config/config.go`** (Extended)
     - Transport configuration fields
     - Protocol mimicry settings
     - QUIC configuration
-    - DNS tunneling configuration
+    - DNS/LongPoll configuration
+    - TLS verification flag (`insecure_skip_verify`)
 
 ### Server-Side Implementation
 
 #### Transport Handlers
-12. **`/root/Spark/server/handler/longpoll/longpoll.go`**
+12. **`/root/Rocket/server/handler/longpoll/longpoll.go`**
     - Long polling server handler
     - Session management (5-minute timeout)
     - Message queuing (1000 messages/session)
     - Endpoints: `/api/longpoll/{handshake,poll,send}`
-    - Automatic session cleanup
+    - UUID/Key validation (same AES check as WebSocket)
+    - Automatic session cleanup and registry integration
 
-13. **`/root/Spark/server/handler/quic/quic.go`**
+13. **`/root/Rocket/server/handler/quic/quic.go`**
     - QUIC server listener
     - UDP port 443 (configurable)
     - TLS 1.3 integration
     - Stream-based communication
     - Keep-alive and idle timeout handling
+    - UUID/Key validation + per-session secret derivation (HKDF)
+    - Registry integration for server→client sends
 
-14. **`/root/Spark/server/handler/dns/dns.go`**
+14. **`/root/Rocket/server/handler/dns/dns.go`**
     - DNS tunneling server
     - TXT record handler
     - Base32 decoding
     - Chunk reassembly
     - Domain-based routing
+    - Nonce + HMAC on every poll/send (replay/tamper protection)
+    - Rate limiting and registry integration
 
 #### Server Integration
-15. **`/root/Spark/server/handler/handler.go`** (Extended)
+15. **`/root/Rocket/server/handler/handler.go`** (Extended)
     - Long polling route initialization
     - Import for longpoll handler
 
-16. **`/root/Spark/server/config/config.go`** (Extended)
+16. **`/root/Rocket/server/config/config.go`** (Extended)
     - Transport configuration structure
     - Long polling config
     - QUIC config
     - DNS config
 
-17. **`/root/Spark/server/main.go`** (Modified)
+17. **`/root/Rocket/server/main.go`** (Modified)
     - QUIC server startup
     - DNS server startup
     - Long polling route registration
@@ -113,13 +119,13 @@ A production-grade, industrial-strength multi-transport C2 communication system 
     - Import statements for quic and dns handlers
 
 ### Documentation
-18. **`/root/Spark/TRANSPORT_FALLBACK_SYSTEM.md`**
+18. **`/root/Rocket/TRANSPORT_FALLBACK_SYSTEM.md`**
     - Complete system architecture
     - Client-side implementation details
     - Configuration guide
     - Usage instructions
 
-19. **`/root/Spark/SERVER_TRANSPORT_DEPLOYMENT.md`**
+19. **`/root/Rocket/SERVER_TRANSPORT_DEPLOYMENT.md`**
     - Server deployment guide
     - Configuration examples
     - Firewall setup
@@ -127,7 +133,7 @@ A production-grade, industrial-strength multi-transport C2 communication system 
     - Troubleshooting
     - Performance tuning
 
-20. **`/root/Spark/config.example.json`**
+20. **`/root/Rocket/config.example.json`**
     - Example server configuration
     - All transport options documented
 
@@ -155,7 +161,8 @@ A production-grade, industrial-strength multi-transport C2 communication system 
 
 ### Encryption
 - TLS 1.2/1.3 for WebSocket and QUIC
-- Session-based secret authentication
+- Session-based secret authentication (longpoll/QUIC)
+- DNS nonce + HMAC (SHA-256) on every poll/send
 - AES encryption for all messages
 - Constant-time comparison for secrets
 
@@ -171,11 +178,14 @@ A production-grade, industrial-strength multi-transport C2 communication system 
 ```json
 {
   "enable_transport_fallback": true,
+  "enable_longpoll": true,
   "enable_quic": true,
   "quic_port": 443,
-  "dns_tunnel_domain": "c2.example.com",
+  "enable_dns": true,
+  "dns_domain": "c2.example.com",
   "dns_server": "8.8.8.8:53",
-  "enable_mimicry": true
+  "enable_mimicry": true,
+  "insecure_skip_verify": false
 }
 ```
 
@@ -314,7 +324,7 @@ A production-grade, industrial-strength multi-transport C2 communication system 
 
 ### Build Client
 ```bash
-cd /root/Spark
+cd /root/Rocket
 ./scripts/build.client.sh
 ```
 
@@ -326,7 +336,7 @@ cd /root/Spark
 ### Test Locally
 ```bash
 # Start server
-sudo ./spark-server -config config.json
+sudo ./rocket-server -config config.json
 
 # Start client (will use transport fallback)
 ./client -uuid test-uuid -key test-key

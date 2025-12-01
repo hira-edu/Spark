@@ -1,12 +1,14 @@
 package quic
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/server/handler/audio"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/server/config"
+	"Rocket/server/handler/audio"
+	"Rocket/server/handler/utility"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	cryptoRand "crypto/rand"
@@ -70,7 +72,7 @@ type QUICServer struct {
 
 var (
 	quicServer *QUICServer
-	tracer     = otel.Tracer("spark-server/quic")
+	tracer     = otel.Tracer("rocket-server/quic")
 )
 
 func init() {
@@ -265,22 +267,14 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 		return nil, errors.New("missing uuid in handshake")
 	}
 
-	_, ok = handshake["key"]
+	deviceKey, ok := handshake["key"]
 	if !ok {
 		return nil, errors.New("missing key in handshake")
 	}
 
-	// Verify device exists and get connection UUID
-	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
-	connUUID, ok := common.CheckDevice(deviceID, "")
-	if !ok {
-		return nil, errors.New("device not found")
-	}
-
-	// Verify the device exists in Devices map
-	device, ok := common.Devices.Get(connUUID)
-	if !ok || device.ID != deviceID {
-		return nil, errors.New("invalid device state")
+	connUUID, err := validateCredentials(deviceID, deviceKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid credentials: %w", err)
 	}
 
 	// Generate a fresh random secret for this session (security best practice)
@@ -292,7 +286,7 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 	// Derive session key from random secret using HKDF for forward secrecy
 	// This ensures the session key is derived from both server material and random entropy
 	sessionKey := make([]byte, 32)
-	kdf := hkdf.New(sha256.New, randomSecret, s.hmacKey, []byte("spark-quic-session-v1"))
+	kdf := hkdf.New(sha256.New, randomSecret, s.hmacKey, []byte("rocket-quic-session-v1"))
 	if _, err := io.ReadFull(kdf, sessionKey); err != nil {
 		return nil, fmt.Errorf("failed to derive session key: %w", err)
 	}
@@ -569,6 +563,30 @@ func SendPacketToQUIC(uuid string, packet *modules.Packet) bool {
 		return quicServer.SendToQUICClient(uuid, packet)
 	}
 	return false
+}
+
+// validateCredentials verifies UUID/Key against server salt (same as WebSocket handshake)
+func validateCredentials(uuidHex, keyHex string) (string, error) {
+	uuidBytes, err := hex.DecodeString(uuidHex)
+	if err != nil || len(uuidBytes) != 16 {
+		return "", errors.New("invalid uuid")
+	}
+
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		return "", errors.New("invalid key")
+	}
+
+	decrypted, err := common.DecAES(keyBytes, config.Config.SaltBytes)
+	if err != nil {
+		return "", err
+	}
+
+	if !bytes.Equal(decrypted, uuidBytes) {
+		return "", errors.New("uuid/key mismatch")
+	}
+
+	return uuidHex, nil
 }
 
 // GetQUICSessionCount returns the number of active QUIC sessions

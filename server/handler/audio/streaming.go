@@ -1,9 +1,9 @@
 package audio
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	"Spark/utils/cmap"
+	"Rocket/modules"
+	"Rocket/server/common"
+	"Rocket/utils/cmap"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 )
 
-var streamTracer = otel.Tracer("spark-server/audio-streaming")
+var streamTracer = otel.Tracer("rocket-server/audio-streaming")
 
 // AudioStream represents an active audio streaming session from a client
 type AudioStream struct {

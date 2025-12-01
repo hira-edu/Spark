@@ -1,8 +1,8 @@
-# Spark Client Configuration Trailer Format
+# Rocket Client Configuration Trailer Format
 
 ## Overview
 
-Spark uses a **binary trailer approach** for embedding client configuration into executable binaries. This design is inspired by Sliver and other modern C2 frameworks, providing a robust, cross-platform solution that works identically across Windows, Linux, and macOS.
+Rocket uses a **binary trailer approach** for embedding client configuration into executable binaries. This design is inspired by Sliver and other modern C2 frameworks, providing a robust, cross-platform solution that works identically across Windows, Linux, and macOS.
 
 ## Why Trailer-Based Embedding?
 
@@ -46,7 +46,7 @@ The trailer pattern offers several advantages over alternative approaches:
 │  Trailer Footer (20 bytes - Fixed Size)                 │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │ Magic:    "SPARKCFG" (8 bytes ASCII)             │  │
-│  │           - Identifies Spark config trailer       │  │
+│  │           - Identifies Rocket config trailer       │  │
 │  │                                                    │  │
 │  │ Version:  1 (uint16 little-endian)               │  │
 │  │           - Format version for future changes     │  │
@@ -298,7 +298,7 @@ func init() {
 
 ## Auto-Update Mechanism
 
-Spark clients can self-update while preserving their configuration.
+Rocket clients can self-update while preserving their configuration.
 
 **Update Process:**
 
@@ -412,7 +412,7 @@ The trailer approach works identically across all platforms:
 - Size-limited: Must pre-allocate exact space
 - Signature-breaking: Modifications invalidate code signatures
 
-**Why Spark moved away:** Unreliable and hard to maintain.
+**Why Rocket moved away:** Unreliable and hard to maintain.
 
 ### PE/ELF Section Manipulation (Meterpreter-style)
 
@@ -583,7 +583,7 @@ If `trailerVersion` is incremented to 2, possible improvements:
 
 ## Conclusion
 
-The trailer-based configuration embedding in Spark represents a **battle-tested, robust approach** used by professional C2 frameworks like Sliver. It provides:
+The trailer-based configuration embedding in Rocket represents a **battle-tested, robust approach** used by professional C2 frameworks like Sliver. It provides:
 
 - **Simplicity**: Easy to implement and maintain
 - **Reliability**: No dependency on compiler behavior or binary format details

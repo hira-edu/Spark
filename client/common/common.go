@@ -1,9 +1,9 @@
 package common
 
 import (
-	"Spark/client/config"
-	"Spark/modules"
-	"Spark/utils"
+	"Rocket/client/config"
+	"Rocket/modules"
+	"Rocket/utils"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"

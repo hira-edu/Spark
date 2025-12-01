@@ -1,10 +1,10 @@
 package desktop
 
 import (
-	"Spark/client/common"
-	"Spark/modules"
-	"Spark/utils"
-	"Spark/utils/cmap"
+	"Rocket/client/common"
+	"Rocket/modules"
+	"Rocket/utils"
+	"Rocket/utils/cmap"
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"

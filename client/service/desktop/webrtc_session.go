@@ -1,7 +1,7 @@
 package desktop
 
 import (
-	"Spark/modules"
+	"Rocket/modules"
 	"encoding/json"
 	"errors"
 	"image"

@@ -1,48 +1,24 @@
 package share
 
 import (
-	"Spark/modules"
-	"Spark/server/common"
-	servercfg "Spark/server/config"
-	"Spark/server/handler/utility"
-	"Spark/utils"
-	"Spark/utils/melody"
+	"Rocket/modules"
+	"Rocket/server/common"
+	servercfg "Rocket/server/config"
+	"Rocket/server/handler/utility"
+	"Rocket/server/storage"
+	"Rocket/utils"
+	"Rocket/utils/melody"
+	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/kataras/golog"
 )
-
-// ShareEntry represents a desktop sharing session
-type ShareEntry struct {
-	ID        string           `json:"id"`
-	Device    string           `json:"device"`
-	Desktop   string           `json:"desktop"`
-	Token     string           `json:"token"`
-	ExpiresAt time.Time        `json:"expiresAt"`
-	SingleUse bool             `json:"singleUse"`
-	ViewOnly  bool             `json:"viewOnly"`
-	TurnOnly  bool             `json:"turnOnly"`
-	Used      bool             `json:"used"`
-	UsedAt    time.Time        `json:"usedAt,omitempty"`
-	UsedBy    string           `json:"usedBy,omitempty"`
-	CreatedAt time.Time        `json:"createdAt"`
-	AccessLog []AccessLogEntry `json:"accessLog,omitempty"`
-}
-
-// AccessLogEntry records guest access attempts
-type AccessLogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	IP        string    `json:"ip"`
-	UserAgent string    `json:"userAgent"`
-	Success   bool      `json:"success"`
-	Reason    string    `json:"reason,omitempty"`
-}
 
 type guestDesktop struct {
 	shareID    string
@@ -53,9 +29,7 @@ type guestDesktop struct {
 }
 
 var (
-	storeMu sync.RWMutex
-	store   = map[string]*ShareEntry{}
-
+	repo          *storage.ShareRepository
 	guestSessions = melody.New()
 )
 
@@ -65,6 +39,7 @@ const (
 )
 
 func init() {
+	repo = storage.NewShareRepository()
 	guestSessions.Config.MaxMessageSize = common.MaxMessageSize
 	guestSessions.HandleConnect(onGuestConnect)
 	guestSessions.HandleMessage(onGuestMessage)
@@ -74,7 +49,7 @@ func init() {
 	go cleanupExpiredShares()
 }
 
-func isExpired(entry *ShareEntry, now time.Time) bool {
+func isExpired(entry *storage.ShareEntry, now time.Time) bool {
 	if entry == nil {
 		return true
 	}
@@ -84,23 +59,23 @@ func isExpired(entry *ShareEntry, now time.Time) bool {
 	return now.After(entry.ExpiresAt)
 }
 
-func ensureDesktop(entry *ShareEntry) string {
+func ensureDesktop(entry *storage.ShareEntry) string {
 	if entry == nil || entry.ID == "" {
 		return ""
 	}
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	current, ok := store[entry.ID]
-	if !ok || isExpired(current, time.Now()) {
+	ctx := context.Background()
+	current, err := repo.GetByID(ctx, entry.ID)
+	if err != nil || current == nil || isExpired(current, time.Now()) {
 		return ""
 	}
 	if current.Desktop == "" {
 		current.Desktop = utils.GetStrUUID()
+		repo.UpdateDesktop(ctx, current.ID, current.Desktop)
 	}
 	return current.Desktop
 }
 
-func guestICEConfig(entry *ShareEntry) gin.H {
+func guestICEConfig(entry *storage.ShareEntry) gin.H {
 	ice := gin.H{
 		`stun`: []string{},
 		`turn`: []string{},
@@ -128,19 +103,12 @@ func guestICEConfig(entry *ShareEntry) gin.H {
 func cleanupExpiredShares() {
 	ticker := time.NewTicker(5 * time.Minute)
 	for range ticker.C {
-		now := time.Now()
-		expired := make([]string, 0)
-		storeMu.Lock()
-		for id, s := range store {
-			if isExpired(s, now) {
-				expired = append(expired, id)
-				delete(store, id)
-			}
-		}
-		storeMu.Unlock()
-		// Close any guest sessions tied to expired shares
-		for _, id := range expired {
-			closeGuestSessionsByShare(id)
+		ctx := context.Background()
+		count, err := repo.DeleteExpired(ctx, time.Now())
+		if err != nil {
+			golog.Warnf("Failed to cleanup expired shares: %v", err)
+		} else if count > 0 {
+			golog.Infof("Cleaned up %d expired shares", count)
 		}
 	}
 }
@@ -153,8 +121,9 @@ func ValidateShareToken(ctx *gin.Context) {
 		return
 	}
 
-	entry := getByToken(token)
-	if entry == nil {
+	dbCtx := context.Background()
+	entry, err := repo.GetByToken(dbCtx, token)
+	if err != nil || entry == nil || isExpired(entry, time.Now()) {
 		logAccess(token, ctx, false, "token not found or expired")
 		ctx.AbortWithStatusJSON(401, modules.Packet{Code: 1, Msg: `${i18n|COMMON.UNAUTHORIZED}`})
 		return
@@ -204,21 +173,22 @@ func InitGuestDesktop(ctx *gin.Context) {
 		return
 	}
 
+	dbCtx := context.Background()
+	entry, err := repo.GetByToken(dbCtx, token)
+	if err != nil || entry == nil || isExpired(entry, time.Now()) {
+		logAccess(token, ctx, false, "token not found")
+		ctx.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
 	secretStr, ok := ctx.GetQuery(`secret`)
-	if !ok || len(secretStr) != 32 {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+	if !ok || len(secretStr) != len(entry.Secret) || strings.ToLower(secretStr) != strings.ToLower(entry.Secret) {
+		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 	secret, err := hex.DecodeString(secretStr)
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
-
-	entry := getByToken(token)
-	if entry == nil {
-		logAccess(token, ctx, false, "token not found")
-		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 
@@ -243,9 +213,13 @@ func InitGuestDesktop(ctx *gin.Context) {
 		return
 	}
 
-	// Mark single-use token as used
+	// Mark single-use token as used (atomic operation)
 	if entry.SingleUse {
-		markTokenUsed(entry.ID, ctx)
+		if err := repo.MarkUsed(dbCtx, entry.ID, ctx.ClientIP()); err != nil {
+			logAccess(token, ctx, false, "token already used (race condition)")
+			ctx.AbortWithStatus(http.StatusUnauthorized)
+			return
+		}
 	}
 
 	logAccess(token, ctx, true, "")
@@ -273,8 +247,9 @@ func GetGuestICEConfig(ctx *gin.Context) {
 		return
 	}
 
-	entry := getByToken(token)
-	if entry == nil {
+	dbCtx := context.Background()
+	entry, err := repo.GetByToken(dbCtx, token)
+	if err != nil || entry == nil || isExpired(entry, time.Now()) {
 		logAccess(token, ctx, false, "token not found or expired for ice")
 		ctx.AbortWithStatusJSON(401, modules.Packet{Code: 1, Msg: `${i18n|COMMON.UNAUTHORIZED}`})
 		return
@@ -329,42 +304,63 @@ func CreateShare(ctx *gin.Context) {
 		expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 	}
 
-	entry := &ShareEntry{
+	// TODO: Get admin username from auth context
+	adminUser := "admin"
+
+	// Generate per-share secret (32 bytes hex)
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
+	}
+
+	entry := &storage.ShareEntry{
 		ID:        utils.GetStrUUID(),
 		Device:    body.Device,
 		Desktop:   body.Desktop,
 		Token:     utils.GetStrUUID(),
+		Secret:    strings.ToLower(hex.EncodeToString(secretBytes)),
 		ExpiresAt: expiresAt,
 		SingleUse: body.SingleUse,
 		ViewOnly:  body.ViewOnly,
 		TurnOnly:  body.TurnOnly,
 		CreatedAt: time.Now(),
-		AccessLog: []AccessLogEntry{},
+		CreatedBy: adminUser,
+		AccessLog: []storage.AccessLogEntry{},
 	}
 
-	storeMu.Lock()
-	store[entry.ID] = entry
-	storeMu.Unlock()
+	dbCtx := context.Background()
+	if err := repo.Create(dbCtx, entry); err != nil {
+		golog.Errorf("Failed to create share: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
+	}
 
-	golog.Infof("Share created: id=%s device=%s singleUse=%v viewOnly=%v turnOnly=%v ttl=%ds",
-		entry.ID, entry.Device, entry.SingleUse, entry.ViewOnly, entry.TurnOnly, ttl)
+	golog.Infof("Share created: id=%s device=%s singleUse=%v viewOnly=%v turnOnly=%v ttl=%ds by=%s",
+		entry.ID, entry.Device, entry.SingleUse, entry.ViewOnly, entry.TurnOnly, ttl, adminUser)
 
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`share`: entry}})
 }
 
 // ListShares returns all active shares
 func ListShares(ctx *gin.Context) {
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	now := time.Now()
-	var items []ShareEntry
-	for id, s := range store {
-		if isExpired(s, now) {
-			delete(store, id)
-			continue
-		}
-		items = append(items, *s)
+	dbCtx := context.Background()
+	shares, err := repo.ListAll(dbCtx, 100, 0) // Limit to 100 shares
+	if err != nil {
+		golog.Errorf("Failed to list shares: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
 	}
+
+	// Filter out expired shares
+	now := time.Now()
+	var items []storage.ShareEntry
+	for _, s := range shares {
+		if !isExpired(s, now) {
+			items = append(items, *s)
+		}
+	}
+
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`shares`: items}})
 }
 
@@ -375,9 +371,15 @@ func GetShare(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(400, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
+
+	dbCtx := context.Background()
+	s, err := repo.GetByID(dbCtx, id)
+	if err != nil {
+		golog.Errorf("Failed to get share: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
+	}
+	if s != nil && !isExpired(s, time.Now()) {
 		ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`share`: s}})
 		return
 	}
@@ -391,9 +393,15 @@ func GetShareToken(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(400, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
+
+	dbCtx := context.Background()
+	s, err := repo.GetByID(dbCtx, id)
+	if err != nil {
+		golog.Errorf("Failed to get share: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
+	}
+	if s != nil && !isExpired(s, time.Now()) {
 		ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{
 			`token`:     s.Token,
 			`expiresAt`: s.ExpiresAt,
@@ -412,9 +420,15 @@ func GetShareAccessLog(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(400, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok {
+
+	dbCtx := context.Background()
+	s, err := repo.GetByID(dbCtx, id)
+	if err != nil {
+		golog.Errorf("Failed to get share: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
+	}
+	if s != nil {
 		ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`accessLog`: s.AccessLog}})
 		return
 	}
@@ -431,12 +445,17 @@ func RevokeShare(ctx *gin.Context) {
 		return
 	}
 
-	storeMu.Lock()
-	if s, ok := store[body.ID]; ok {
-		golog.Infof("Share revoked: id=%s device=%s", s.ID, s.Device)
-		delete(store, body.ID)
+	dbCtx := context.Background()
+	s, _ := repo.GetByID(dbCtx, body.ID)
+	if err := repo.Delete(dbCtx, body.ID); err != nil {
+		golog.Errorf("Failed to revoke share: %v", err)
+		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
+		return
 	}
-	storeMu.Unlock()
+
+	if s != nil {
+		golog.Infof("Share revoked: id=%s device=%s", s.ID, s.Device)
+	}
 
 	// Close any active guest sessions for this share
 	closeGuestSessionsByShare(body.ID)
@@ -453,14 +472,13 @@ func CloseGuestSessionsByDevice(deviceID string) {
 		return
 	}
 
-	storeMu.Lock()
-	for id, s := range store {
-		if s.Device == deviceID {
-			golog.Infof("Share auto-revoked on device disconnect: id=%s device=%s", s.ID, s.Device)
-			delete(store, id)
-		}
+	dbCtx := context.Background()
+	count, err := repo.DeleteByDevice(dbCtx, deviceID)
+	if err != nil {
+		golog.Errorf("Failed to delete shares for device %s: %v", deviceID, err)
+	} else if count > 0 {
+		golog.Infof("Share auto-revoked on device disconnect: count=%d device=%s", count, deviceID)
 	}
-	storeMu.Unlock()
 
 	// Close guest WebSocket sessions
 	var toClose []*melody.Session
@@ -491,62 +509,32 @@ func closeGuestSessionsByShare(shareID string) {
 	}
 }
 
-func getByToken(token string) *ShareEntry {
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	now := time.Now()
-	for _, s := range store {
-		if s.Token == token && !isExpired(s, now) {
-			return s
-		}
-	}
-	return nil
-}
-
 func isShareActive(id string) bool {
 	if id == "" {
 		return false
 	}
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	if s, ok := store[id]; ok && !isExpired(s, time.Now()) {
-		return true
+	dbCtx := context.Background()
+	s, err := repo.GetByID(dbCtx, id)
+	if err != nil || s == nil || isExpired(s, time.Now()) {
+		return false
 	}
-	return false
-}
-
-func markTokenUsed(id string, ctx *gin.Context) {
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	if s, ok := store[id]; ok {
-		s.Used = true
-		s.UsedAt = time.Now()
-		s.UsedBy = ctx.ClientIP()
+	if s.SingleUse && s.Used {
+		return false
 	}
+	return true
 }
 
 func logAccess(token string, ctx *gin.Context, success bool, reason string) {
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	now := time.Now()
-	for _, s := range store {
-		if s.Token == token {
-			if isExpired(s, now) {
-				continue
-			}
-			s.AccessLog = append(s.AccessLog, AccessLogEntry{
-				Timestamp: now,
-				IP:        ctx.ClientIP(),
-				UserAgent: ctx.GetHeader("User-Agent"),
-				Success:   success,
-				Reason:    reason,
-			})
-			// Keep only last 100 entries
-			if len(s.AccessLog) > 100 {
-				s.AccessLog = s.AccessLog[len(s.AccessLog)-100:]
-			}
-			return
-		}
+	dbCtx := context.Background()
+	entry := storage.AccessLogEntry{
+		Timestamp: time.Now(),
+		IP:        ctx.ClientIP(),
+		UserAgent: ctx.GetHeader("User-Agent"),
+		Success:   success,
+		Reason:    reason,
+	}
+	if err := repo.AppendAccessLog(dbCtx, token, entry); err != nil {
+		golog.Warnf("Failed to log access for token %s: %v", token[:8]+"...", err)
 	}
 }
 
@@ -630,6 +618,13 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 	}
 
+	// Enforce single-use mid-session: if share marked used and single-use, close
+	if guest.shareID != "" && !isShareActive(guest.shareID) {
+		sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
+		session.Close()
+		return
+	}
+
 	service, op, isBinary := utils.CheckBinaryPack(data)
 	if !isBinary || service != 20 {
 		sendGuestPack(modules.Packet{Code: -1}, session)
@@ -693,6 +688,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 
 	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
+		if guest.viewOnly {
+			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+			return
+		}
 		if payload, ok := normalizeSDP(pack.Data); ok {
 			payload[`desktop`] = desktopUUID
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
@@ -702,6 +701,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 
 	case `DESKTOP_WEBRTC_ICE`:
+		if guest.viewOnly {
+			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+			return
+		}
 		if payload, ok := normalizeCandidate(pack.Data); ok {
 			payload[`desktop`] = desktopUUID
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
@@ -793,7 +796,8 @@ func sendGuestPack(pack modules.Packet, session *melody.Session) bool {
 func validateGuestOrigin(ctx *gin.Context) bool {
 	origin := ctx.GetHeader("Origin")
 	if origin == "" {
-		return true
+		// Enforce non-empty Origin for CSWSH protection
+		return false
 	}
 	originURL, err := url.Parse(origin)
 	if err != nil {
