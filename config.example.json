@@ -1,0 +1,43 @@
+{
+  "listen": ":8443",
+  "salt": "your-salt-here-max-24-chars",
+  "auth": {
+    "admin": "your-password-here"
+  },
+  "log": {
+    "level": "info",
+    "path": "./logs",
+    "days": 7
+  },
+  "tls": {
+    "enable": true,
+    "cert": "./certs/server.crt",
+    "key": "./certs/server.key",
+    "autocert": {
+      "enable": false,
+      "domains": ["yourdomain.com"],
+      "email": "admin@yourdomain.com",
+      "cache_dir": "./certs"
+    }
+  },
+  "webrtc": {
+    "turn_servers": [],
+    "stun_servers": [
+      "stun:stun.l.google.com:19302"
+    ]
+  },
+  "transport": {
+    "long_polling": {
+      "enable": true
+    },
+    "quic": {
+      "enable": true,
+      "listen": ":443"
+    },
+    "dns": {
+      "enable": false,
+      "listen": ":53",
+      "domain": "c2.example.com"
+    }
+  }
+}

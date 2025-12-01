@@ -2,8 +2,6 @@ package transport
 
 import (
 	"Spark/client/common"
-	"Spark/modules"
-	"Spark/utils"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
@@ -23,13 +21,13 @@ import (
 // QUIC is a modern, encrypted, multiplexed transport protocol built on UDP
 // Provides better performance and is harder to block than TCP-based protocols
 type QUICTransport struct {
-	conn        quic.Connection
-	stream      quic.Stream
+	conn        *quic.Conn
+	stream      *quic.Stream
 	secret      []byte
 	ctx         context.Context
 	cancel      context.CancelFunc
-	sendQueue   chan *modules.Packet
-	recvQueue   chan *modules.Packet
+	sendQueue   chan []byte // Already encrypted data from adapter
+	recvQueue   chan []byte // Encrypted data to adapter
 	mu          sync.Mutex
 	connected   bool
 }
@@ -37,8 +35,8 @@ type QUICTransport struct {
 // NewQUICTransport creates a new QUIC transport
 func NewQUICTransport() *QUICTransport {
 	return &QUICTransport{
-		sendQueue: make(chan *modules.Packet, 100),
-		recvQueue: make(chan *modules.Packet, 100),
+		sendQueue: make(chan []byte, 100),
+		recvQueue: make(chan []byte, 100),
 	}
 }
 
@@ -207,7 +205,7 @@ func (t *QUICTransport) handshake(ctx context.Context, cfg *Config) ([]byte, err
 	return secret, nil
 }
 
-// readLoop continuously reads messages from QUIC stream
+// readLoop continuously reads encrypted bytes from QUIC stream
 func (t *QUICTransport) readLoop() {
 	buf := make([]byte, 65536) // 64KB buffer
 
@@ -235,38 +233,29 @@ func (t *QUICTransport) readLoop() {
 			continue
 		}
 
-		// Decrypt
-		data, err := utils.Decrypt(buf[:n], t.secret)
-		if err != nil {
-			continue
-		}
+		// Queue encrypted bytes as-is (common.Conn will decrypt)
+		encData := make([]byte, n)
+		copy(encData, buf[:n])
 
-		// Unmarshal
-		var msg modules.Packet
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-
-		// Queue message
 		select {
-		case t.recvQueue <- &msg:
+		case t.recvQueue <- encData:
 		case <-t.ctx.Done():
 			return
 		}
 	}
 }
 
-// sendLoop sends queued messages over QUIC stream
+// sendLoop sends queued encrypted bytes over QUIC stream
 func (t *QUICTransport) sendLoop() {
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
-		case msg := <-t.sendQueue:
-			if err := t.send(msg); err != nil {
+		case encData := <-t.sendQueue:
+			if err := t.send(encData); err != nil {
 				// Re-queue on failure
 				select {
-				case t.sendQueue <- msg:
+				case t.sendQueue <- encData:
 				default:
 				}
 				time.Sleep(100 * time.Millisecond)
@@ -275,31 +264,19 @@ func (t *QUICTransport) sendLoop() {
 	}
 }
 
-// send sends a single message over QUIC stream
-func (t *QUICTransport) send(msg *modules.Packet) error {
-	// Marshal
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	// Encrypt
-	encData, err := utils.Encrypt(data, t.secret)
-	if err != nil {
-		return err
-	}
-
-	// Write to stream with timeout
+// send sends encrypted bytes over QUIC stream
+func (t *QUICTransport) send(encData []byte) error {
+	// Write encrypted data as-is (already encrypted by common.Conn)
 	t.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	defer t.stream.SetWriteDeadline(time.Time{})
 
-	_, err = t.stream.Write(encData)
+	_, err := t.stream.Write(encData)
 	return err
 }
 
 // createConnWrapper creates a common.Conn wrapper for QUIC
 func (t *QUICTransport) createConnWrapper() *common.Conn {
-	adapter := &quicAdapter{
+	adapter := &QUICAdapter{
 		transport: t,
 	}
 	return common.CreateConnFromAdapter(adapter, t.secret)
@@ -328,9 +305,4 @@ func (t *QUICTransport) Close() error {
 	}
 
 	return nil
-}
-
-// quicAdapter adapts QUIC to WebSocket-like interface
-type quicAdapter struct {
-	transport *QUICTransport
 }

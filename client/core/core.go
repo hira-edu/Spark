@@ -160,8 +160,14 @@ func attemptConnection(ctx context.Context) error {
 	default:
 	}
 
-	// Connect
-	wsConn, err := connectWS()
+	// Connect using transport fallback if enabled
+	var wsConn *common.Conn
+	var err error
+	if config.Config.EnableTransportFallback {
+		wsConn, err = connectWithAutoFallback(ctx)
+	} else {
+		wsConn, err = connectWS()
+	}
 	if err != nil {
 		telemetry.LogWSError("connect failed", err, nil)
 		return categorizeError(fmt.Errorf("connect: %w", err))

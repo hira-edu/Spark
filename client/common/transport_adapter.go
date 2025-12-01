@@ -1,10 +1,5 @@
 package common
 
-import (
-	"Spark/modules"
-	"io"
-)
-
 // TransportAdapter is an interface that all transport types must implement
 // This allows common.Conn to work with WebSocket, QUIC, Long Polling, DNS, etc.
 type TransportAdapter interface {

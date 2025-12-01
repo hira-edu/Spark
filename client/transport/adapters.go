@@ -1,7 +1,7 @@
 package transport
 
 import (
-	"Spark/modules"
+	"errors"
 	"time"
 )
 
@@ -13,20 +13,24 @@ type LongPollingAdapter struct {
 }
 
 func (a *LongPollingAdapter) Write(data []byte) error {
-	// Unmarshal to packet (data is already encrypted)
-	// This is a simplified version - in production you'd handle this properly
-	// For now, we queue the raw data
-	// TODO: Implement proper packet handling
-	return a.transport.send(&modules.Packet{})
+	// Data is already encrypted from common.Conn.SendPack/SendRawData
+	// Pass it through to the transport unchanged
+	select {
+	case a.transport.sendQueue <- data:
+		return nil
+	case <-a.transport.ctx.Done():
+		return a.transport.ctx.Err()
+	default:
+		return errors.New("send queue full")
+	}
 }
 
 func (a *LongPollingAdapter) Read() ([]byte, error) {
-	// Block until message available
+	// Block until encrypted bytes available from transport
+	// Return them unchanged - common.Conn will decrypt
 	select {
-	case msg := <-a.transport.recvQueue:
-		// TODO: Marshal and encrypt packet
-		_ = msg
-		return nil, nil
+	case data := <-a.transport.recvQueue:
+		return data, nil
 	case <-a.transport.ctx.Done():
 		return nil, a.transport.ctx.Err()
 	}
@@ -53,16 +57,22 @@ type DNSAdapter struct {
 }
 
 func (a *DNSAdapter) Write(data []byte) error {
-	// TODO: Implement proper packet handling
-	return a.transport.send(&modules.Packet{})
+	// Data is already encrypted - pass through unchanged
+	select {
+	case a.transport.sendQueue <- data:
+		return nil
+	case <-a.transport.ctx.Done():
+		return a.transport.ctx.Err()
+	default:
+		return errors.New("send queue full")
+	}
 }
 
 func (a *DNSAdapter) Read() ([]byte, error) {
+	// Return encrypted bytes unchanged
 	select {
-	case msg := <-a.transport.recvQueue:
-		// TODO: Marshal and encrypt packet
-		_ = msg
-		return nil, nil
+	case data := <-a.transport.recvQueue:
+		return data, nil
 	case <-a.transport.ctx.Done():
 		return nil, a.transport.ctx.Err()
 	}
@@ -88,21 +98,22 @@ type QUICAdapter struct {
 }
 
 func (a *QUICAdapter) Write(data []byte) error {
-	// QUIC stream write
-	a.transport.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	defer a.transport.stream.SetWriteDeadline(time.Time{})
-
-	_, err := a.transport.stream.Write(data)
-	return err
+	// Data is already encrypted - pass through unchanged
+	select {
+	case a.transport.sendQueue <- data:
+		return nil
+	case <-a.transport.ctx.Done():
+		return a.transport.ctx.Err()
+	default:
+		return errors.New("send queue full")
+	}
 }
 
 func (a *QUICAdapter) Read() ([]byte, error) {
-	// Block for next message
+	// Return encrypted bytes unchanged
 	select {
-	case msg := <-a.transport.recvQueue:
-		// TODO: Marshal packet to bytes
-		_ = msg
-		return nil, nil
+	case data := <-a.transport.recvQueue:
+		return data, nil
 	case <-a.transport.ctx.Done():
 		return nil, a.transport.ctx.Err()
 	}

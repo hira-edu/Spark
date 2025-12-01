@@ -20,11 +20,21 @@ var Melody = melody.New()
 var Devices = cmap.New[*modules.Device]()
 
 func SendPackByUUID(pack modules.Packet, uuid string) bool {
+	// Try WebSocket first (highest priority, lowest latency)
 	session, ok := Melody.GetSessionByUUID(uuid)
-	if !ok {
-		return false
+	if ok {
+		return SendPack(pack, session)
 	}
-	return SendPack(pack, session)
+
+	// WebSocket not available, try registered alternative transports via registry
+	// The transport registry avoids import cycles by using function pointers
+	registry := GetTransportRegistry()
+	if registry.SendTo(uuid, &pack) {
+		return true
+	}
+
+	// No active transport found for this UUID
+	return false
 }
 
 func SendPack(pack modules.Packet, session *melody.Session) bool {
@@ -192,4 +202,28 @@ func DecAES(data []byte, key []byte) ([]byte, error) {
 		return nil, utils.ErrFailedVerification
 	}
 	return decBuffer[:dataLen-16], nil
+}
+
+// Legacy function registration system - DEPRECATED
+// Replaced by TransportRegistry for cleaner architecture
+// These remain for backward compatibility but are no longer used by SendPackByUUID
+var (
+	sendToLongPoll func(uuid string, pack *modules.Packet) bool // DEPRECATED: Use TransportRegistry
+	sendToQUIC     func(uuid string, pack *modules.Packet) bool // DEPRECATED: Use TransportRegistry
+	sendToDNS      func(uuid string, pack *modules.Packet) bool // DEPRECATED: Use TransportRegistry
+)
+
+// RegisterLongPollSender - DEPRECATED: Use TransportRegistry.Register instead
+func RegisterLongPollSender(fn func(uuid string, pack *modules.Packet) bool) {
+	sendToLongPoll = fn
+}
+
+// RegisterQUICSender - DEPRECATED: Use TransportRegistry.Register instead
+func RegisterQUICSender(fn func(uuid string, pack *modules.Packet) bool) {
+	sendToQUIC = fn
+}
+
+// RegisterDNSSender - DEPRECATED: Use TransportRegistry.Register instead
+func RegisterDNSSender(fn func(uuid string, pack *modules.Packet) bool) {
+	sendToDNS = fn
 }

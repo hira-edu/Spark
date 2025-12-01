@@ -2,11 +2,8 @@ package transport
 
 import (
 	"Spark/client/common"
-	"Spark/modules"
-	"Spark/utils"
 	"context"
 	"encoding/base32"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -24,8 +21,8 @@ type DNSTransport struct {
 	secret      []byte
 	ctx         context.Context
 	cancel      context.CancelFunc
-	sendQueue   chan *modules.Packet
-	recvQueue   chan *modules.Packet
+	sendQueue   chan []byte // Already encrypted data from adapter
+	recvQueue   chan []byte // Encrypted data to adapter
 	mu          sync.Mutex
 	connected   bool
 	seq         uint32 // Sequence number for requests
@@ -43,8 +40,8 @@ const (
 // NewDNSTransport creates a new DNS tunneling transport
 func NewDNSTransport() *DNSTransport {
 	return &DNSTransport{
-		sendQueue: make(chan *modules.Packet, 100),
-		recvQueue: make(chan *modules.Packet, 100),
+		sendQueue: make(chan []byte, 100),
+		recvQueue: make(chan []byte, 100),
 	}
 }
 
@@ -102,7 +99,7 @@ func (t *DNSTransport) Connect(ctx context.Context, cfg *Config) (*common.Conn, 
 	}
 
 	// Perform handshake via DNS TXT record
-	secret, err := t.handshake(ctx)
+	secret, err := t.handshake(ctx, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("DNS handshake failed: %w", err)
 	}
@@ -122,10 +119,10 @@ func (t *DNSTransport) Connect(ctx context.Context, cfg *Config) (*common.Conn, 
 }
 
 // handshake performs DNS-based handshake
-// Format: handshake.<uuid>.<domain>
-// Response: TXT record with hex-encoded secret
-func (t *DNSTransport) handshake(ctx context.Context) ([]byte, error) {
-	query := fmt.Sprintf("handshake.%s.%s", t.uuid, t.domain)
+// Format: handshake.<uuid>.<key>.<domain>
+// Response: TXT record with base32-encoded secret
+func (t *DNSTransport) handshake(ctx context.Context, key string) ([]byte, error) {
+	query := fmt.Sprintf("handshake.%s.%s.%s", t.uuid, key, t.domain)
 
 	txtRecords, err := t.resolver.LookupTXT(ctx, query)
 	if err != nil {
@@ -162,14 +159,14 @@ func (t *DNSTransport) pollLoop() {
 		case <-t.ctx.Done():
 			return
 		case <-ticker.C:
-			messages, err := t.poll()
+			encData, err := t.poll()
 			if err != nil {
 				continue
 			}
 
-			for _, msg := range messages {
+			if len(encData) > 0 {
 				select {
-				case t.recvQueue <- msg:
+				case t.recvQueue <- encData:
 				case <-t.ctx.Done():
 					return
 				}
@@ -178,10 +175,10 @@ func (t *DNSTransport) pollLoop() {
 	}
 }
 
-// poll makes a DNS query to check for messages
+// poll makes a DNS query to check for encrypted messages
 // Format: poll.<seq>.<uuid>.<domain>
-// Response: TXT record with base32-encoded encrypted JSON
-func (t *DNSTransport) poll() ([]*modules.Packet, error) {
+// Response: TXT record with base32-encoded encrypted data
+func (t *DNSTransport) poll() ([]byte, error) {
 	t.mu.Lock()
 	seq := t.seq
 	t.seq++
@@ -201,8 +198,8 @@ func (t *DNSTransport) poll() ([]*modules.Packet, error) {
 		return nil, nil // No messages
 	}
 
-	// Parse messages from TXT records
-	var messages []*modules.Packet
+	// Parse encrypted data from TXT records
+	// Server sends base32-encoded encrypted data
 	for _, record := range txtRecords {
 		// Decode base32
 		encData, err := decodeBase32(record)
@@ -210,35 +207,24 @@ func (t *DNSTransport) poll() ([]*modules.Packet, error) {
 			continue
 		}
 
-		// Decrypt
-		data, err := utils.Decrypt(encData, t.secret)
-		if err != nil {
-			continue
-		}
-
-		// Unmarshal
-		var msg modules.Packet
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-
-		messages = append(messages, &msg)
+		// Return encrypted data as-is (common.Conn will decrypt)
+		return encData, nil
 	}
 
-	return messages, nil
+	return nil, nil
 }
 
-// sendLoop sends queued messages via DNS
+// sendLoop sends queued encrypted bytes via DNS
 func (t *DNSTransport) sendLoop() {
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
-		case msg := <-t.sendQueue:
-			if err := t.send(msg); err != nil {
+		case encData := <-t.sendQueue:
+			if err := t.send(encData); err != nil {
 				// Re-queue on failure
 				select {
-				case t.sendQueue <- msg:
+				case t.sendQueue <- encData:
 				default:
 				}
 				time.Sleep(1 * time.Second)
@@ -247,23 +233,11 @@ func (t *DNSTransport) sendLoop() {
 	}
 }
 
-// send sends a message via DNS query
+// send sends encrypted bytes via DNS query
 // Large messages are chunked across multiple DNS queries
 // Format: send.<seq>.<chunk>.<data>.<uuid>.<domain>
-func (t *DNSTransport) send(msg *modules.Packet) error {
-	// Marshal message
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	// Encrypt
-	encData, err := utils.Encrypt(data, t.secret)
-	if err != nil {
-		return err
-	}
-
-	// Encode to base32 (DNS-safe)
+func (t *DNSTransport) send(encData []byte) error {
+	// Encode encrypted data to base32 (DNS-safe)
 	encoded := encodeBase32(encData)
 
 	// Chunk data to fit in DNS labels
@@ -297,7 +271,7 @@ func (t *DNSTransport) send(msg *modules.Packet) error {
 
 // createConnWrapper creates a common.Conn wrapper for DNS tunneling
 func (t *DNSTransport) createConnWrapper() *common.Conn {
-	adapter := &dnsAdapter{
+	adapter := &DNSAdapter{
 		transport: t,
 	}
 	return common.CreateConnFromAdapter(adapter, t.secret)
@@ -318,11 +292,6 @@ func (t *DNSTransport) Close() error {
 	}
 
 	return nil
-}
-
-// dnsAdapter adapts DNS tunneling to WebSocket-like interface
-type dnsAdapter struct {
-	transport *DNSTransport
 }
 
 // Helper functions

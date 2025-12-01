@@ -1,6 +1,8 @@
 module Spark
 
-go 1.23.0
+go 1.24.0
+
+toolchain go1.24.10
 
 require (
 	github.com/creack/pty v1.1.18
@@ -16,10 +18,12 @@ require (
 	github.com/kbinani/screenshot v0.0.0-20250624051815-089614a94018
 	github.com/kirides/go-d3d v1.0.0
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
+	github.com/miekg/dns v1.1.68
 	github.com/pion/interceptor v0.1.40
 	github.com/pion/mediadevices v0.7.2
 	github.com/pion/webrtc/v4 v4.1.2
 	github.com/prometheus/client_golang v1.23.2
+	github.com/quic-go/quic-go v0.57.1
 	github.com/rakyll/statik v0.1.7
 	github.com/shirou/gopsutil/v3 v3.22.2
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.53.0
@@ -104,8 +108,12 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/arch v0.8.0 // indirect
 	golang.org/x/image v0.23.0 // indirect
+	golang.org/x/mod v0.27.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240701130421-f6361c86f094 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240701130421-f6361c86f094 // indirect
 	google.golang.org/grpc v1.64.0 // indirect

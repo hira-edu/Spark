@@ -2,19 +2,15 @@ package transport
 
 import (
 	"Spark/client/common"
-	"Spark/modules"
-	"Spark/utils"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -30,8 +26,8 @@ type LongPollingTransport struct {
 	secret      []byte
 	ctx         context.Context
 	cancel      context.CancelFunc
-	sendQueue   chan *modules.Packet
-	recvQueue   chan *modules.Packet
+	sendQueue   chan []byte // Already encrypted data from adapter
+	recvQueue   chan []byte // Encrypted data to adapter
 	mu          sync.Mutex
 	connected   bool
 }
@@ -39,8 +35,8 @@ type LongPollingTransport struct {
 // NewLongPollingTransport creates a new long polling transport
 func NewLongPollingTransport() *LongPollingTransport {
 	return &LongPollingTransport{
-		sendQueue: make(chan *modules.Packet, 100),
-		recvQueue: make(chan *modules.Packet, 100),
+		sendQueue: make(chan []byte, 100),
+		recvQueue: make(chan []byte, 100),
 	}
 }
 
@@ -167,16 +163,16 @@ func (t *LongPollingTransport) pollLoop() {
 		}
 
 		// Poll for messages with timeout
-		messages, err := t.poll()
+		encryptedData, err := t.poll()
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		// Queue received messages
-		for _, msg := range messages {
+		// Queue received encrypted bytes
+		if len(encryptedData) > 0 {
 			select {
-			case t.recvQueue <- msg:
+			case t.recvQueue <- encryptedData:
 			case <-t.ctx.Done():
 				return
 			}
@@ -184,8 +180,8 @@ func (t *LongPollingTransport) pollLoop() {
 	}
 }
 
-// poll makes a single poll request
-func (t *LongPollingTransport) poll() ([]*modules.Packet, error) {
+// poll makes a single poll request and returns encrypted data
+func (t *LongPollingTransport) poll() ([]byte, error) {
 	u := t.baseURL + "/poll"
 
 	req, err := http.NewRequestWithContext(t.ctx, "GET", u, nil)
@@ -211,38 +207,27 @@ func (t *LongPollingTransport) poll() ([]*modules.Packet, error) {
 		return nil, fmt.Errorf("poll failed: status=%d", resp.StatusCode)
 	}
 
-	// Read encrypted response
+	// Read encrypted response and return as-is
+	// Server sends encrypted data, we pass it to adapter unchanged
 	encData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	// Decrypt
-	data, err := utils.Decrypt(encData, t.secret)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt failed: %w", err)
-	}
-
-	// Unmarshal messages
-	var messages []*modules.Packet
-	if err := json.Unmarshal(data, &messages); err != nil {
-		return nil, fmt.Errorf("unmarshal failed: %w", err)
-	}
-
-	return messages, nil
+	return encData, nil
 }
 
-// sendLoop sends queued messages to server
+// sendLoop sends queued encrypted bytes to server
 func (t *LongPollingTransport) sendLoop() {
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
-		case msg := <-t.sendQueue:
-			if err := t.send(msg); err != nil {
+		case encData := <-t.sendQueue:
+			if err := t.send(encData); err != nil {
 				// Re-queue on failure
 				select {
-				case t.sendQueue <- msg:
+				case t.sendQueue <- encData:
 				default:
 					// Queue full, drop message
 				}
@@ -252,22 +237,11 @@ func (t *LongPollingTransport) sendLoop() {
 	}
 }
 
-// send sends a single message to server
-func (t *LongPollingTransport) send(msg *modules.Packet) error {
+// send sends encrypted bytes to server
+func (t *LongPollingTransport) send(encData []byte) error {
 	u := t.baseURL + "/send"
 
-	// Marshal message
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	// Encrypt
-	encData, err := utils.Encrypt(data, t.secret)
-	if err != nil {
-		return err
-	}
-
+	// Send encrypted data as-is (already encrypted by common.Conn)
 	req, err := http.NewRequestWithContext(t.ctx, "POST", u, bytes.NewReader(encData))
 	if err != nil {
 		return err
@@ -317,10 +291,8 @@ func (t *LongPollingTransport) applyMimicry(req *http.Request, cfg *Config) {
 
 // createConnWrapper creates a common.Conn wrapper for long polling
 func (t *LongPollingTransport) createConnWrapper() *common.Conn {
-	// This is a pseudo-connection that uses the long polling queues
-	// We need to create an adapter that implements the WebSocket interface
-	// but routes through our HTTP long polling
-	adapter := &longPollAdapter{
+	// Create adapter that bridges common.Conn and long polling transport
+	adapter := &LongPollingAdapter{
 		transport: t,
 	}
 
@@ -343,11 +315,3 @@ func (t *LongPollingTransport) Close() error {
 
 	return nil
 }
-
-// longPollAdapter adapts long polling to WebSocket-like interface
-type longPollAdapter struct {
-	transport *LongPollingTransport
-}
-
-// Note: We'll need to extend common.Conn to support this adapter pattern
-// For now, this shows the architecture

@@ -6,6 +6,7 @@ import (
 	"Spark/server/handler/desktop"
 	"Spark/server/handler/file"
 	"Spark/server/handler/generate"
+	"Spark/server/handler/longpoll"
 	"Spark/server/handler/process"
 	"Spark/server/handler/screenshot"
 	"Spark/server/handler/share"
@@ -63,4 +64,12 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.POST(`/share/revoke`, share.RevokeShare)
 		group.POST(`/share/delete`, share.DeleteShare)
 	}
+}
+
+// InitLongPollingRoutes initializes long polling routes
+func InitLongPollingRoutes(ctx *gin.RouterGroup) {
+	// Long polling routes (no auth required - uses secret-based auth in handlers)
+	ctx.POST(`/longpoll/handshake`, longpoll.Handshake)
+	ctx.GET(`/longpoll/poll`, longpoll.Poll)
+	ctx.POST(`/longpoll/send`, longpoll.Send)
 }

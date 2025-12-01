@@ -15,6 +15,7 @@ type config struct {
 	Log       *log              `json:"log"`
 	TLS       *tls              `json:"tls"`
 	WebRTC    *webrtc           `json:"webrtc"`
+	Transport *transport        `json:"transport"` // Transport configuration
 	SaltBytes []byte            `json:"-"`
 }
 
@@ -40,6 +41,32 @@ type log struct {
 type webrtc struct {
 	Turn []string `json:"turn_servers"`
 	Stun []string `json:"stun_servers"`
+}
+
+type transport struct {
+	// Long Polling configuration
+	LongPolling *longPolling `json:"long_polling"`
+
+	// QUIC configuration
+	QUIC *quic `json:"quic"`
+
+	// DNS Tunneling configuration
+	DNS *dnsConfig `json:"dns"`
+}
+
+type longPolling struct {
+	Enable bool `json:"enable"` // Enable long polling transport
+}
+
+type quic struct {
+	Enable bool   `json:"enable"` // Enable QUIC transport
+	Listen string `json:"listen"` // QUIC listen address (e.g., ":443")
+}
+
+type dnsConfig struct {
+	Enable bool   `json:"enable"` // Enable DNS tunneling
+	Listen string `json:"listen"` // DNS listen address (e.g., ":53")
+	Domain string `json:"domain"` // Domain for DNS tunneling (e.g., "c2.example.com")
 }
 
 // Commit is hash of this commit, for auto upgrade.

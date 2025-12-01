@@ -63,7 +63,12 @@ func CheckForm(ctx *gin.Context, form any) (string, bool) {
 
 // OnDevicePack handles events about device info.
 // Such as websocket handshake and update device info.
-func OnDevicePack(data []byte, session *melody.Session) error {
+// OnDevicePackWithUUID handles DEVICE_UP and DEVICE_UPDATE packets for any transport
+// uuid: the session UUID
+// remoteAddr: the WAN address (can be empty string)
+// sendResponse: callback to send response packet (can be nil)
+// closeConnection: callback to close connection (can be nil)
+func OnDevicePackWithUUID(data []byte, uuid, remoteAddr string, sendResponse func(modules.Packet), closeConnection func()) error {
 	var pack struct {
 		Code   int            `json:"code,omitempty"`
 		Act    string         `json:"act,omitempty"`
@@ -72,13 +77,15 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 	}
 	err := utils.JSON.Unmarshal(data, &pack)
 	if err != nil {
-		session.Close()
+		if closeConnection != nil {
+			closeConnection()
+		}
 		return err
 	}
 
-	addr, ok := session.Get(`Address`)
-	if ok {
-		pack.Device.WAN = addr.(string)
+	// Set WAN address
+	if remoteAddr != "" {
+		pack.Device.WAN = remoteAddr
 	} else {
 		pack.Device.WAN = `Unknown`
 	}
@@ -89,16 +96,17 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 		// This will keep only one connection remained per device.
 		exSession := ``
 		var kickedOldSession bool
-		common.Devices.IterCb(func(uuid string, device *modules.Device) bool {
+		common.Devices.IterCb(func(existingUUID string, device *modules.Device) bool {
 			if device.ID == pack.Device.ID {
-				exSession = uuid
-				target, ok := common.Melody.GetSessionByUUID(uuid)
+				exSession = existingUUID
+				// Try to kick old WebSocket session
+				target, ok := common.Melody.GetSessionByUUID(existingUUID)
 				if ok {
 					kickedOldSession = true
 					common.Warn(nil, `CLIENT_DUPLICATE`, ``, `kicking old session for same device`, map[string]any{
 						`deviceID`:       pack.Device.ID[:16] + `...`,
-						`oldSessionUUID`: uuid[:8] + `...`,
-						`newSessionUUID`: session.UUID[:8] + `...`,
+						`oldSessionUUID`: existingUUID[:8] + `...`,
+						`newSessionUUID`: uuid[:8] + `...`,
 						`device`: map[string]any{
 							`name`: device.Hostname,
 							`ip`:   device.WAN,
@@ -107,6 +115,8 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 					common.SendPack(modules.Packet{Act: `OFFLINE`}, target)
 					target.Close()
 				}
+				// For non-WebSocket transports, we just log and replace
+				// The old transport session will expire naturally
 				return false
 			}
 			return true
@@ -114,17 +124,18 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 		if len(exSession) > 0 {
 			common.Devices.Remove(exSession)
 		}
-		common.Devices.Set(session.UUID, &pack.Device)
+		common.Devices.Set(uuid, &pack.Device)
 		common.Info(nil, `CLIENT_ONLINE`, ``, ``, map[string]any{
 			`device`: map[string]any{
 				`name`:        pack.Device.Hostname,
 				`ip`:          pack.Device.WAN,
-				`sessionUUID`: session.UUID[:8] + `...`,
+				`sessionUUID`: uuid[:8] + `...`,
 				`replacedOld`: kickedOldSession,
 			},
 		})
 	} else {
-		device, ok := common.Devices.Get(session.UUID)
+		// DEVICE_UPDATE
+		device, ok := common.Devices.Get(uuid)
 		if ok {
 			device.CPU = pack.Device.CPU
 			device.RAM = pack.Device.RAM
@@ -133,8 +144,34 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 			device.Uptime = pack.Device.Uptime
 		}
 	}
-	common.SendPack(modules.Packet{Code: 0}, session)
+
+	// Send success response
+	if sendResponse != nil {
+		sendResponse(modules.Packet{Code: 0})
+	}
 	return nil
+}
+
+// OnDevicePack handles DEVICE_UP and DEVICE_UPDATE packets for WebSocket transport
+// This is a wrapper around OnDevicePackWithUUID for backward compatibility
+func OnDevicePack(data []byte, session *melody.Session) error {
+	addr, ok := session.Get(`Address`)
+	remoteAddr := ""
+	if ok {
+		remoteAddr = addr.(string)
+	}
+
+	return OnDevicePackWithUUID(
+		data,
+		session.UUID,
+		remoteAddr,
+		func(pack modules.Packet) {
+			common.SendPack(pack, session)
+		},
+		func() {
+			session.Close()
+		},
+	)
 }
 
 // CheckUpdate will check if client need update and return latest client if so.

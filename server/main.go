@@ -7,6 +7,8 @@ import (
 	"Spark/server/config"
 	"Spark/server/handler"
 	"Spark/server/handler/desktop"
+	dnshandler "Spark/server/handler/dns"
+	quichandler "Spark/server/handler/quic"
 	"Spark/server/handler/share"
 	"Spark/server/handler/terminal"
 	"Spark/server/handler/utility"
@@ -64,6 +66,13 @@ func main() {
 	{
 		handler.AuthHandler = checkAuth()
 		handler.InitRouter(app.Group(`/api`))
+
+		// Initialize long polling routes if enabled
+		if config.Config.Transport != nil && config.Config.Transport.LongPolling != nil && config.Config.Transport.LongPolling.Enable {
+			handler.InitLongPollingRoutes(app.Group(`/api`))
+			common.Info(nil, `LONGPOLL_ENABLED`, ``, ``, nil)
+		}
+
 		app.Any(`/ws`, wsHandshake)
 		app.NoRoute(handler.AuthHandler, func(ctx *gin.Context) {
 			if !serveGzip(ctx, webFS) && !checkCache(ctx, webFS) {
@@ -130,6 +139,51 @@ func main() {
 		}
 	}
 
+	// Start QUIC server if enabled
+	if config.Config.Transport != nil && config.Config.Transport.QUIC != nil && config.Config.Transport.QUIC.Enable {
+		quicAddr := config.Config.Transport.QUIC.Listen
+		if quicAddr == `` {
+			quicAddr = `:443` // Default QUIC port
+		}
+
+		// Use the same TLS config as HTTPS
+		if srv.TLSConfig != nil {
+			go func() {
+				if err := quichandler.StartQUICServer(quicAddr, srv.TLSConfig); err != nil {
+					common.Warn(nil, `QUIC_START_FAILED`, ``, err.Error(), nil)
+				}
+			}()
+			common.Info(nil, `QUIC_ENABLED`, ``, ``, map[string]any{
+				`listen`: quicAddr,
+			})
+		} else {
+			common.Warn(nil, `QUIC_DISABLED`, ``, `TLS must be enabled for QUIC`, nil)
+		}
+	}
+
+	// Start DNS server if enabled
+	if config.Config.Transport != nil && config.Config.Transport.DNS != nil && config.Config.Transport.DNS.Enable {
+		dnsAddr := config.Config.Transport.DNS.Listen
+		if dnsAddr == `` {
+			dnsAddr = `:53` // Default DNS port
+		}
+
+		dnsDomain := config.Config.Transport.DNS.Domain
+		if dnsDomain == `` {
+			common.Warn(nil, `DNS_DISABLED`, ``, `DNS domain not configured`, nil)
+		} else {
+			go func() {
+				if err := dnshandler.StartDNSServer(dnsAddr, dnsDomain); err != nil {
+					common.Warn(nil, `DNS_START_FAILED`, ``, err.Error(), nil)
+				}
+			}()
+			common.Info(nil, `DNS_ENABLED`, ``, ``, map[string]any{
+				`listen`: dnsAddr,
+				`domain`: dnsDomain,
+			})
+		}
+	}
+
 	{
 		go func() {
 			if tlsEnabled {
@@ -155,9 +209,30 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
+	// Shutdown HTTP/HTTPS server
 	if err := srv.Shutdown(ctx); err != nil {
 		common.Warn(nil, `SERVICE_EXIT`, `error`, err.Error(), nil)
 	}
+
+	// Shutdown QUIC server if running
+	if config.Config.Transport != nil && config.Config.Transport.QUIC != nil && config.Config.Transport.QUIC.Enable {
+		if err := quichandler.StopQUICServer(); err != nil {
+			common.Warn(nil, `QUIC_SHUTDOWN`, `error`, err.Error(), nil)
+		} else {
+			common.Info(nil, `QUIC_SHUTDOWN`, `success`, ``, nil)
+		}
+	}
+
+	// Shutdown DNS server if running
+	if config.Config.Transport != nil && config.Config.Transport.DNS != nil && config.Config.Transport.DNS.Enable {
+		if err := dnshandler.StopDNSServer(); err != nil {
+			common.Warn(nil, `DNS_SHUTDOWN`, `error`, err.Error(), nil)
+		} else {
+			common.Info(nil, `DNS_SHUTDOWN`, `success`, ``, nil)
+		}
+	}
+
 	<-ctx.Done()
 	common.Warn(nil, `SERVICE_EXIT`, `success`, ``, nil)
 	common.CloseLog()

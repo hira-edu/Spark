@@ -95,6 +95,40 @@ func AddEvent(fn EventCallback, connUUID, trigger string) {
 	})
 }
 
+// CallEventByUUID calls event callback by UUID instead of session
+// Used for non-WebSocket transports (QUIC, Long Polling, DNS)
+func CallEventByUUID(pack modules.Packet, uuid string) {
+	if len(pack.Event) == 0 {
+		return
+	}
+	ev, ok := events.Get(pack.Event)
+	if !ok {
+		Debug(nil, `EVENT_CALL`, `miss`, `event not found`, map[string]any{
+			`event`:  pack.Event,
+			`action`: pack.Act,
+		})
+		return
+	}
+	if uuid != ev.connection {
+		Debug(nil, `EVENT_CALL`, `skip`, `uuid mismatch`, map[string]any{
+			`event`:        pack.Event,
+			`action`:       pack.Act,
+			`uuid`:         uuid[:8] + `...`,
+			`expectedUUID`: ev.connection[:8] + `...`,
+		})
+		return
+	}
+	// Call with nil session since non-WebSocket transports don't have melody.Session
+	ev.callback(pack, nil)
+	if ev.finish != nil {
+		ev.finish <- true
+	}
+	Debug(nil, `EVENT_CALL`, `success`, ``, map[string]any{
+		`event`:  pack.Event,
+		`action`: pack.Act,
+	})
+}
+
 // RemoveEvent deletes the event with the given event trigger.
 // The ok will be returned to caller if the event is temp (only once).
 func RemoveEvent(trigger string, ok ...bool) {
