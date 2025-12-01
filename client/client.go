@@ -76,6 +76,9 @@ func main() {
 	// Elevate automatically when needed so service install succeeds on double-click.
 	lifecycle.EnsureElevated()
 
+	// Drop the console for silent/background launches to avoid flashing windows.
+	maybeHideConsole(os.Args)
+
 	// Detect run mode
 	mode := lifecycle.DetectMode(os.Args)
 
@@ -101,7 +104,7 @@ func main() {
 	// Run based on mode
 	runner := lifecycle.NewRunner(app, installer, svcCtrl)
 	// Start watchdog only for the service host so worker sessions do not
-	// compete with SCM-managed restarts.
+	// compete with SCM-managed restarts. Uses hidden launcher to avoid console flash.
 	if mode == lifecycle.RunModeService {
 		lifecycle.StartWatchdog(installer, svcCtrl)
 	}
@@ -174,11 +177,11 @@ func readinessHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"ready":           ready,
-		"ws_connected":    snapshot.WSConnected,
-		"ui_running":      snapshot.UIProcessRunning,
-		"active_session":  snapshot.ActiveSessionID,
-		"uptime_seconds":  snapshot.UptimeSeconds,
+		"ready":          ready,
+		"ws_connected":   snapshot.WSConnected,
+		"ui_running":     snapshot.UIProcessRunning,
+		"active_session": snapshot.ActiveSessionID,
+		"uptime_seconds": snapshot.UptimeSeconds,
 	})
 }
 

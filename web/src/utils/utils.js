@@ -51,12 +51,14 @@ function tsToTime(ts) {
 }
 
 function getBaseURL(ws, suffix) {
-	if (location.protocol === 'https:') {
-		let scheme = ws ? 'wss' : 'https';
-		return scheme + `://${location.host}${location.pathname}${suffix}`;
+	const isHttps = location.protocol === 'https:';
+	const scheme = ws ? (isHttps ? 'wss' : 'ws') : (isHttps ? 'https' : 'http');
+	let path = suffix || '';
+	// Always build from the site root; avoid inheriting the current route prefix
+	if (path && !path.startsWith('/')) {
+		path = '/' + path;
 	}
-	let scheme = ws ? 'ws' : 'http';
-	return scheme + `://${location.host}${location.pathname}${suffix}`;
+	return `${scheme}://${location.host}${path}`;
 }
 
 function genRandHex(len) {

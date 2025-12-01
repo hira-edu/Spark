@@ -35,9 +35,14 @@ func EnsureElevated() {
 	if os.Getenv("SPARK_SKIP_ELEVATE") == "1" {
 		return
 	}
-	// Skip elevation for console/debug/uninstall modes - these are explicit user actions
+	// If the service is already installed, do nothing (avoid repeated UAC prompts).
+	if serviceInstalledAndRunning() || serviceInstalledAnyState() {
+		return
+	}
+	// Skip elevation for console/debug/uninstall/ui-only modes - these are explicit user actions
+	// or service-spawned processes that should not trigger UAC prompts
 	for _, arg := range os.Args[1:] {
-		if arg == "--console" || arg == "--debug" || arg == "--uninstall" {
+		if arg == "--console" || arg == "--debug" || arg == "--uninstall" || arg == "--ui-only" {
 			return
 		}
 	}

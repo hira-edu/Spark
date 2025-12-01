@@ -11,7 +11,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -61,8 +61,12 @@ func (t *LongPollingTransport) Connect(ctx context.Context, cfg *Config) (*commo
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Parse base URL
-	baseURL := strings.TrimSuffix(cfg.ServerURL, "/")
+	// Parse base URL - strip any path from ServerURL (e.g., /ws) since long polling uses /api/longpoll
+	parsedURL, err := url.Parse(cfg.ServerURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL: %w", err)
+	}
+	baseURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
 	pollPath := cfg.LongPollPath
 	if pollPath == "" {
 		pollPath = "/api/longpoll"

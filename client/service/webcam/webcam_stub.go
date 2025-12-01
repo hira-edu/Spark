@@ -1,6 +1,5 @@
-//go:build (!linux || stub) && stub
-// +build !linux stub
-// +build stub
+//go:build webcam_stub || (!linux && !windows)
+// +build webcam_stub !linux,!windows
 
 package webcam
 

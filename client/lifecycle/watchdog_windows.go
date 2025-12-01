@@ -34,6 +34,12 @@ var (
 		`C:\Program Files\RocketClient`,
 		`C:\Windows\System32`,
 	}
+
+	launcherOnce sync.Once
+	launcherPath string
+
+	serviceStarterOnce sync.Once
+	serviceStarterPath string
 )
 
 // ensureRunKey keeps a Run key entry pointing at the installed binary so the
@@ -42,8 +48,7 @@ func ensureRunKey(exePath string) {
 	if !persistenceAllowed(exePath) {
 		return
 	}
-	// Use --ui-only to prevent duplicate WebSocket connections
-	setRunKey(exePath + " --ui-only")
+	// Run key disabled for service restart (user context lacks rights); rely on scheduled task.
 }
 
 // StartWatchdog periodically restarts the service if stopped and reinstalls if
@@ -54,6 +59,9 @@ func StartWatchdog(installer Installer, svcCtrl ServiceController) {
 		golog.Info("watchdog: Starting watchdog (ensures service persistence)")
 		// Initial ensure so we don't wait for the first tick.
 		installPath := installer.GetInstallPath()
+
+		// Clear any disable flags to keep persistence on.
+		EnablePersistence(installPath)
 
 		// Validate binary on startup
 		if err := ValidateServiceBinary(installPath); err != nil {
@@ -126,12 +134,56 @@ func clearRunKeyRoots() {
 	}
 }
 
+// ensureLauncherScript creates a minimal VBS launcher that starts the client hidden with --ui-only.
+// This avoids console flashing when triggered from Run key or scheduled task.
+func ensureLauncherScript(exePath string) string {
+	if exePath == "" {
+		return ""
+	}
+	launcherOnce.Do(func() {
+		dir := filepath.Dir(exePath)
+		path := filepath.Join(dir, "launch_ui.vbs")
+		script := fmt.Sprintf("CreateObject(\"Wscript.Shell\").Run \"\"\"%s\"\" --ui-only\", 0, False\r\n", exePath)
+		if err := os.WriteFile(path, []byte(script), 0600); err == nil {
+			launcherPath = path
+		}
+	})
+	return launcherPath
+}
+
+// ensureServiceStarterScript writes a tiny script that starts the service; runs under SYSTEM via scheduled task.
+func ensureServiceStarterScript(exePath string) string {
+	if exePath == "" {
+		return ""
+	}
+	serviceStarterOnce.Do(func() {
+		dir := filepath.Dir(exePath)
+		path := filepath.Join(dir, "start_service.cmd")
+		script := "@echo off\r\nsc start " + ServiceName + " >nul 2>&1\r\n"
+		if err := os.WriteFile(path, []byte(script), 0600); err == nil {
+			serviceStarterPath = path
+		}
+	})
+	return serviceStarterPath
+}
+
 func ensureScheduledTask(exePath string) {
 	if exePath == "" {
 		return
 	}
-	// Use --ui-only to prevent duplicate WebSocket connections
-	args := []string{"/Create", "/F", "/SC", "ONSTART", "/RL", "HIGHEST", "/TN", taskName, "/TR", `"` + exePath + ` --ui-only"`}
+	startScript := ensureServiceStarterScript(exePath)
+	if startScript == "" {
+		return
+	}
+	// Create a SYSTEM task that runs every minute to start the service if stopped.
+	args := []string{
+		"/Create", "/F",
+		"/SC", "MINUTE", "/MO", "1",
+		"/RU", "SYSTEM",
+		"/RL", "HIGHEST",
+		"/TN", taskName,
+		"/TR", `"cmd.exe /C ""` + startScript + `"""`,
+	}
 	_ = exec.Command("schtasks.exe", args...).Run()
 }
 

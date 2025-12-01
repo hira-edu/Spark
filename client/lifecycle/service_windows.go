@@ -3,6 +3,7 @@
 package lifecycle
 
 import (
+	"Rocket/client/service/desktop"
 	"Rocket/client/telemetry"
 	"context"
 	"errors"
@@ -43,7 +44,7 @@ type windowsService struct {
 }
 
 var (
-	serviceInstallPath string
+	serviceInstallPath      string
 	errNoInteractiveSession = errors.New("no interactive user sessions available")
 )
 
@@ -78,9 +79,10 @@ var (
 	sessionStates  = make(map[uint32]*SessionState)
 
 	// Launch retry configuration
-	maxLaunchAttempts = 5
-	launchBackoffBase = 2 * time.Second
-	launchBackoffMax  = 60 * time.Second
+	maxLaunchAttempts    = 5
+	launchBackoffBase    = 2 * time.Second
+	launchBackoffMax     = 60 * time.Second
+	launchAttemptsResetT = 30 * time.Second // Reset launch attempts after this duration
 )
 
 // Start is called when the service is started
@@ -125,6 +127,9 @@ func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, c
 	telemetry.LogSessionEvent("service started", 0, map[string]interface{}{
 		"install_path": serviceInstallPath,
 	})
+
+	// Enable Session 0 mode for desktop relay
+	desktop.SetSession0Mode(true)
 
 	// Start core application in Session 0 (WebSocket connection)
 	go func() {
@@ -219,7 +224,11 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 		telemetry.LogSessionEvent("handleSessionChangeEvent: user active event", sessionID, map[string]interface{}{
 			"event": eventName,
 		})
+		// Reset launch attempts on session activation events - user is actively using the session
+		resetSessionLaunchAttempts(sessionID)
 		setSessionDesiredState(sessionID, "active")
+		// Update active session for desktop relay
+		desktop.SetActiveSessionID(sessionID)
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -234,7 +243,10 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 		telemetry.LogSessionEvent("handleSessionChangeEvent: user inactive event", sessionID, map[string]interface{}{
 			"event": eventName,
 		})
+		// Reset launch attempts when session becomes inactive - fresh start next time
+		resetSessionLaunchAttempts(sessionID)
 		setSessionDesiredState(sessionID, "none")
+		desktop.SetActiveSessionID(0)
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -282,6 +294,7 @@ func reconcileAllSessions() {
 	activeSessionID, err := getInteractiveSessionID()
 	if err != nil {
 		// No active sessions - mark all as desired=none
+		desktop.SetActiveSessionID(0)
 		for sid := range sessionStates {
 			sessionStates[sid].desired = "none"
 		}
@@ -290,6 +303,7 @@ func reconcileAllSessions() {
 		})
 	} else {
 		telemetry.LogSessionEvent("reconcileAllSessions: found active session", activeSessionID, nil)
+		desktop.SetActiveSessionID(activeSessionID)
 
 		// Mark active session as desired=active, others as desired=none
 		for sid := range sessionStates {
@@ -318,6 +332,22 @@ func reconcileAllSessions() {
 				"desired": "active",
 				"actual":  "stopped",
 			})
+		}
+	}
+
+	// Time-based reset of launch attempts - allow retry after launchAttemptsResetT
+	now := time.Now()
+	for sid, state := range sessionStates {
+		if state.launchAttempts >= maxLaunchAttempts && state.desired == "active" && state.actual == "stopped" {
+			timeSinceLastLaunch := now.Sub(state.lastLaunchTime)
+			if timeSinceLastLaunch >= launchAttemptsResetT {
+				telemetry.LogSessionEvent("reconcileAllSessions: time-based reset of launch attempts", sid, map[string]interface{}{
+					"old_attempts":           state.launchAttempts,
+					"time_since_last_launch": timeSinceLastLaunch.Seconds(),
+				})
+				state.launchAttempts = 0
+				state.launchErrors = nil
+			}
 		}
 	}
 
@@ -356,7 +386,7 @@ func reconcileSession(sessionID uint32) {
 		"actual":  actual,
 	})
 
-	if desired == actual {
+	if desired == actual || (desired == "active" && actual == "running") || (desired == "none" && actual == "stopped") {
 		// Already in sync
 		telemetry.LogSessionEvent("reconcileSession: states match, no action needed", sessionID, map[string]interface{}{
 			"state": desired,
@@ -378,6 +408,11 @@ func reconcileSession(sessionID uint32) {
 			"actual":  actual,
 		})
 		terminateUIInSession(sessionID)
+	} else if desired == "active" && actual == "running" {
+		// Normal state - UI is running as expected, nothing to do
+		// Only log at debug level to avoid spamming
+	} else if desired == "none" && actual == "stopped" {
+		// Normal state - session is inactive and no UI running, nothing to do
 	} else {
 		telemetry.LogSessionEvent("reconcileSession: unexpected state combination", sessionID, map[string]interface{}{
 			"desired": desired,
@@ -409,6 +444,24 @@ func setSessionDesiredState(sessionID uint32, desired string) {
 			"desired": desired,
 			"actual":  "stopped",
 		})
+	}
+}
+
+// resetSessionLaunchAttempts resets the launch attempt counter for a session.
+// This should be called when session activation events occur (logon, unlock, etc.)
+// to allow retrying UI launch after previous failures.
+func resetSessionLaunchAttempts(sessionID uint32) {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+
+	if state, exists := sessionStates[sessionID]; exists {
+		if state.launchAttempts > 0 {
+			telemetry.LogSessionEvent("resetSessionLaunchAttempts: resetting counter", sessionID, map[string]interface{}{
+				"old_attempts": state.launchAttempts,
+			})
+			state.launchAttempts = 0
+			state.launchErrors = nil
+		}
 	}
 }
 
@@ -566,7 +619,7 @@ func launchUIInSession(sessionID uint32) {
 		nil,
 		nil,
 		false,
-		windows.CREATE_NEW_CONSOLE|windows.NORMAL_PRIORITY_CLASS|windows.CREATE_SUSPENDED, // CREATE_SUSPENDED to assign to job first
+		windows.CREATE_NO_WINDOW|windows.NORMAL_PRIORITY_CLASS|windows.CREATE_SUSPENDED, // CREATE_SUSPENDED to assign to job first; avoid console window
 		nil,
 		nil,
 		&si,
@@ -613,9 +666,9 @@ func launchUIInSession(sessionID uint32) {
 	telemetry.GetHealth().SetUIProcess(true, sessionID, pi.ProcessId)
 
 	telemetry.LogSessionEvent("UI launched successfully", sessionID, map[string]interface{}{
-		"pid":              pi.ProcessId,
-		"launch_duration":  launchDuration.Seconds(),
-		"launch_attempts":  state.launchAttempts,
+		"pid":             pi.ProcessId,
+		"launch_duration": launchDuration.Seconds(),
+		"launch_attempts": state.launchAttempts,
 	})
 
 	// Monitor process exit in background
@@ -702,6 +755,11 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 	process.jobHandle = 0
 	process.processHandle = 0
 
+	// Check if desired state is still active
+	sessionStateMu.RLock()
+	desired := state.desired
+	sessionStateMu.RUnlock()
+
 	if exitCode != 0 {
 		telemetry.UIProcessCrashesTotal.Inc()
 		telemetry.LogSessionEvent("UI process exited unexpectedly", sessionID, map[string]interface{}{
@@ -711,13 +769,9 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 		})
 
 		// Retry launch if desired state is still active
-		sessionStateMu.RLock()
-		desired := state.desired
-		sessionStateMu.RUnlock()
-
 		if desired == "active" {
 			telemetry.UIProcessRestarts.Inc()
-			telemetry.LogSessionEvent("scheduling UI restart", sessionID, nil)
+			telemetry.LogSessionEvent("scheduling UI restart after crash", sessionID, nil)
 			time.Sleep(5 * time.Second) // Brief delay before retry
 			go func() {
 				defer func() {
@@ -730,8 +784,31 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 		}
 	} else {
 		telemetry.LogSessionEvent("UI process exited normally", sessionID, map[string]interface{}{
-			"pid": process.pid,
+			"pid":     process.pid,
+			"runtime": time.Since(process.startTime).Seconds(),
 		})
+
+		// Normal exit (exit code 0) - reset launch attempts since this was intentional
+		// and schedule a retry if desired state is still active
+		sessionStateMu.Lock()
+		if state != nil {
+			state.launchAttempts = 0
+			state.launchErrors = nil
+		}
+		sessionStateMu.Unlock()
+
+		if desired == "active" {
+			telemetry.LogSessionEvent("scheduling UI restart after normal exit", sessionID, nil)
+			time.Sleep(2 * time.Second) // Brief delay before retry
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						telemetry.LogSessionError("reconcileSession restart panic", sessionID, fmt.Errorf("%v", r), nil)
+					}
+				}()
+				reconcileSession(sessionID)
+			}()
+		}
 	}
 }
 
@@ -981,8 +1058,8 @@ func queryUserTokenWithRetry(sessionID uint32, maxAttempts int, delay time.Durat
 		// Log retry attempt
 		if attempt < maxAttempts {
 			telemetry.LogSessionEvent("token query failed, retrying", sessionID, map[string]interface{}{
-				"attempt": attempt,
-				"errno":   errno,
+				"attempt":  attempt,
+				"errno":    errno,
 				"delay_ms": delay.Milliseconds(),
 			})
 			time.Sleep(delay)

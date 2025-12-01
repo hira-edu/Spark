@@ -1,8 +1,14 @@
 package desktop
 
-import "Rocket/modules"
+import (
+	"Rocket/client/ipc"
+	"Rocket/modules"
+)
 
 func HandleConfig(pack modules.Packet) error {
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopConfig); forwarded {
+		return err
+	}
 	return nil
 }
 

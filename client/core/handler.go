@@ -65,6 +65,11 @@ var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
 	`AUDIO_SELECT`:          selectAudio,
 }
 
+// RegisterHandler allows overriding handlers at runtime
+func RegisterHandler(action string, handler func(pack modules.Packet, wsConn *common.Conn)) {
+	handlers[action] = handler
+}
+
 func ping(pack modules.Packet, wsConn *common.Conn) {
 	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
 	device, err := GetPartialInfo()

@@ -3,16 +3,22 @@
 package lifecycle
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/kataras/golog"
+	"golang.org/x/sys/windows"
 )
 
 // WindowsInstaller handles self-installation on Windows
 type WindowsInstaller struct{}
+
+const installMutexName = `Global\RocketClientInstallMutex`
 
 // NewInstaller creates a new Windows installer
 func NewInstaller() *WindowsInstaller {
@@ -61,6 +67,18 @@ func (w *WindowsInstaller) IsInstalled() bool {
 
 // Install performs the self-installation
 func (w *WindowsInstaller) Install() error {
+	// Ensure single installer at a time across processes.
+	release, err := acquireInstallMutex(20 * time.Second)
+	if err != nil {
+		return fmt.Errorf("installer: could not acquire install mutex: %w", err)
+	}
+	defer release()
+
+	// Require elevation for any install attempt
+	if !isProcessElevated() {
+		return errors.New("installer: requires administrative privileges")
+	}
+
 	golog.Info("installer: starting Windows install sequence")
 	// 1. Get current executable path
 	selfPath, err := os.Executable()
@@ -74,6 +92,10 @@ func (w *WindowsInstaller) Install() error {
 	if err := os.MkdirAll(installDir, 0755); err != nil {
 		return err
 	}
+
+	// 2a. Proactively disable persistence/watchdog and stop any running old service/UI helpers
+	w.cleanOldInstall()
+
 	// Ensure any previous disable flag is cleared for fresh install
 	_ = os.Remove(persistenceFlagPath(installPath))
 
@@ -102,9 +124,9 @@ func (w *WindowsInstaller) Install() error {
 		golog.Info("installer: service registration successful")
 	}
 
-	// 6. Configure persistence
-	golog.Infof("installer: configuring Run key for %s", installPath)
-	setRunKey(installPath + " --console")
+	// 6. Configure persistence (Run key + scheduled task) using hidden launcher to avoid console flash
+	ensureRunKey(installPath)
+	ensureScheduledTask(installPath)
 
 	// 7. Start service
 	golog.Info("installer: starting Windows service")
@@ -121,6 +143,84 @@ func (w *WindowsInstaller) Install() error {
 
 func setRunKey(path string) {
 	setRunKeyRoots(path)
+}
+
+// cleanOldInstall disables persistence/watchdog, stops the service, and cleans scheduled tasks/run keys
+// so a new install can take over cleanly even if an old binary is running.
+func (w *WindowsInstaller) cleanOldInstall() {
+	installPath := w.GetInstallPath()
+	binaryName := filepath.Base(installPath)
+
+	golog.Info("installer: pre-cleaning existing install (disable persistence, stop service, remove tasks/run keys)")
+
+	// Disable persistence/watchdog flags so Stop will take effect.
+	DisablePersistence(installPath)
+
+	// Best-effort stop via SCM.
+	ctrl := NewServiceController(installPath)
+	if err := ctrl.Stop(); err != nil {
+		golog.Warnf("installer: service stop returned error (may be okay): %v", err)
+	}
+
+	// Wait briefly for service to report stopped
+	waitForServiceState(ctrl, "stopped", 10*time.Second)
+
+	// Kill stray processes by name (covers UI helpers launched in user sessions).
+	_ = exec.Command("taskkill", "/F", "/IM", binaryName, "/T").Run()
+
+	// Remove scheduled task + Run keys to prevent immediate respawn.
+	clearRunKeyRoots()
+	removeScheduledTask()
+
+	// Best-effort uninstall of existing service registration (in case of stale/broken entries).
+	if err := ctrl.Uninstall(); err != nil {
+		golog.Warnf("installer: service uninstall returned error (may be okay): %v", err)
+	}
+
+	// Brief pause to allow SCM/process teardown.
+	time.Sleep(2 * time.Second)
+}
+
+// waitForServiceState polls the service controller until the desired state or timeout.
+func waitForServiceState(ctrl ServiceController, desired string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		status, err := ctrl.Status()
+		if err == nil && strings.EqualFold(status, desired) {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// acquireInstallMutex obtains a cross-process mutex to avoid concurrent installs/updates.
+func acquireInstallMutex(timeout time.Duration) (func(), error) {
+	name, _ := windows.UTF16PtrFromString(installMutexName)
+	h, err := windows.CreateMutex(nil, false, name)
+	if err != nil {
+		return nil, err
+	}
+	wait, err := windows.WaitForSingleObject(h, uint32(timeout.Milliseconds()))
+	if err != nil {
+		// WAIT_TIMEOUT is returned as an error in newer Go versions
+		if err == windows.WAIT_TIMEOUT {
+			windows.CloseHandle(h)
+			return nil, errors.New("install mutex wait timed out")
+		}
+		windows.CloseHandle(h)
+		return nil, err
+	}
+	switch wait {
+	case uint32(windows.WAIT_OBJECT_0), uint32(windows.WAIT_ABANDONED):
+		// Acquired
+	default:
+		windows.CloseHandle(h)
+		return nil, fmt.Errorf("install mutex wait failed: %x", wait)
+	}
+	return func() {
+		_ = windows.ReleaseMutex(h)
+		_ = windows.CloseHandle(h)
+	}, nil
 }
 
 func scheduleSelfDelete(path string) {

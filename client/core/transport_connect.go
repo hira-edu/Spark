@@ -26,7 +26,7 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 		quicPort = 443 // Default QUIC port
 	}
 
-	cfg := &transport.Config{
+		cfg := &transport.Config{
 		// Use HTTP(S) base URL; WebSocket transport will convert schemes.
 		ServerURL:  config.GetBaseURL(false),
 		UUID:       config.Config.UUID,
@@ -46,7 +46,7 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 
 		// Long polling config
 		LongPollTimeout: 30 * time.Second,
-		LongPollPath:    "/longpoll",
+		LongPollPath:    "/api/longpoll",
 
 		// QUIC config
 		QUICEnabled: config.Config.EnableQUIC,

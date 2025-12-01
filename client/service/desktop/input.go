@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"Rocket/client/ipc"
 	"Rocket/modules"
 	"Rocket/utils"
 	"encoding/json"
@@ -51,6 +52,10 @@ const (
 
 // HandleInput injects desktop input events from the web client.
 func HandleInput(pack modules.Packet) error {
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopInput); forwarded {
+		return err
+	}
+
 	desktopIDVal, ok := pack.GetData(`desktop`, reflect.String)
 	if !ok {
 		return errInputInvalid

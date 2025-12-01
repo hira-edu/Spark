@@ -3,6 +3,7 @@ package core
 import (
 	"Rocket/client/common"
 	"Rocket/client/config"
+	"Rocket/client/service/desktop"
 	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"Rocket/utils"
@@ -181,12 +182,14 @@ func attemptConnection(ctx context.Context) error {
 	// Record connection established
 	connectionStart = time.Now()
 	telemetry.GetHealth().SetWSConnected(true)
+	desktop.SetWSConnected(true)
 
 	// Register
 	err = reportWS(wsConn)
 	if err != nil {
 		telemetry.LogWSError("register failed", err, nil)
 		telemetry.GetHealth().SetWSConnected(false)
+		desktop.SetWSConnected(false)
 		return fmt.Errorf("register: %w", err)
 	}
 
@@ -200,6 +203,7 @@ func attemptConnection(ctx context.Context) error {
 	duration := time.Since(connectionStart)
 	telemetry.WSConnectionDuration.Observe(duration.Seconds())
 	telemetry.GetHealth().SetWSConnected(false)
+	desktop.SetWSConnected(false)
 
 	if err != nil {
 		telemetry.LogWSError("handle failed", err, map[string]interface{}{

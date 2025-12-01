@@ -63,6 +63,11 @@ func (r *Runner) Run(mode RunMode) error {
 			golog.Info("runner: waiting for service to stop")
 			time.Sleep(3 * time.Second)
 
+			// Best-effort cleanup of watchdog/run keys/stray processes to prevent respawn during update
+			if wi, ok := r.installer.(*WindowsInstaller); ok {
+				wi.cleanOldInstall()
+			}
+
 			// Read new binary
 			golog.Info("runner: reading new binary")
 			selfBytes, err := os.ReadFile(selfPath)
@@ -149,9 +154,17 @@ func (r *Runner) Run(mode RunMode) error {
 		// UI-only mode: no WebSocket connection, Session 0 service handles communication
 		golog.Info("runner: Mode = UI_ONLY (UI in user session, no WebSocket connection)")
 		golog.Info("runner: Session 0 service maintains server connection, this process handles UI only")
-		// Simply keep the process alive for UI/tray icon purposes
-		// The Session 0 service maintains the actual WebSocket connection
-		select {} // Block forever (process stays alive for UI purposes)
+		// Start desktop bridge for handling IPC from Session 0
+		if runtime.GOOS == "windows" {
+			return RunUIOnlyMode()
+		}
+		// Non-Windows: just block
+		select {}
+
+	case RunModeNoop:
+		// No-op mode: service is already running, just exit silently
+		golog.Info("runner: Mode = NOOP (service already running, exiting)")
+		return nil
 
 	case RunModeUpdate:
 		// Update mode is handled separately in client.go

@@ -2,6 +2,8 @@ package desktop
 
 import (
 	"Rocket/client/common"
+	"Rocket/client/ipc"
+	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"Rocket/utils"
 	"Rocket/utils/cmap"
@@ -74,10 +76,10 @@ var magicBytes = []byte{34, 22, 19, 17, 20}
 
 // Op codes for frame protocol
 const (
-	opFirstFrame  = 0x00 // First part of a frame
-	opRestFrame   = 0x01 // Rest parts of a frame
-	opResolution  = 0x02 // Resolution info
-	opJSON        = 0x03 // JSON data
+	opFirstFrame = 0x00 // First part of a frame
+	opRestFrame  = 0x01 // Rest parts of a frame
+	opResolution = 0x02 // Resolution info
+	opJSON       = 0x03 // JSON data
 )
 
 const compress = compressJPEG
@@ -88,6 +90,123 @@ var sessions = cmap.New[*session]()
 var prevDesktop *image.RGBA
 var displayBounds image.Rectangle
 var errNoImage = errors.New(`DESKTOP.NO_IMAGE_YET`)
+var errNoActiveSession = errors.New(`DESKTOP.NO_ACTIVE_SESSION`)
+
+// sendDesktopData writes desktop binary data either to the WebSocket (Session 0) or over IPC (user session bridge).
+func sendDesktopData(buf []byte) {
+	if common.WSConn != nil {
+		if err := common.WSConn.SendData(buf); err != nil {
+			telemetry.LogStructured("ERROR", "desktop: failed to send frame over WS", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+		return
+	}
+	if ok := SendFrameViaIPC(buf); !ok {
+		telemetry.LogStructured("WARN", "desktop: IPC frame send failed", map[string]interface{}{
+			"bridge_mode": IsBridgeMode(),
+		})
+	}
+}
+
+// sendDesktopPacket delivers a control packet back to the server (via WS) or to Session 0 over IPC.
+func sendDesktopPacket(pack modules.Packet, rawEvent []byte) {
+	if pack.Event == `` && rawEvent != nil {
+		pack.Event = hex.EncodeToString(rawEvent)
+	}
+
+	if common.WSConn != nil {
+		// For init acknowledgements, use the standard encrypted pack pathway.
+		if pack.Act == "DESKTOP_INIT" {
+			if err := common.WSConn.SendPack(pack); err != nil {
+				telemetry.LogStructured("ERROR", "desktop: failed to send init callback", map[string]interface{}{
+					"error": err.Error(),
+				})
+			}
+			return
+		}
+
+		// Ensure we have raw event bytes; decode from pack if not provided.
+		if rawEvent == nil && len(pack.Event) > 0 {
+			if ev, err := hex.DecodeString(pack.Event); err == nil {
+				rawEvent = ev
+			} else {
+				telemetry.LogStructured("WARN", "desktop: failed to decode event hex", map[string]interface{}{
+					"act":   pack.Act,
+					"event": pack.Event,
+					"error": err.Error(),
+				})
+			}
+		}
+
+		data, err := utils.JSON.Marshal(pack)
+		if err != nil {
+			return
+		}
+		// If we still don't have raw event bytes, fall back to SendPack so callbacks still reach the server.
+		if rawEvent == nil {
+			if err := common.WSConn.SendPack(pack); err != nil {
+				telemetry.LogStructured("ERROR", "desktop: failed to send control pack fallback", map[string]interface{}{
+					"act":   pack.Act,
+					"error": err.Error(),
+				})
+			}
+			return
+		}
+
+		data = utils.XOR(data, common.WSConn.GetSecret())
+		if err := common.WSConn.SendRawData(rawEvent, data, 20, opJSON); err != nil {
+			telemetry.LogStructured("ERROR", "desktop: failed to send control packet", map[string]interface{}{
+				"act":   pack.Act,
+				"error": err.Error(),
+			})
+		}
+		return
+	}
+
+	// Bridge mode: forward to Session 0 for delivery.
+	if ok := SendPacketViaIPC(pack); !ok {
+		telemetry.LogStructured("WARN", "desktop: IPC control send failed", map[string]interface{}{
+			"act":         pack.Act,
+			"bridge_mode": IsBridgeMode(),
+		})
+	}
+}
+
+// relayDesktopCommand forwards desktop commands from Session 0 to the active user session.
+// Returns (true, nil) when forwarded, (true, err) when relay failed, (false, nil) when not in Session 0 mode.
+func relayDesktopCommand(pack modules.Packet, msgType uint16) (bool, error) {
+	if !IsSession0Mode() {
+		return false, nil
+	}
+
+	sessionID := GetActiveSessionID()
+	if sessionID == 0 {
+		return true, errNoActiveSession
+	}
+
+	relay := GetOrCreateRelay(sessionID)
+	if err := relay.Connect(); err != nil {
+		return true, err
+	}
+
+	switch msgType {
+	case ipc.MsgTypeDesktopInit:
+		return true, relay.SendInit(pack)
+	case ipc.MsgTypeDesktopKill:
+		return true, relay.SendKill(pack)
+	case ipc.MsgTypeDesktopPing:
+		return true, relay.SendPing(pack)
+	case ipc.MsgTypeDesktopInput:
+		return true, relay.SendInput(pack)
+	case ipc.MsgTypeDesktopConfig:
+		return true, relay.SendConfig(pack)
+	case ipc.MsgTypeDesktopShot:
+		return true, relay.SendShot(pack)
+	default:
+		return true, errors.New("unsupported relay message type")
+	}
+}
 
 func init() {
 	go healthCheck()
@@ -318,6 +437,10 @@ func isDiff(img, prev *image.RGBA, rect image.Rectangle) bool {
 }
 
 func InitDesktop(pack modules.Packet) error {
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopInit); forwarded {
+		return err
+	}
+
 	var uuid string
 	rawEvent, err := hex.DecodeString(pack.Event)
 	if err != nil {
@@ -341,9 +464,7 @@ func InitDesktop(pack modules.Packet) error {
 		if screenshot.NumActiveDisplays() == 0 {
 			if displayBounds.Dx() == 0 || displayBounds.Dy() == 0 {
 				close(desktop.channel)
-				data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.NO_DISPLAY_FOUND}`})
-				data = utils.XOR(data, common.WSConn.GetSecret())
-				common.WSConn.SendRawData(desktop.rawEvent, data, 20, 03)
+				sendDesktopPacket(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.NO_DISPLAY_FOUND}`, Event: pack.Event}, desktop.rawEvent)
 				return errors.New(`${i18n|DESKTOP.NO_DISPLAY_FOUND}`)
 			}
 		}
@@ -364,6 +485,10 @@ func InitDesktop(pack modules.Packet) error {
 }
 
 func PingDesktop(pack modules.Packet) {
+	if forwarded, _ := relayDesktopCommand(pack, ipc.MsgTypeDesktopPing); forwarded {
+		return
+	}
+
 	var uuid string
 	var desktop *session
 	if val, ok := pack.GetData(`desktop`, reflect.String); !ok {
@@ -379,6 +504,10 @@ func PingDesktop(pack modules.Packet) {
 }
 
 func KillDesktop(pack modules.Packet) {
+	if forwarded, _ := relayDesktopCommand(pack, ipc.MsgTypeDesktopKill); forwarded {
+		return
+	}
+
 	var uuid string
 	if val, ok := pack.GetData(`desktop`, reflect.String); !ok {
 		return
@@ -409,13 +538,15 @@ func KillDesktop(pack modules.Packet) {
 
 	// Send quit message
 	if rawEvent != nil {
-		data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`})
-		data = utils.XOR(data, common.WSConn.GetSecret())
-		common.WSConn.SendRawData(rawEvent, data, 20, 03)
+		sendDesktopPacket(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`, Event: pack.Event}, rawEvent)
 	}
 }
 
 func GetDesktop(pack modules.Packet) {
+	if forwarded, _ := relayDesktopCommand(pack, ipc.MsgTypeDesktopShot); forwarded {
+		return
+	}
+
 	var uuid string
 	var desktop *session
 	if val, ok := pack.GetData(`desktop`, reflect.String); !ok {
@@ -461,11 +592,10 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 			if msg.t == 1 {
 				desktop.lock.Lock()
 				rawEvent := desktop.rawEvent
+				event := desktop.event
 				desktop.lock.Unlock()
 				if rawEvent != nil {
-					data, _ := utils.JSON.Marshal(modules.Packet{Act: `DESKTOP_QUIT`, Msg: msg.info})
-					data = utils.XOR(data, common.WSConn.GetSecret())
-					common.WSConn.SendRawData(rawEvent, data, 20, opJSON)
+					sendDesktopPacket(modules.Packet{Act: `DESKTOP_QUIT`, Msg: msg.info, Event: event}, rawEvent)
 				}
 				desktop.escape = true
 				return
@@ -475,14 +605,12 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				buf := append(append(magicBytes, opFirstFrame), desktop.rawEvent...)
 				for _, slice := range *msg.frame {
 					if len(buf)+len(*slice) >= common.MaxMessageSize {
-						if common.WSConn.SendData(buf) != nil {
-							break
-						}
+						sendDesktopData(buf)
 						buf = append(append(magicBytes, opRestFrame), desktop.rawEvent...)
 					}
 					buf = append(buf, *slice...)
 				}
-				common.WSConn.SendData(buf)
+				sendDesktopData(buf)
 				buf = nil
 				continue
 			}
@@ -494,7 +622,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				binary.BigEndian.PutUint16(data[2:4], uint16(displayBounds.Dx()))
 				binary.BigEndian.PutUint16(data[4:6], uint16(displayBounds.Dy()))
 				buf = append(buf, data...)
-				common.WSConn.SendData(buf)
+				sendDesktopData(buf)
 				continue
 			}
 		case <-time.After(7 * time.Second):
