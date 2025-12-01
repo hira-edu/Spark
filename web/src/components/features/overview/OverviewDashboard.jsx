@@ -150,13 +150,13 @@ const OverviewDashboard = () => {
       {/* Modals */}
       {ComponentMap.Generate && (
         <ComponentMap.Generate
-          visible={!!generate}
+          open={!!generate}
           onCancel={() => setGenerate(false)}
         />
       )}
       {ComponentMap.Execute && (
         <ComponentMap.Execute
-          visible={execute}
+          open={!!execute}
           device={execute}
           onCancel={setExecute.bind(null, false)}
         />

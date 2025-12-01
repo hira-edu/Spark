@@ -1,6 +1,6 @@
 import React from 'react';
 import { UploadOutlined, DownloadOutlined, BgColorsOutlined, FontSizeOutlined, ClearOutlined, ReloadOutlined } from '@ant-design/icons';
-import { Dropdown, Menu } from 'antd';
+import { Dropdown } from 'antd';
 import { IconButton } from '../../../shared';
 import './Terminal.css';
 
@@ -43,27 +43,20 @@ const Footer = ({
   const isWindows = os?.toLowerCase().includes('windows');
   const isConnected = status === 'connected';
 
-  const themeMenu = (
-    <Menu
-      selectedKeys={[theme]}
-      onClick={({ key }) => onThemeChange(key)}
-    >
-      {THEMES.map((t) => (
-        <Menu.Item key={t.key}>{t.label}</Menu.Item>
-      ))}
-    </Menu>
-  );
+  const themeMenu = {
+    items: THEMES,
+    selectedKeys: [theme],
+    onClick: ({ key }) => onThemeChange(key),
+  };
 
-  const fontSizeMenu = (
-    <Menu
-      selectedKeys={[String(fontSize)]}
-      onClick={({ key }) => onFontSizeChange(Number(key))}
-    >
-      {FONT_SIZES.map((size) => (
-        <Menu.Item key={String(size)}>{size}px</Menu.Item>
-      ))}
-    </Menu>
-  );
+  const fontSizeMenu = {
+    items: FONT_SIZES.map((size) => ({
+      key: String(size),
+      label: `${size}px`,
+    })),
+    selectedKeys: [String(fontSize)],
+    onClick: ({ key }) => onFontSizeChange(Number(key)),
+  };
 
   return (
     <div className="terminal-footer">
@@ -108,7 +101,7 @@ const Footer = ({
         )}
 
         {/* Theme selector */}
-        <Dropdown overlay={themeMenu} trigger={['click']}>
+        <Dropdown menu={themeMenu} trigger={['click']}>
           <IconButton
             icon={<BgColorsOutlined />}
             tooltip="Change theme"
@@ -117,7 +110,7 @@ const Footer = ({
         </Dropdown>
 
         {/* Font size selector */}
-        <Dropdown overlay={fontSizeMenu} trigger={['click']}>
+        <Dropdown menu={fontSizeMenu} trigger={['click']}>
           <IconButton
             icon={<FontSizeOutlined />}
             tooltip="Font size"

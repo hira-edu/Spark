@@ -1,5 +1,5 @@
 import React from 'react';
-import ReactDOM from 'react-dom';
+import ReactDOM from 'react-dom/client';
 import {BrowserRouter, Route, Routes} from 'react-router-dom';
 import Wrapper from './components/wrapper';
 import AuthGuard from './components/AuthGuard';
@@ -9,8 +9,8 @@ import axios from 'axios';
 import {message} from 'antd';
 import i18n from "./locale/locale";
 
+import 'antd/dist/reset.css';
 import './global.css';
-import 'antd/dist/antd.css';
 import Overview from "./pages/overview";
 import SharePage from "./pages/share";
 import LoginPage from "./pages/login";
@@ -64,28 +64,32 @@ axios.interceptors.response.use(async res => {
 	return Promise.reject(err);
 });
 
-ReactDOM.render(
-	<BrowserRouter>
-		<AuthProvider>
-			<Routes>
-				{/* Public routes */}
-				<Route path="/login" element={<LoginPage/>}/>
-				<Route path="/setup" element={<SetupPage/>}/>
-				<Route path="/share" element={<SharePage/>}/>
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
 
-				{/* Protected routes */}
-				<Route path="/" element={
-					<AuthGuard>
-						<Wrapper>
-							<Overview/>
-						</Wrapper>
-					</AuthGuard>
-				}/>
+root.render(
+	<React.StrictMode>
+		<BrowserRouter>
+			<AuthProvider>
+				<Routes>
+					{/* Public routes */}
+					<Route path="/login" element={<LoginPage/>}/>
+					<Route path="/setup" element={<SetupPage/>}/>
+					<Route path="/share" element={<SharePage/>}/>
 
-				{/* 404 page */}
-				<Route path="*" element={<Err/>}/>
-			</Routes>
-		</AuthProvider>
-	</BrowserRouter>,
-	document.getElementById('root')
+					{/* Protected routes */}
+					<Route path="/" element={
+						<AuthGuard>
+							<Wrapper>
+								<Overview/>
+							</Wrapper>
+						</AuthGuard>
+					}/>
+
+					{/* 404 page */}
+					<Route path="*" element={<Err/>}/>
+				</Routes>
+			</AuthProvider>
+		</BrowserRouter>
+	</React.StrictMode>
 );

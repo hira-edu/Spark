@@ -1,9 +1,9 @@
 import React from 'react';
 import ProLayout, {PageContainer} from '@ant-design/pro-layout';
-import zhCN from 'antd/lib/locale/zh_CN';
-import en from 'antd/lib/locale/en_US';
+import zhCN from 'antd/locale/zh_CN';
+import en from 'antd/locale/en_US';
 import {getLang, getLocale} from "../locale/locale";
-import {Button, ConfigProvider, notification, Dropdown, Avatar, Space} from "antd";
+import {Button, ConfigProvider, notification, Dropdown, Avatar, Space, theme} from "antd";
 import {LogoutOutlined, UserOutlined} from '@ant-design/icons';
 import {useNavigate} from 'react-router-dom';
 import {useAuth} from '../context/AuthContext';
@@ -20,6 +20,7 @@ if (enableUpdateCheck) {
 function wrapper(props) {
 	const navigate = useNavigate();
 	const { user, logout } = useAuth();
+	const locale = getLang()==='zh-CN'?zhCN:en;
 
 	const handleLogout = async () => {
 		await logout();
@@ -67,39 +68,50 @@ function wrapper(props) {
 	);
 
 	return (
-		<ProLayout
-			loading={false}
-			title='Rocket'
-			logo={null}
-			layout='top'
-			navTheme='dark'
-			collapsed={true}
-			fixedHeader={true}
-			contentWidth='fluid'
-			collapsedButtonRender={Title}
-			headerTheme='dark'
-			rightContentRender={() => <UserMenu />}
-			style={{
-				background: '#1a1a1a',
-			}}
-			contentStyle={{
-				background: '#1a1a1a',
-				padding: 0,
+		<ConfigProvider
+			locale={locale}
+			theme={{
+				algorithm: theme.darkAlgorithm,
+				token: {
+					colorBgBase: '#1a1a1a',
+					colorBgContainer: '#1a1a1a',
+					colorTextBase: '#ffffff',
+					colorBorderSecondary: '#3d3d3d'
+				}
 			}}
 		>
-			<PageContainer
-				header={{
-					style: { display: 'none' }
-				}}
+			<ProLayout
+				loading={false}
+				title='Rocket'
+				logo={null}
+				layout='top'
+				navTheme='dark'
+				collapsed={true}
+				fixedHeader={true}
+				contentWidth='fluid'
+				collapsedButtonRender={Title}
+				headerTheme='dark'
+				rightContentRender={() => <UserMenu />}
 				style={{
 					background: '#1a1a1a',
 				}}
+				contentStyle={{
+					background: '#1a1a1a',
+					padding: 0,
+				}}
 			>
-				<ConfigProvider locale={getLang()==='zh-CN'?zhCN:en}>
+				<PageContainer
+					header={{
+						style: { display: 'none' }
+					}}
+					style={{
+						background: '#1a1a1a',
+					}}
+				>
 					{props.children}
-				</ConfigProvider>
-			</PageContainer>
-		</ProLayout>
+				</PageContainer>
+			</ProLayout>
+		</ConfigProvider>
 	);
 }
 

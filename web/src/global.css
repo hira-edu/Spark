@@ -28,7 +28,7 @@ body {
 	color: #ffffff;
 }
 
-.ant-modal-close-x {
+.ant-modal-close {
 	color: #a0a0a0;
 }
 
@@ -37,11 +37,15 @@ body {
 	border: 1px solid #3d3d3d;
 }
 
-.ant-dropdown-menu-item {
+.ant-dropdown-menu-item,
+.ant-dropdown-menu .ant-dropdown-menu-title-content {
 	color: #ffffff;
 }
 
 .ant-dropdown-menu-item:hover {
+	background: #2d2d2d;
+}
+.ant-dropdown-menu-item-active {
 	background: #2d2d2d;
 }
 

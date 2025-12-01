@@ -26,7 +26,7 @@ module.exports = (env, args) => {
                     include: path.resolve(__dirname, 'src'),
                     options: {
                         loader: 'jsx',
-                        target: 'es2015'
+                        target: 'es2018'
                     }
                 },
                 {
@@ -104,7 +104,7 @@ module.exports = (env, args) => {
             minimizer: [
                 new ESBuildMinifyPlugin({
                     css: true,
-                    target: 'es2015',
+                    target: 'es2018',
                     implementation: esbuild,
                     legalComments: 'none'
                 })

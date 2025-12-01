@@ -5,18 +5,30 @@ import i18n from "../../locale/locale";
 import {message} from "antd";
 
 function Execute(props) {
+	const { device, onCancel, open, visible, ...restProps } = props;
+	const isOpen = open ?? visible;
+
 	async function onFinish(form) {
-		form.device = props.device.id;
-		let basePath = location.origin + location.pathname + 'api/device/';
-		request(basePath + 'exec', form).then(res => {
+		const basePath = location.origin + location.pathname + 'api/device/';
+		const payload = {
+			...form,
+			device: device?.id
+		};
+		try {
+			const res = await request(basePath + 'exec', payload);
 			if (res.data.code === 0) {
 				message.success(i18n.t('EXECUTE.EXECUTION_SUCCESS'));
+				return true;
 			}
-		});
+		} catch (err) {
+			return false;
+		}
+		return false;
 	}
 
 	return (
 		<ModalForm
+			open={isOpen}
 			modalProps={{
 				destroyOnClose: true,
 				maskClosable: false,
@@ -24,13 +36,13 @@ function Execute(props) {
 			title={i18n.t('EXECUTE.TITLE')}
 			width={380}
 			onFinish={onFinish}
-			onVisibleChange={open => {
-				if (!open) props.onCancel();
+			onOpenChange={(nextOpen) => {
+				if (!nextOpen && onCancel) onCancel();
 			}}
 			submitter={{
 				render: (_, elems) => elems.pop()
 			}}
-			{...props}
+			{...restProps}
 		>
 			<ProFormText
 				width="md"

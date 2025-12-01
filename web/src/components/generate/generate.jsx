@@ -6,7 +6,7 @@ import prebuilt from '../../config/prebuilt.json';
 import i18n from "../../locale/locale";
 import './generate.css';
 
-function Generate({visible, onCancel}) {
+function Generate({open, visible, onCancel}) {
 	const [form] = Form.useForm();
 	const [loading, setLoading] = useState(false);
 	const [notice, setNotice] = useState('');
@@ -16,13 +16,15 @@ function Generate({visible, onCancel}) {
 	const [enableDNS, setEnableDNS] = useState(false);
 	const [enableMimicry, setEnableMimicry] = useState(false);
 
+	const isOpen = open ?? visible;
+
 	React.useEffect(() => {
-		if (visible) {
+		if (isOpen) {
 			const initValues = getInitValues();
 			form.setFieldsValue(initValues);
 			setPreview(buildPreview(initValues));
 		}
-	}, [visible, form]);
+	}, [isOpen, form]);
 
 	function getInitValues() {
 		let pathname = location.pathname || `/`;
@@ -110,7 +112,7 @@ function Generate({visible, onCancel}) {
 	return (
 		<Modal
 			title={i18n.t('GENERATOR.TITLE') || 'Generate Client'}
-			open={visible}
+			open={isOpen}
 			onCancel={handleCancel}
 			footer={null}
 			width={760}

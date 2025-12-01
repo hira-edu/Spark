@@ -1,5 +1,5 @@
 import React from 'react';
-import { Input, Tooltip, Dropdown, Menu } from 'antd';
+import { Input, Tooltip, Dropdown } from 'antd';
 import {
   ArrowLeftOutlined,
   ArrowRightOutlined,
@@ -46,16 +46,11 @@ const Toolbar = ({
   onUpload,
   onNewFolder,
 }) => {
-  const sortMenu = (
-    <Menu
-      selectedKeys={[sortBy]}
-      onClick={({ key }) => onSortChange(key)}
-    >
-      {SORT_OPTIONS.map((opt) => (
-        <Menu.Item key={opt.key}>{opt.label}</Menu.Item>
-      ))}
-    </Menu>
-  );
+  const sortMenu = {
+    items: SORT_OPTIONS,
+    selectedKeys: [sortBy],
+    onClick: ({ key }) => onSortChange(key)
+  };
 
   return (
     <div className="explorer-toolbar">
@@ -145,7 +140,7 @@ const Toolbar = ({
         </div>
 
         {/* Sort dropdown */}
-        <Dropdown overlay={sortMenu} trigger={['click']}>
+        <Dropdown menu={sortMenu} trigger={['click']}>
           <IconButton
             icon={<SortAscendingOutlined />}
             tooltip="Sort by"
