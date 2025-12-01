@@ -13,3 +13,7 @@ export { useFileSystem } from './explorer';
 // Process Manager
 export { ProcessManager } from './procmgr';
 export { useProcessList } from './procmgr';
+
+// Overview Dashboard
+export { OverviewDashboard } from './overview';
+export { useDeviceList } from './overview';

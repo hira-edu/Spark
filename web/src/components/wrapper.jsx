@@ -21,13 +21,28 @@ function wrapper(props) {
 			title='Spark'
 			logo={null}
 			layout='top'
-			navTheme='light'
+			navTheme='dark'
 			collapsed={true}
 			fixedHeader={true}
 			contentWidth='fluid'
 			collapsedButtonRender={Title}
+			headerTheme='dark'
+			style={{
+				background: '#1a1a1a',
+			}}
+			contentStyle={{
+				background: '#1a1a1a',
+				padding: 0,
+			}}
 		>
-			<PageContainer>
+			<PageContainer
+				header={{
+					style: { display: 'none' }
+				}}
+				style={{
+					background: '#1a1a1a',
+				}}
+			>
 				<ConfigProvider locale={getLang()==='zh-CN'?zhCN:en}>
 					{props.children}
 				</ConfigProvider>

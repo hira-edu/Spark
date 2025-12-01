@@ -1,16 +1,58 @@
 body {
 	overflow-x: hidden;
+	margin: 0;
+	padding: 0;
 }
 
 #root {
-	height: 100%;
-	background-image: url('static/bg.svg');
-	background-repeat: no-repeat;
-	background-position: center 110px;
-	background-color: #f0f2f5;
-	background-size: 100%;
+	min-height: 100vh;
+	background: #1a1a1a;
 }
 
+/* Override antd table styles */
 .ant-table-cell {
 	border: none !important;
+}
+
+/* Dark theme for antd components */
+.ant-modal-content {
+	background: #242424;
+}
+
+.ant-modal-header {
+	background: #242424;
+	border-bottom-color: #3d3d3d;
+}
+
+.ant-modal-title {
+	color: #ffffff;
+}
+
+.ant-modal-close-x {
+	color: #a0a0a0;
+}
+
+.ant-dropdown-menu {
+	background: #242424;
+	border: 1px solid #3d3d3d;
+}
+
+.ant-dropdown-menu-item {
+	color: #ffffff;
+}
+
+.ant-dropdown-menu-item:hover {
+	background: #2d2d2d;
+}
+
+.ant-dropdown-menu-item-divider {
+	background: #3d3d3d;
+}
+
+.ant-dropdown-menu-item-danger {
+	color: #ff4d4f;
+}
+
+.ant-empty-description {
+	color: #a0a0a0;
 }
