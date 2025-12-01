@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -30,6 +31,10 @@ const (
 	maxQueueSize          = 1000
 	maxMessageSize        = common.MaxMessageSize
 	cleanupInterval       = 1 * time.Minute
+
+	// Rate limiting constants
+	sendRateLimitQPS      = 10  // Sends per second per UUID
+	sendRateLimitBurst    = 20  // Burst allowance per UUID
 )
 
 // Session represents a long polling session
@@ -38,6 +43,7 @@ type Session struct {
 	Secret        []byte
 	LastSeen      time.Time
 	MessageQueue  chan *modules.Packet
+	RateLimiter   *rate.Limiter // Per-UUID rate limiter
 	mu            sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -103,6 +109,7 @@ func (sm *SessionManager) createSession(uuid string, secret []byte) *Session {
 		Secret:       secret,
 		LastSeen:     time.Now(),
 		MessageQueue: make(chan *modules.Packet, maxQueueSize),
+		RateLimiter:  rate.NewLimiter(rate.Limit(sendRateLimitQPS), sendRateLimitBurst),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
