@@ -9,3 +9,7 @@ export { useTerminalSession } from './terminal';
 // File Explorer
 export { FileExplorer } from './explorer';
 export { useFileSystem } from './explorer';
+
+// Process Manager
+export { ProcessManager } from './procmgr';
+export { useProcessList } from './procmgr';
