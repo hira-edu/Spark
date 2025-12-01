@@ -216,6 +216,9 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 	switch eventType {
 	case windows.WTS_SESSION_LOGON, windows.WTS_SESSION_UNLOCK, windows.WTS_CONSOLE_CONNECT, windows.WTS_REMOTE_CONNECT:
 		// User became active - launch UI
+		telemetry.LogSessionEvent("handleSessionChangeEvent: user active event", sessionID, map[string]interface{}{
+			"event": eventName,
+		})
 		setSessionDesiredState(sessionID, "active")
 		go func() {
 			defer func() {
@@ -228,6 +231,9 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 
 	case windows.WTS_SESSION_LOGOFF, windows.WTS_SESSION_TERMINATE, windows.WTS_SESSION_LOCK, windows.WTS_CONSOLE_DISCONNECT, windows.WTS_REMOTE_DISCONNECT:
 		// User became inactive - terminate UI
+		telemetry.LogSessionEvent("handleSessionChangeEvent: user inactive event", sessionID, map[string]interface{}{
+			"event": eventName,
+		})
 		setSessionDesiredState(sessionID, "none")
 		go func() {
 			defer func() {
@@ -279,12 +285,23 @@ func reconcileAllSessions() {
 		for sid := range sessionStates {
 			sessionStates[sid].desired = "none"
 		}
-		telemetry.LogSessionEvent("no active sessions", 0, nil)
+		telemetry.LogSessionEvent("reconcileAllSessions: no active sessions", 0, map[string]interface{}{
+			"error": err.Error(),
+		})
 	} else {
+		telemetry.LogSessionEvent("reconcileAllSessions: found active session", activeSessionID, nil)
+
 		// Mark active session as desired=active, others as desired=none
 		for sid := range sessionStates {
 			if sid == activeSessionID {
+				oldDesired := sessionStates[sid].desired
+				oldActual := sessionStates[sid].actual
 				sessionStates[sid].desired = "active"
+				telemetry.LogSessionEvent("reconcileAllSessions: marking session active", sid, map[string]interface{}{
+					"old_desired": oldDesired,
+					"new_desired": "active",
+					"actual":      oldActual,
+				})
 			} else {
 				sessionStates[sid].desired = "none"
 			}
@@ -297,6 +314,10 @@ func reconcileAllSessions() {
 				desired:   "active",
 				actual:    "stopped",
 			}
+			telemetry.LogSessionEvent("reconcileAllSessions: created new active session state", activeSessionID, map[string]interface{}{
+				"desired": "active",
+				"actual":  "stopped",
+			})
 		}
 	}
 
@@ -317,6 +338,10 @@ func reconcileSession(sessionID uint32) {
 			actual:    "stopped",
 		}
 		sessionStates[sessionID] = state
+		telemetry.LogSessionEvent("reconcileSession: created new state", sessionID, map[string]interface{}{
+			"desired": state.desired,
+			"actual":  state.actual,
+		})
 	}
 	sessionStateMu.Unlock()
 
@@ -326,17 +351,38 @@ func reconcileSession(sessionID uint32) {
 	actual := state.actual
 	sessionStateMu.RUnlock()
 
+	telemetry.LogSessionEvent("reconcileSession: checking state", sessionID, map[string]interface{}{
+		"desired": desired,
+		"actual":  actual,
+	})
+
 	if desired == actual {
 		// Already in sync
+		telemetry.LogSessionEvent("reconcileSession: states match, no action needed", sessionID, map[string]interface{}{
+			"state": desired,
+		})
 		return
 	}
 
 	if desired == "active" && actual == "stopped" {
 		// Launch UI process
+		telemetry.LogSessionEvent("reconcileSession: will launch UI", sessionID, map[string]interface{}{
+			"desired": desired,
+			"actual":  actual,
+		})
 		launchUIInSession(sessionID)
 	} else if desired == "none" && actual == "running" {
 		// Terminate UI process
+		telemetry.LogSessionEvent("reconcileSession: will terminate UI", sessionID, map[string]interface{}{
+			"desired": desired,
+			"actual":  actual,
+		})
 		terminateUIInSession(sessionID)
+	} else {
+		telemetry.LogSessionEvent("reconcileSession: unexpected state combination", sessionID, map[string]interface{}{
+			"desired": desired,
+			"actual":  actual,
+		})
 	}
 }
 
@@ -346,13 +392,23 @@ func setSessionDesiredState(sessionID uint32, desired string) {
 	defer sessionStateMu.Unlock()
 
 	if state, exists := sessionStates[sessionID]; exists {
+		oldDesired := state.desired
 		state.desired = desired
+		telemetry.LogSessionEvent("setSessionDesiredState: updated existing", sessionID, map[string]interface{}{
+			"old_desired": oldDesired,
+			"new_desired": desired,
+			"actual":      state.actual,
+		})
 	} else {
 		sessionStates[sessionID] = &SessionState{
 			sessionID: sessionID,
 			desired:   desired,
 			actual:    "stopped",
 		}
+		telemetry.LogSessionEvent("setSessionDesiredState: created new", sessionID, map[string]interface{}{
+			"desired": desired,
+			"actual":  "stopped",
+		})
 	}
 }
 

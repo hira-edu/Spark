@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"Rocket/client/telemetry"
 	"errors"
 	"github.com/kirides/go-d3d/d3d11"
 	"github.com/kirides/go-d3d/outputduplication"
@@ -50,11 +51,33 @@ type ScreenGDI struct {
 
 func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 	dxgi := ScreenDXGI{}
-	if dxgi.Init(displayIndex, rect) == nil {
+	dxgiErr := dxgi.Init(displayIndex, rect)
+	if dxgiErr == nil {
 		s.screen = &dxgi
+		// Log successful DXGI initialization
+		telemetry.LogStructured("INFO", "Desktop capture initialized with DXGI", map[string]interface{}{
+			"display": displayIndex,
+			"rect":    rect.String(),
+		})
 	} else {
+		// Log DXGI failure and fallback to GDI
+		telemetry.LogStructured("WARN", "DXGI initialization failed, falling back to GDI", map[string]interface{}{
+			"error":   dxgiErr.Error(),
+			"display": displayIndex,
+		})
 		gdi := ScreenGDI{}
-		gdi.Init(displayIndex, rect)
+		gdiErr := gdi.Init(displayIndex, rect)
+		if gdiErr != nil {
+			telemetry.LogStructured("ERROR", "GDI initialization also failed", map[string]interface{}{
+				"error":   gdiErr.Error(),
+				"display": displayIndex,
+			})
+		} else {
+			telemetry.LogStructured("INFO", "Desktop capture initialized with GDI", map[string]interface{}{
+				"display": displayIndex,
+				"rect":    rect.String(),
+			})
+		}
 		s.screen = &gdi
 	}
 }
