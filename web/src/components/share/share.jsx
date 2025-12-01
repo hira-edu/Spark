@@ -12,7 +12,7 @@ function Share(props) {
 	const [creating, setCreating] = useState(false);
 	const [shares, setShares] = useState([]);
 
-	const guestBase = useMemo(() => `${location.origin}${location.pathname}#/share?token=`, []);
+	const guestBase = useMemo(() => `${location.origin}/share?token=`, []);
 
 	useEffect(() => {
 		if (open) {

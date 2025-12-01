@@ -26,7 +26,7 @@ function SharePage() {
 
 	const guestUrl = useMemo(() => {
 		if (!token) return '';
-		return `${location.origin}${location.pathname}#/share?token=${encodeURIComponent(token)}`;
+		return `${location.origin}/share?token=${encodeURIComponent(token)}`;
 	}, [token]);
 
 	function validateToken(tk) {

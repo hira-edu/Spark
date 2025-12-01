@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import {HashRouter as Router, Route, Routes} from 'react-router-dom';
+import {BrowserRouter as Router, Route, Routes} from 'react-router-dom';
 import Wrapper from './components/wrapper';
 import AuthGuard from './components/AuthGuard';
 import { AuthProvider } from './context/AuthContext';
@@ -24,7 +24,8 @@ axios.interceptors.response.use(async res => {
 		if (data.code !== 0){
 			// Don't show auth errors on initial load or login/setup pages
 			const isAuthError = data.msg && (data.msg.includes('AUTH.') || data.msg.includes('SESSION'));
-			const isAuthPage = window.location.hash === '#/login' || window.location.hash === '#/setup' || window.location.hash === '';
+			const pathname = window.location.pathname;
+			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
 			if (!isAuthError || !isAuthPage) {
 				message.warn(translate(data.msg));
 			}
@@ -48,7 +49,8 @@ axios.interceptors.response.use(async res => {
 		if (data.code !== 0){
 			// Don't show auth errors on initial load or login/setup pages
 			const isAuthError = data.msg && (data.msg.includes('AUTH.') || data.msg.includes('SESSION'));
-			const isAuthPage = window.location.hash === '#/login' || window.location.hash === '#/setup' || window.location.hash === '';
+			const pathname = window.location.pathname;
+			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
 			if (!isAuthError || !isAuthPage) {
 				message.warn(translate(data.msg));
 			}
@@ -56,8 +58,8 @@ axios.interceptors.response.use(async res => {
 		}
 	}
 	// Handle 401 Unauthorized - redirect to login
-	if (res?.status === 401 && window.location.hash !== '#/login' && window.location.hash !== '#/setup') {
-		window.location.hash = '#/login';
+	if (res?.status === 401 && window.location.pathname !== '/login' && window.location.pathname !== '/setup') {
+		window.location.href = '/login';
 	}
 	return Promise.reject(err);
 });

@@ -94,9 +94,26 @@ func main() {
 
 		app.Any(`/ws`, wsHandshake)
 		app.NoRoute(func(ctx *gin.Context) {
-			if !serveGzip(ctx, webFS) && !checkCache(ctx, webFS) {
-				http.FileServer(webFS).ServeHTTP(ctx.Writer, ctx.Request)
+			path := ctx.Request.URL.Path
+			// Let API/WebSocket return 404 as usual
+			if strings.HasPrefix(path, "/api") || path == "/ws" {
+				ctx.Status(http.StatusNotFound)
+				return
 			}
+
+			// Serve static file if it exists, otherwise fall back to SPA index.html
+			if serveGzip(ctx, webFS) || checkCache(ctx, webFS) {
+				return
+			}
+
+			f, err := webFS.Open("/index.html")
+			if err != nil {
+				http.FileServer(webFS).ServeHTTP(ctx.Writer, ctx.Request)
+				return
+			}
+			defer f.Close()
+			ctx.Header("Content-Type", "text/html; charset=utf-8")
+			io.Copy(ctx.Writer, f)
 		})
 	}
 
