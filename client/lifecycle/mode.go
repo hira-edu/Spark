@@ -10,6 +10,10 @@ import (
 // DetectMode determines the appropriate run mode based on args and environment
 func DetectMode(args []string) RunMode {
 	golog.Infof("mode: Detecting run mode (args count=%d, values=%v)", len(args), args)
+	// Log each argument individually for debugging
+	for i, arg := range args {
+		golog.Infof("mode: args[%d] = %q", i, arg)
+	}
 
 	// Check command line flags first
 	if len(args) > 1 {
