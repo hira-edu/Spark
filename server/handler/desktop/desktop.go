@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +15,9 @@ import (
 	"Spark/utils/melody"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type desktop struct {
@@ -42,6 +46,11 @@ func init() {
 
 // InitDesktop handles desktop websocket handshake event
 func InitDesktop(ctx *gin.Context) {
+	tr := otel.Tracer("spark-server/desktop")
+	ctxSpan, span := tr.Start(ctx.Request.Context(), "desktop.handshake")
+	defer span.End()
+	ctx.Request = ctx.Request.WithContext(ctxSpan)
+
 	start := time.Now()
 	logAbort := func(status int, reason string, extra map[string]any) {
 		if extra == nil {
@@ -90,6 +99,8 @@ func InitDesktop(ctx *gin.Context) {
 		logAbort(http.StatusBadRequest, `device not found`, map[string]any{
 			`device`: device,
 		})
+		span.RecordError(fmt.Errorf("device not found"))
+		span.SetStatus(codes.Error, "device not found")
 		return
 	}
 
@@ -104,6 +115,12 @@ func InitDesktop(ctx *gin.Context) {
 		`secret_len`: len(secret),
 		`latency_ms`: time.Since(start).Milliseconds(),
 	})
+	span.SetAttributes(
+		attribute.String("desktop.device", device),
+		attribute.Int("desktop.secret_len", len(secret)),
+		attribute.Int64("latency_ms", time.Since(start).Milliseconds()),
+		attribute.String("origin", ctx.GetHeader(`Origin`)),
+	)
 }
 
 // desktopEventWrapper returns a eventCallback function that will

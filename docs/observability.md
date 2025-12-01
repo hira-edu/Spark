@@ -69,6 +69,22 @@ otelcol-contrib --config observability/otel-collector.yaml \
   --set=PROM_REMOTE_WRITE_ENDPOINT=http://mimir:9009/api/v1/push
 ```
 
+## Single-host quick deploy (server + collector on the same box)
+
+1) Enable server tracing via env:
+   - `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`
+   - Optional: `OTEL_EXPORTER_OTLP_INSECURE=true`, `SPARK_TRACE_SAMPLE_RATIO=0.2`
+2) Run the collector locally:
+   ```sh
+   otelcol-contrib --config observability/otel-collector.yaml \
+     --set=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=127.0.0.1:4317 \
+     --set=OTEL_EXPORTER_OTLP_TRACES_INSECURE=true \
+     --set=LOKI_ENDPOINT=http://127.0.0.1:3100/loki/api/v1/push \
+     --set=PROM_REMOTE_WRITE_ENDPOINT=http://127.0.0.1:9009/api/v1/push
+   ```
+3) Enable Caddy JSON logs (`/var/log/caddy/access.json`) and ensure file permissions allow the collector to read them.
+4) Agents on the same host: confirm log paths align with `SPARK_AGENT_LOG_PATH` (Windows) or `SPARK_AGENT_LOG_PATH_LINUX` (Linux).
+
 ## Dashboards and alerts (suggested)
 
 - Alerts: repeated 1005/1006 WebSocket closes, UI launch failures, circuit breaker open, missing UI in active session, HTTP 5xx spikes on Caddy/server.

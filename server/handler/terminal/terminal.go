@@ -10,6 +10,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"reflect"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type terminal struct {
@@ -32,27 +37,39 @@ func init() {
 
 // InitTerminal handles terminal websocket handshake event
 func InitTerminal(ctx *gin.Context) {
+	tr := otel.Tracer("spark-server/terminal")
+	ctxSpan, span := tr.Start(ctx.Request.Context(), "terminal.handshake")
+	defer span.End()
+	ctx.Request = ctx.Request.WithContext(ctxSpan)
+	start := time.Now()
+
 	if !ctx.IsWebsocket() {
 		ctx.AbortWithStatus(http.StatusBadRequest)
+		span.SetStatus(codes.Error, "not websocket")
 		return
 	}
 	secretStr, ok := ctx.GetQuery(`secret`)
 	if !ok || len(secretStr) != 32 {
 		ctx.AbortWithStatus(http.StatusBadRequest)
+		span.SetStatus(codes.Error, "missing secret")
 		return
 	}
 	secret, err := hex.DecodeString(secretStr)
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "secret decode failed")
 		return
 	}
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
+		span.SetStatus(codes.Error, "missing device")
 		return
 	}
 	if _, ok := common.CheckDevice(device, ``); !ok {
 		ctx.AbortWithStatus(http.StatusBadRequest)
+		span.SetStatus(codes.Error, "device not found")
 		return
 	}
 
@@ -61,6 +78,12 @@ func InitTerminal(ctx *gin.Context) {
 		`Device`:   device,
 		`LastPack`: utils.Unix,
 	})
+
+	span.SetAttributes(
+		attribute.String("terminal.device", device),
+		attribute.Int("terminal.secret_len", len(secret)),
+		attribute.Int64("latency_ms", time.Since(start).Milliseconds()),
+	)
 }
 
 // terminalEventWrapper returns a eventCallback function that will
