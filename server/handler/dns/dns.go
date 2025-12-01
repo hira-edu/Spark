@@ -8,12 +8,16 @@ import (
 	"Spark/utils"
 	"Spark/utils/cmap"
 	"context"
+	"crypto/hmac"
 	cryptoRand "crypto/rand"
+	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +42,11 @@ const (
 	rateLimitQPS         = 10           // Queries per second per IP
 	rateLimitBurst       = 20           // Burst allowance per IP
 	rateLimiterCleanup   = 5 * time.Minute
+
+	// Security constants
+	nonceWindow          = 300          // Accept nonces within 5 minute window
+	maxQueryNameLength   = 253          // Max DNS name length
+	maxDataPartLength    = 200          // Max data part in query (prevents abuse)
 )
 
 // DNSSession represents a DNS tunneling session
@@ -47,6 +56,7 @@ type DNSSession struct {
 	LastSeen     time.Time
 	MessageQueue chan *modules.Packet
 	ChunkBuffer  map[uint32]map[int]string // seq -> chunk_id -> data
+	NonceCache   map[string]time.Time       // nonce -> timestamp (prevents replay)
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -249,43 +259,53 @@ func (s *DNSServer) handleQuery(data []byte, remoteAddr *net.UDPAddr) {
 }
 
 // handleHandshake handles DNS handshake
-// Format: handshake.<uuid>.<key>.<domain>
-func (s *DNSServer) handleHandshake(ctx context.Context, uuid string, key string) string {
-	// Verify device exists with proper key validation
-	_, ok := common.CheckDevice(uuid, key)
+// Format: handshake.<deviceID>.<key>.<domain>
+func (s *DNSServer) handleHandshake(ctx context.Context, deviceID string, key string) string {
+	// Verify device exists and get connection UUID
+	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
+	connUUID, ok := common.CheckDevice(deviceID, "")
 	if !ok {
-		return "error=invalid_credentials"
+		return "error=device_not_found"
+	}
+
+	// Verify the device exists in Devices map
+	device, ok := common.Devices.Get(connUUID)
+	if !ok || device.ID != deviceID {
+		return "error=invalid_device_state"
 	}
 
 	// Generate a fresh random secret for this session (security best practice)
 	secret := make([]byte, 32)
 	if _, err := cryptoRand.Read(secret); err != nil {
-		common.Warn(nil, "DNS_HANDSHAKE_SECRET_FAILED", uuid, err.Error(), nil)
+		common.Warn(nil, "DNS_HANDSHAKE_SECRET_FAILED", deviceID, err.Error(), nil)
 		return "error=secret_generation_failed"
 	}
 
-	// Create session
+	// Create session using connUUID (not deviceID)
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	session := &DNSSession{
-		UUID:         uuid,
+		UUID:         connUUID,
 		Secret:       secret,
 		LastSeen:     time.Now(),
 		MessageQueue: make(chan *modules.Packet, 100),
 		ChunkBuffer:  make(map[uint32]map[int]string),
+		NonceCache:   make(map[string]time.Time),
 		ctx:          sessionCtx,
 		cancel:       cancel,
 	}
 
-	s.sessions.Set(uuid, session)
+	s.sessions.Set(connUUID, session)
 
 	// Register session with transport registry for server→client sends
 	registry := common.GetTransportRegistry()
-	registry.Register(uuid, common.TransportDNS, func(packet *modules.Packet) bool {
-		return s.SendToDNSClient(uuid, packet)
+	registry.Register(connUUID, common.TransportDNS, func(packet *modules.Packet) bool {
+		return s.SendToDNSClient(connUUID, packet)
 	})
 
-	common.Info(nil, "DNS_SESSION_CREATED", uuid, "", nil)
+	common.Info(nil, "DNS_SESSION_CREATED", connUUID, "", map[string]any{
+		"device_id": deviceID,
+	})
 
 	// Return secret in TXT record
 	// Format: secret=<base32-encoded-secret>
@@ -293,12 +313,26 @@ func (s *DNSServer) handleHandshake(ctx context.Context, uuid string, key string
 }
 
 // handlePoll handles DNS poll request
-// Format: poll.<seq>.<uuid>.<domain>
+// Format: poll.<nonce>.<hmac>.<uuid>.<domain>
 func (s *DNSServer) handlePoll(ctx context.Context, uuid string, parts []string) string {
+	// Require nonce and HMAC for security
+	if len(parts) < 3 {
+		return "error=invalid_format"
+	}
+
+	nonce := parts[1]
+	receivedHMAC := parts[2]
+
 	// Verify session exists
 	session, ok := s.sessions.Get(uuid)
 	if !ok {
 		return "error=session_not_found"
+	}
+
+	// Verify HMAC with nonce (prevents replay attacks)
+	if !session.verifyHMAC("poll", nonce, "", receivedHMAC) {
+		common.Warn(nil, "DNS_POLL_HMAC_FAILED", uuid, "", nil)
+		return "error=invalid_hmac"
 	}
 
 	// Verify device is still registered (authentication check)
@@ -336,17 +370,68 @@ func (s *DNSServer) handlePoll(ctx context.Context, uuid string, parts []string)
 	}
 }
 
-// handleSend handles DNS send request
-// Format: send.<seq>.<chunk>.<data>.<uuid>.<domain>
+// handleSend handles DNS send request with proper chunking support
+// Format: send.<nonce>.<seq>.<chunk>.<totalChunks>.<data>.<hmac>.<uuid>.<domain>
 func (s *DNSServer) handleSend(ctx context.Context, uuid string, parts []string) string {
-	if len(parts) < 4 {
+	if len(parts) < 7 {
 		return "error=invalid_format"
+	}
+
+	nonce := parts[1]
+	seqStr := parts[2]
+	chunkStr := parts[3]
+	totalChunksStr := parts[4]
+	data := parts[5]
+	receivedHMAC := parts[6]
+
+	// Parse sequence and chunk numbers
+	seq, err := strconv.ParseUint(seqStr, 10, 32)
+	if err != nil {
+		return "error=invalid_seq"
+	}
+	chunk, err := strconv.ParseInt(chunkStr, 10, 32)
+	if err != nil {
+		return "error=invalid_chunk"
+	}
+	totalChunks, err := strconv.ParseInt(totalChunksStr, 10, 32)
+	if err != nil {
+		return "error=invalid_total_chunks"
+	}
+
+	// Enforce chunk limits (prevent abuse)
+	if totalChunks > int64(maxChunks) || totalChunks < 1 {
+		common.Warn(nil, "DNS_SEND_TOO_MANY_CHUNKS", uuid, "", map[string]any{
+			"total_chunks": totalChunks,
+			"max_chunks":   maxChunks,
+		})
+		return "error=too_many_chunks"
+	}
+
+	if chunk >= totalChunks || chunk < 0 {
+		return "error=invalid_chunk_index"
+	}
+
+	// Enforce size limits (prevent DNS abuse)
+	if len(data) > maxDataPartLength {
+		common.Warn(nil, "DNS_SEND_SIZE_EXCEEDED", uuid, "", map[string]any{
+			"data_len": len(data),
+			"max_len":  maxDataPartLength,
+		})
+		return "error=data_too_large"
 	}
 
 	// Verify session exists
 	session, ok := s.sessions.Get(uuid)
 	if !ok {
 		return "error=session_not_found"
+	}
+
+	// Verify HMAC with nonce (prevents replay attacks and tampering)
+	// Include seq+chunk in HMAC to prevent chunk reordering attacks
+	hmacData := fmt.Sprintf("%d:%d:%d:%s", seq, chunk, totalChunks, data)
+	if !session.verifyHMAC("send", nonce, hmacData, receivedHMAC) {
+		common.Warn(nil, "DNS_SEND_HMAC_FAILED", uuid, "", nil)
+		return "error=invalid_hmac"
 	}
 
 	// Verify device is still registered (authentication check)
@@ -359,16 +444,54 @@ func (s *DNSServer) handleSend(ctx context.Context, uuid string, parts []string)
 	// Update last seen
 	session.mu.Lock()
 	session.LastSeen = time.Now()
+
+	// Store chunk in buffer
+	seqKey := uint32(seq)
+	if _, exists := session.ChunkBuffer[seqKey]; !exists {
+		session.ChunkBuffer[seqKey] = make(map[int]string)
+	}
+	session.ChunkBuffer[seqKey][int(chunk)] = data
+
+	// Check if we have all chunks
+	if len(session.ChunkBuffer[seqKey]) != int(totalChunks) {
+		session.mu.Unlock()
+		// Still waiting for more chunks
+		return "ok"
+	}
+
+	// All chunks received - concatenate them in order
+	var reassembled strings.Builder
+	for i := 0; i < int(totalChunks); i++ {
+		chunkData, exists := session.ChunkBuffer[seqKey][i]
+		if !exists {
+			session.mu.Unlock()
+			return "error=missing_chunk"
+		}
+		reassembled.WriteString(chunkData)
+	}
+
+	// Clean up chunk buffer for this sequence
+	delete(session.ChunkBuffer, seqKey)
+
+	// Clean up old sequences (prevent memory leak)
+	if len(session.ChunkBuffer) > 10 {
+		// Keep only the 5 most recent sequences
+		var seqs []uint32
+		for s := range session.ChunkBuffer {
+			seqs = append(seqs, s)
+		}
+		// Sort and remove oldest
+		if len(seqs) > 5 {
+			for i := 0; i < len(seqs)-5; i++ {
+				delete(session.ChunkBuffer, seqs[i])
+			}
+		}
+	}
+
 	session.mu.Unlock()
 
-	// Extract seq, chunk, and data
-	// This is simplified - in production, implement proper chunk reassembly
-	// seq := parts[1]
-	// chunk := parts[2]
-	data := parts[3]
-
-	// Decode base32 data
-	decoded, err := decodeBase32(data)
+	// Decode base32 reassembled data
+	decoded, err := decodeBase32(reassembled.String())
 	if err != nil {
 		return "error=decode_failed"
 	}
@@ -393,6 +516,58 @@ func (s *DNSServer) handleSend(ctx context.Context, uuid string, parts []string)
 	return "ok"
 }
 
+// verifyHMAC verifies the HMAC signature for DNS queries
+// Format: <operation>.<nonce>.<data>.<hmac>.<uuid>.<domain>
+// HMAC = HMAC-SHA256(secret, operation+nonce+data+uuid)
+func (s *DNSSession) verifyHMAC(operation, nonce, data, receivedHMAC string) bool {
+	// Verify nonce is not reused (replay protection)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if nonce was already used
+	if _, exists := s.NonceCache[nonce]; exists {
+		return false
+	}
+
+	// Parse nonce timestamp (nonce should be Unix timestamp)
+	nonceTime, err := strconv.ParseInt(nonce, 10, 64)
+	if err != nil {
+		return false
+	}
+
+	// Verify nonce is within acceptable time window
+	now := time.Now().Unix()
+	if now-nonceTime > nonceWindow || nonceTime > now+10 {
+		return false
+	}
+
+	// Compute expected HMAC: HMAC-SHA256(secret, operation+nonce+data+uuid)
+	mac := hmac.New(sha256.New, s.Secret)
+	mac.Write([]byte(operation))
+	mac.Write([]byte(nonce))
+	mac.Write([]byte(data))
+	mac.Write([]byte(s.UUID))
+	expectedHMAC := hex.EncodeToString(mac.Sum(nil))
+
+	// Constant-time comparison
+	if !hmac.Equal([]byte(expectedHMAC), []byte(receivedHMAC)) {
+		return false
+	}
+
+	// Store nonce to prevent replay
+	s.NonceCache[nonce] = time.Now()
+
+	// Clean up old nonces
+	cutoff := time.Now().Add(-time.Duration(nonceWindow) * time.Second)
+	for n, t := range s.NonceCache {
+		if t.Before(cutoff) {
+			delete(s.NonceCache, n)
+		}
+	}
+
+	return true
+}
+
 // parseDNSQuery parses DNS query using proper DNS library
 func (s *DNSServer) parseDNSQuery(data []byte) (string, error) {
 	msg := new(dns.Msg)
@@ -404,9 +579,21 @@ func (s *DNSServer) parseDNSQuery(data []byte) (string, error) {
 		return "", errors.New("no questions in DNS query")
 	}
 
+	question := msg.Question[0]
+
+	// Enforce qtype: only allow TXT queries for tunneling
+	if question.Qtype != dns.TypeTXT {
+		return "", fmt.Errorf("invalid qtype: %d, only TXT queries allowed", question.Qtype)
+	}
+
+	// Enforce query name length limit
+	if len(question.Name) > maxQueryNameLength {
+		return "", fmt.Errorf("query name too long: %d bytes (max %d)", len(question.Name), maxQueryNameLength)
+	}
+
 	// Return the first question's name (without trailing dot)
-	name := msg.Question[0].Name
-	return strings.TrimSuffix(name, "."), nil
+	name := strings.TrimSuffix(question.Name, ".")
+	return name, nil
 }
 
 // sendErrorResponse sends a DNS error response

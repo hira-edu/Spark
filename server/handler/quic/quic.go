@@ -247,7 +247,7 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 		return nil, errors.New("missing uuid in handshake")
 	}
 
-	key, ok := handshake["key"]
+	_, ok = handshake["key"]
 	if !ok {
 		return nil, errors.New("missing key in handshake")
 	}

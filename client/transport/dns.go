@@ -3,10 +3,14 @@ package transport
 import (
 	"Spark/client/common"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -175,16 +179,28 @@ func (t *DNSTransport) pollLoop() {
 	}
 }
 
+// computeHMAC computes HMAC-SHA256 signature
+// HMAC = HMAC-SHA256(secret, operation+nonce+data+uuid)
+func (t *DNSTransport) computeHMAC(operation, nonce, data string) string {
+	mac := hmac.New(sha256.New, t.secret)
+	mac.Write([]byte(operation))
+	mac.Write([]byte(nonce))
+	mac.Write([]byte(data))
+	mac.Write([]byte(t.uuid))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // poll makes a DNS query to check for encrypted messages
-// Format: poll.<seq>.<uuid>.<domain>
+// Format: poll.<nonce>.<hmac>.<uuid>.<domain>
 // Response: TXT record with base32-encoded encrypted data
 func (t *DNSTransport) poll() ([]byte, error) {
-	t.mu.Lock()
-	seq := t.seq
-	t.seq++
-	t.mu.Unlock()
+	// Generate nonce (Unix timestamp)
+	nonce := strconv.FormatInt(time.Now().Unix(), 10)
 
-	query := fmt.Sprintf("poll.%d.%s.%s", seq, t.uuid, t.domain)
+	// Compute HMAC for replay protection
+	hmacSig := t.computeHMAC("poll", nonce, "")
+
+	query := fmt.Sprintf("poll.%s.%s.%s.%s", nonce, hmacSig, t.uuid, t.domain)
 
 	pollCtx, cancel := context.WithTimeout(t.ctx, 5*time.Second)
 	defer cancel()
@@ -233,9 +249,8 @@ func (t *DNSTransport) sendLoop() {
 	}
 }
 
-// send sends encrypted bytes via DNS query
-// Large messages are chunked across multiple DNS queries
-// Format: send.<seq>.<chunk>.<data>.<uuid>.<domain>
+// send sends encrypted bytes via DNS query with proper chunking
+// Format: send.<nonce>.<seq>.<chunk>.<totalChunks>.<data>.<hmac>.<uuid>.<domain>
 func (t *DNSTransport) send(encData []byte) error {
 	// Encode encrypted data to base32 (DNS-safe)
 	encoded := encodeBase32(encData)
@@ -248,9 +263,21 @@ func (t *DNSTransport) send(encData []byte) error {
 	t.seq++
 	t.mu.Unlock()
 
+	totalChunks := len(chunks)
+
+	// Generate nonce (Unix timestamp) - reuse for all chunks in this sequence
+	nonce := strconv.FormatInt(time.Now().Unix(), 10)
+
 	// Send each chunk as a separate DNS query
 	for i, chunk := range chunks {
-		query := fmt.Sprintf("send.%d.%d.%s.%s.%s", seq, i, chunk, t.uuid, t.domain)
+		// Compute HMAC including seq/chunk to prevent reordering
+		// Must match server format: seq:chunk:totalChunks:data
+		hmacData := fmt.Sprintf("%d:%d:%d:%s", seq, i, totalChunks, chunk)
+		hmacSig := t.computeHMAC("send", nonce, hmacData)
+
+		// Build query: send.<nonce>.<seq>.<chunk>.<totalChunks>.<data>.<hmac>.<uuid>.<domain>
+		query := fmt.Sprintf("send.%s.%d.%d.%d.%s.%s.%s.%s",
+			nonce, seq, i, totalChunks, chunk, hmacSig, t.uuid, t.domain)
 
 		// Validate DNS name length
 		if len(query) > maxDNSNameLength {
@@ -263,7 +290,9 @@ func (t *DNSTransport) send(encData []byte) error {
 		cancel()
 
 		// Small delay between chunks to avoid rate limiting
-		time.Sleep(100 * time.Millisecond)
+		if i < len(chunks)-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
 	return nil
