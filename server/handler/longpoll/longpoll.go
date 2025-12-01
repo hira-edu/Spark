@@ -375,6 +375,16 @@ func Send(ctx *gin.Context) {
 		return
 	}
 
+	// Check rate limit (backpressure)
+	if !session.RateLimiter.Allow() {
+		ctx.AbortWithStatus(http.StatusTooManyRequests) // 429
+		span.SetStatus(codes.Error, "rate limit exceeded")
+		common.Warn(ctx, "LONGPOLL_SEND_RATE_LIMIT", uuid, "", map[string]any{
+			"rate_limit_qps": sendRateLimitQPS,
+		})
+		return
+	}
+
 	// Update last seen
 	session.updateLastSeen()
 

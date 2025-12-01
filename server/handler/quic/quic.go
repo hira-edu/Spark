@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -33,18 +34,23 @@ const (
 	maxMessageSize        = common.MaxMessageSize
 	maxConcurrentStreams  = 100
 	keepAlivePeriod       = 30 * time.Second
+
+	// Rate limiting constants
+	messageRateLimitQPS   = 10  // Messages per second per UUID
+	messageRateLimitBurst = 20  // Burst allowance per UUID
 )
 
 // QUICSession represents a QUIC connection session
 type QUICSession struct {
-	UUID       string
-	Secret     []byte
-	Conn       *quic.Conn
-	Stream     *quic.Stream
-	LastSeen   time.Time
-	mu         sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	UUID         string
+	Secret       []byte
+	Conn         *quic.Conn
+	Stream       *quic.Stream
+	LastSeen     time.Time
+	RateLimiter  *rate.Limiter // Per-UUID rate limiter
+	mu           sync.RWMutex
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // QUICServer manages QUIC connections
@@ -275,13 +281,14 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	session := &QUICSession{
-		UUID:     connUUID,
-		Secret:   secret,
-		Conn:     conn,
-		Stream:   stream,
-		LastSeen: time.Now(),
-		ctx:      sessionCtx,
-		cancel:   cancel,
+		UUID:        connUUID,
+		Secret:      secret,
+		Conn:        conn,
+		Stream:      stream,
+		LastSeen:    time.Now(),
+		RateLimiter: rate.NewLimiter(rate.Limit(messageRateLimitQPS), messageRateLimitBurst),
+		ctx:         sessionCtx,
+		cancel:      cancel,
 	}
 
 	// Send handshake response
@@ -331,6 +338,24 @@ func (s *QUICServer) handleSession(session *QUICSession) {
 		}
 
 		if n == 0 {
+			continue
+		}
+
+		// Enforce per-message size guard (prevent oversized messages before decrypt)
+		if n > maxMessageSize {
+			common.Warn(nil, "QUIC_MESSAGE_TOO_LARGE", session.UUID, "", map[string]any{
+				"message_size": n,
+				"max_size":     maxMessageSize,
+			})
+			return
+		}
+
+		// Check rate limit (backpressure)
+		if !session.RateLimiter.Allow() {
+			common.Warn(nil, "QUIC_MESSAGE_RATE_LIMIT", session.UUID, "", map[string]any{
+				"rate_limit_qps": messageRateLimitQPS,
+			})
+			// Continue reading but drop the message
 			continue
 		}
 
