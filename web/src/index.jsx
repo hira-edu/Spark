@@ -1,6 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom';
-import {BrowserRouter as Router, Route, Routes} from 'react-router-dom';
+import {BrowserRouter, Route, Routes} from 'react-router-dom';
 import Wrapper from './components/wrapper';
 import AuthGuard from './components/AuthGuard';
 import { AuthProvider } from './context/AuthContext';
@@ -65,7 +65,7 @@ axios.interceptors.response.use(async res => {
 });
 
 ReactDOM.render(
-	<Router>
+	<BrowserRouter>
 		<AuthProvider>
 			<Routes>
 				{/* Public routes */}
@@ -86,6 +86,6 @@ ReactDOM.render(
 				<Route path="*" element={<Err/>}/>
 			</Routes>
 		</AuthProvider>
-	</Router>,
+	</BrowserRouter>,
 	document.getElementById('root')
 );

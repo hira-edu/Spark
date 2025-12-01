@@ -12,7 +12,8 @@ module.exports = (env, args) => {
     return {
         entry: path.join(__dirname, 'src/index.jsx'),
         output: {
-            publicPath: mode === 'development' ? undefined : './',
+            // Use absolute URLs so BrowserRouter deep links load assets correctly
+            publicPath: '/',
             path: path.resolve(__dirname, 'dist'),
             filename: '[name].[contenthash:7].js'
         },
@@ -165,6 +166,7 @@ module.exports = (env, args) => {
             port: 3000,
             open: true,
             hot: true,
+            historyApiFallback: true,
             proxy: {
                 '/api/': {
                     target: 'http://localhost:8001/',

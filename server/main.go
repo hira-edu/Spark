@@ -5,8 +5,8 @@ import (
 	"Rocket/server/common"
 	"Rocket/server/config"
 	"Rocket/server/handler"
-	authHandler "Rocket/server/handler/auth"
 	"Rocket/server/handler/audio"
+	authHandler "Rocket/server/handler/auth"
 	"Rocket/server/handler/desktop"
 	dnshandler "Rocket/server/handler/dns"
 	quichandler "Rocket/server/handler/quic"
@@ -101,19 +101,17 @@ func main() {
 				return
 			}
 
-			// Serve static file if it exists, otherwise fall back to SPA index.html
-			if serveGzip(ctx, webFS) || checkCache(ctx, webFS) {
+			// Serve static asset (gzip/plain) if present; otherwise return SPA shell
+			if serveGzip(ctx, webFS) || serveStatic(ctx, webFS) {
 				return
 			}
 
-			f, err := webFS.Open("/index.html")
-			if err != nil {
-				http.FileServer(webFS).ServeHTTP(ctx.Writer, ctx.Request)
+			if ctx.Request.Method != http.MethodGet && ctx.Request.Method != http.MethodHead {
+				ctx.Status(http.StatusNotFound)
 				return
 			}
-			defer f.Close()
-			ctx.Header("Content-Type", "text/html; charset=utf-8")
-			io.Copy(ctx.Writer, f)
+
+			serveIndex(ctx, webFS)
 		})
 	}
 
@@ -666,7 +664,7 @@ func checkAuth() gin.HandlerFunc {
 
 func serveGzip(ctx *gin.Context, statikFS http.FileSystem) bool {
 	headers := ctx.Request.Header
-	filename := path.Clean(ctx.Request.RequestURI)
+	filename := path.Clean(ctx.Request.URL.Path)
 	if !strings.Contains(headers.Get(`Accept-Encoding`), `gzip`) {
 		return false
 	}
@@ -683,24 +681,22 @@ func serveGzip(ctx *gin.Context, statikFS http.FileSystem) bool {
 	}
 	defer file.Close()
 
-	file.Seek(0, io.SeekStart)
+	ctx.Header(`Vary`, `Accept-Encoding`)
+	if applyCacheHeaders(ctx, filename) {
+		return true
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+
 	conn, ok := ctx.Request.Context().Value(`Conn`).(net.Conn)
 	if !ok {
 		return false
 	}
 
-	etag := fmt.Sprintf(`"%x-%s"`, []byte(filename), config.Commit)
-	if headers.Get(`If-None-Match`) == etag {
-		ctx.Status(http.StatusNotModified)
-		return true
-	}
-	ctx.Header(`Cache-Control`, `max-age=604800`)
-	ctx.Header(`ETag`, etag)
-	ctx.Header(`Expires`, utils.Now.Add(7*24*time.Hour).Format(`Mon, 02 Jan 2006 15:04:05 GMT`))
-
 	ctx.Writer.Header().Del(`Content-Length`)
 	ctx.Header(`Content-Encoding`, `gzip`)
-	ctx.Header(`Vary`, `Accept-Encoding`)
 	ctx.Status(http.StatusOK)
 
 	for {
@@ -727,9 +723,53 @@ func serveGzip(ctx *gin.Context, statikFS http.FileSystem) bool {
 	return true
 }
 
-func checkCache(ctx *gin.Context, _ http.FileSystem) bool {
-	filename := path.Clean(ctx.Request.RequestURI)
+func serveStatic(ctx *gin.Context, statikFS http.FileSystem) bool {
+	if ctx.Request.Method != http.MethodGet && ctx.Request.Method != http.MethodHead {
+		return false
+	}
 
+	filename := path.Clean(ctx.Request.URL.Path)
+	file, err := statikFS.Open(filename)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil || info.IsDir() {
+		return false
+	}
+
+	if applyCacheHeaders(ctx, filename) {
+		return true
+	}
+
+	http.ServeContent(ctx.Writer, ctx.Request, filename, info.ModTime(), file)
+	return true
+}
+
+func serveIndex(ctx *gin.Context, statikFS http.FileSystem) {
+	f, err := statikFS.Open("/index.html")
+	if err != nil {
+		http.FileServer(statikFS).ServeHTTP(ctx.Writer, ctx.Request)
+		return
+	}
+	defer f.Close()
+
+	ctx.Header("Content-Type", "text/html; charset=utf-8")
+	ctx.Header("Cache-Control", "no-cache")
+	ctx.Header("Pragma", "no-cache")
+	ctx.Header("Expires", "0")
+	ctx.Status(http.StatusOK)
+
+	if ctx.Request.Method == http.MethodHead {
+		return
+	}
+
+	io.Copy(ctx.Writer, f)
+}
+
+func applyCacheHeaders(ctx *gin.Context, filename string) bool {
 	etag := fmt.Sprintf(`"%x-%s"`, []byte(filename), config.Commit)
 	if ctx.Request.Header.Get(`If-None-Match`) == etag {
 		ctx.Status(http.StatusNotModified)

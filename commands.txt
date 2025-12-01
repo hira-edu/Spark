@@ -1,0 +1,46 @@
+# Copy and paste these commands one at a time
+
+# Step 1: Build Frontend
+cd /root/Rocket/web && NODE_ENV=production npx webpack --mode production
+
+# Step 2: Verify frontend build
+ls -lh /root/Rocket/web/dist/index.html
+
+# Step 3: Regenerate statik embeddings
+cd /root/Rocket && ~/go/bin/statik -src=./web/dist -dest=./server/embed -f -ns=web -p=web
+
+# Step 4: Verify statik generation
+ls -lh /root/Rocket/server/embed/web/statik.go
+
+# Step 5: Build server
+cd /root/Rocket && COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "dev") && CGO_ENABLED=0 go build -ldflags "-s -w -X 'Rocket/server/config.Commit=$COMMIT'" -tags=jsoniter -o ./rocket-server Rocket/server
+
+# Step 6: Verify server binary
+ls -lh /root/Rocket/rocket-server
+
+# Step 7: Check current server process
+ps aux | grep rocket-server | grep -v grep
+
+# Step 8: Stop current server
+pkill -f rocket-server
+
+# Step 9: Verify server stopped (should show nothing)
+sleep 2 && ps aux | grep rocket-server | grep -v grep
+
+# Step 10: Start new server
+cd /root/Rocket && nohup ./rocket-server > /tmp/rocket-server.log 2>&1 &
+
+# Step 11: Get the server PID (note this down)
+echo $!
+
+# Step 12: Wait for server to start
+sleep 3
+
+# Step 13: Verify server is running
+ps aux | grep rocket-server | grep -v grep
+
+# Step 14: Check server logs
+tail -50 /tmp/rocket-server.log
+
+# Step 15: Test server (adjust port if needed)
+# curl -I http://localhost:7896

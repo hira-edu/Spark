@@ -102,7 +102,7 @@ func Login(ctx *gin.Context) {
 		int((24 * time.Hour).Seconds()),
 		"/",
 		"",
-		false, // Set to true if using HTTPS
+		true,  // Secure - required for HTTPS
 		true,  // HttpOnly
 	)
 
@@ -140,7 +140,7 @@ func Logout(ctx *gin.Context) {
 	}
 
 	// Clear cookie
-	ctx.SetCookie("Authorization", "", -1, "/", "", false, true)
+	ctx.SetCookie("Authorization", "", -1, "/", "", true, true)
 
 	ctx.JSON(200, modules.Packet{Code: 0})
 }
