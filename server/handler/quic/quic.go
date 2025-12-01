@@ -241,8 +241,8 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 		return nil, fmt.Errorf("parse handshake failed: %w", err)
 	}
 
-	// Extract UUID and Key
-	uuid, ok := handshake["uuid"]
+	// Extract device ID and Key
+	deviceID, ok := handshake["uuid"]
 	if !ok {
 		return nil, errors.New("missing uuid in handshake")
 	}
@@ -252,10 +252,17 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 		return nil, errors.New("missing key in handshake")
 	}
 
-	// Verify device
-	device, ok := common.CheckDevice(uuid, key)
+	// Verify device exists and get connection UUID
+	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
+	connUUID, ok := common.CheckDevice(deviceID, "")
 	if !ok {
-		return nil, errors.New("invalid credentials")
+		return nil, errors.New("device not found")
+	}
+
+	// Verify the device exists in Devices map
+	device, ok := common.Devices.Get(connUUID)
+	if !ok || device.ID != deviceID {
+		return nil, errors.New("invalid device state")
 	}
 
 	// Generate a fresh random secret for this session (security best practice)
@@ -263,13 +270,12 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 	if _, err := io.ReadFull(cryptoRand.Reader, secret); err != nil {
 		return nil, fmt.Errorf("failed to generate secret: %w", err)
 	}
-	_ = device // Device verified but not used for secret generation
 
 	// Create session context
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	session := &QUICSession{
-		UUID:     uuid,
+		UUID:     connUUID,
 		Secret:   secret,
 		Conn:     conn,
 		Stream:   stream,

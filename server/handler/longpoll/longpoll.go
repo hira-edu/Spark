@@ -247,9 +247,9 @@ func Poll(ctx *gin.Context) {
 	}
 
 	secret, err := hex.DecodeString(secretHex)
-	if err != nil {
+	if err != nil || len(secret) != 32 {
 		ctx.AbortWithStatus(http.StatusBadRequest)
-		span.SetStatus(codes.Error, "invalid secret format")
+		span.SetStatus(codes.Error, "invalid secret format or length")
 		return
 	}
 
@@ -347,9 +347,9 @@ func Send(ctx *gin.Context) {
 	}
 
 	secret, err := hex.DecodeString(secretHex)
-	if err != nil {
+	if err != nil || len(secret) != 32 {
 		ctx.AbortWithStatus(http.StatusBadRequest)
-		span.SetStatus(codes.Error, "invalid secret format")
+		span.SetStatus(codes.Error, "invalid secret format or length")
 		return
 	}
 
