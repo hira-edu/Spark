@@ -1,3 +1,7 @@
+//go:build (!linux || stub) && stub
+// +build !linux stub
+// +build stub
+
 package webcam
 
 import (
@@ -26,4 +30,19 @@ func KillWebcam(pack modules.Packet) {
 
 func HandleSelect(pack modules.Packet) error {
 	return errUnsupported
+}
+
+func GetFrameData() <-chan []byte {
+	return nil
+}
+
+func GetSessionUUID() string {
+	return ""
+}
+
+func IsRunning() bool {
+	return false
+}
+
+func Cleanup() {
 }

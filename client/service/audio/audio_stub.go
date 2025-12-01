@@ -1,3 +1,6 @@
+//go:build stub
+// +build stub
+
 package audio
 
 import (
@@ -27,4 +30,19 @@ func KillAudio(pack modules.Packet) {
 
 func HandleSelect(pack modules.Packet) error {
 	return errUnsupported
+}
+
+func GetAudioData() <-chan []byte {
+	return nil
+}
+
+func GetSessionUUID() string {
+	return ""
+}
+
+func IsRunning() bool {
+	return false
+}
+
+func Cleanup() {
 }
