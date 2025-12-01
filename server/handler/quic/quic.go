@@ -8,7 +8,9 @@ import (
 	"Spark/utils"
 	"Spark/utils/cmap"
 	"context"
+	"crypto/hmac"
 	cryptoRand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"golang.org/x/crypto/hkdf"
 	"golang.org/x/time/rate"
 )
 
@@ -59,6 +62,7 @@ type QUICServer struct {
 	sessions      cmap.ConcurrentMap[string, *QUICSession]
 	tlsConfig     *tls.Config
 	addr          string
+	hmacKey       []byte // Server HMAC key material for handshake authentication
 	mu            sync.RWMutex
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -83,10 +87,18 @@ func init() {
 func NewQUICServer(addr string, tlsConfig *tls.Config) (*QUICServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Generate server HMAC key material for handshake authentication
+	hmacKey := make([]byte, 32)
+	if _, err := io.ReadFull(cryptoRand.Reader, hmacKey); err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to generate HMAC key: %w", err)
+	}
+
 	server := &QUICServer{
 		addr:      addr,
 		tlsConfig: tlsConfig,
 		sessions:  cmap.New[*QUICSession](),
+		hmacKey:   hmacKey,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
