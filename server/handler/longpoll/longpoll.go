@@ -3,6 +3,7 @@ package longpoll
 import (
 	"Spark/modules"
 	"Spark/server/common"
+	"Spark/server/handler/audio"
 	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/cmap"
@@ -167,23 +168,33 @@ func Handshake(ctx *gin.Context) {
 	defer span.End()
 	ctx.Request = ctx.Request.WithContext(ctxSpan)
 
-	// Extract UUID and Key from headers
-	uuid := ctx.GetHeader("UUID")
+	// Extract device ID and Key from headers
+	deviceID := ctx.GetHeader("UUID")
 	key := ctx.GetHeader("Key")
 
-	if uuid == "" || key == "" {
+	if deviceID == "" || key == "" {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.SetStatus(codes.Error, "missing UUID or Key")
 		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "missing_credentials", "", nil)
 		return
 	}
 
-	// Verify device exists
-	_, ok := common.CheckDevice(uuid, key)
+	// Verify device exists and get connection UUID
+	// CheckDevice(deviceID, "") searches for device by ID and returns connUUID
+	connUUID, ok := common.CheckDevice(deviceID, "")
 	if !ok {
 		ctx.AbortWithStatus(http.StatusUnauthorized)
-		span.SetStatus(codes.Error, "invalid credentials")
-		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "invalid_credentials", uuid, nil)
+		span.SetStatus(codes.Error, "device not found")
+		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "device_not_found", deviceID, nil)
+		return
+	}
+
+	// Verify the device key matches
+	device, ok := common.Devices.Get(connUUID)
+	if !ok || device.ID != deviceID {
+		ctx.AbortWithStatus(http.StatusUnauthorized)
+		span.SetStatus(codes.Error, "invalid device state")
+		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "invalid_device_state", deviceID, nil)
 		return
 	}
 
@@ -194,12 +205,12 @@ func Handshake(ctx *gin.Context) {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "failed to generate secret")
-		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "secret_generation_failed", uuid, nil)
+		common.Warn(ctx, "LONGPOLL_HANDSHAKE_FAILED", "secret_generation_failed", deviceID, nil)
 		return
 	}
 
-	// Create session
-	session := sessionManager.createSession(uuid, secret)
+	// Create session using connUUID (not deviceID)
+	session := sessionManager.createSession(connUUID, secret)
 
 	// Return secret in header
 	ctx.Header("Secret", hex.EncodeToString(session.Secret))
@@ -207,12 +218,14 @@ func Handshake(ctx *gin.Context) {
 	ctx.Status(http.StatusOK)
 
 	span.SetAttributes(
-		attribute.String("longpoll.uuid", uuid),
+		attribute.String("longpoll.conn_uuid", connUUID),
+		attribute.String("longpoll.device_id", deviceID),
 		attribute.Int("longpoll.secret_len", len(secret)),
 	)
 
-	common.Info(ctx, "LONGPOLL_HANDSHAKE_SUCCESS", uuid, "", map[string]any{
+	common.Info(ctx, "LONGPOLL_HANDSHAKE_SUCCESS", connUUID, "", map[string]any{
 		"transport": "longpoll",
+		"device_id": deviceID,
 	})
 }
 
@@ -409,6 +422,15 @@ func routePacket(uuid string, packet *modules.Packet) error {
 	common.Info(nil, "LONGPOLL_PACKET_RECEIVED", uuid, packet.Act, map[string]any{
 		"packet_act": packet.Act,
 	})
+
+	// Handle AUDIO_DATA packets (streaming audio from client)
+	if packet.Act == `AUDIO_DATA` {
+		if err := audio.HandleAudioData(*packet, uuid); err != nil {
+			common.Warn(nil, "LONGPOLL_AUDIO_DATA_ERROR", uuid, err.Error(), nil)
+			return err
+		}
+		return nil
+	}
 
 	// Handle DEVICE_UP and DEVICE_UPDATE packets specially (same as WebSocket)
 	if packet.Act == `DEVICE_UP` || packet.Act == `DEVICE_UPDATE` {

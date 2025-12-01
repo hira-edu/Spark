@@ -6,6 +6,7 @@ import (
 	"Spark/server/common"
 	"Spark/server/config"
 	"Spark/server/handler"
+	"Spark/server/handler/audio"
 	"Spark/server/handler/desktop"
 	dnshandler "Spark/server/handler/dns"
 	quichandler "Spark/server/handler/quic"
@@ -432,6 +433,15 @@ func wsOnMessageBinary(session *melody.Session, data []byte) {
 	if pack.Act == `DEVICE_UP` || pack.Act == `DEVICE_UPDATE` {
 		session.Set(`LastPack`, utils.Unix)
 		utility.OnDevicePack(data, session)
+		return
+	}
+
+	// Handle AUDIO_DATA packets (streaming audio from client)
+	if pack.Act == `AUDIO_DATA` {
+		if err := audio.HandleAudioData(pack, session.UUID); err != nil {
+			common.Warn(nil, "WS_AUDIO_DATA_ERROR", session.UUID, err.Error(), nil)
+		}
+		session.Set(`LastPack`, utils.Unix)
 		return
 	}
 	if !common.Devices.Has(session.UUID) {

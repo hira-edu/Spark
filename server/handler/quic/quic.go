@@ -3,6 +3,7 @@ package quic
 import (
 	"Spark/modules"
 	"Spark/server/common"
+	"Spark/server/handler/audio"
 	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/cmap"
@@ -361,6 +362,15 @@ func (s *QUICServer) routePacket(uuid string, packet *modules.Packet) error {
 	common.Info(nil, "QUIC_PACKET_RECEIVED", uuid, packet.Act, map[string]any{
 		"packet_act": packet.Act,
 	})
+
+	// Handle AUDIO_DATA packets (streaming audio from client)
+	if packet.Act == `AUDIO_DATA` {
+		if err := audio.HandleAudioData(*packet, uuid); err != nil {
+			common.Warn(nil, "QUIC_AUDIO_DATA_ERROR", uuid, err.Error(), nil)
+			return err
+		}
+		return nil
+	}
 
 	// Handle DEVICE_UP and DEVICE_UPDATE packets specially (same as WebSocket)
 	if packet.Act == `DEVICE_UP` || packet.Act == `DEVICE_UPDATE` {

