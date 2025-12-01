@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 var logWriter *os.File
@@ -70,6 +72,12 @@ func getLog(ctx any, event, status, msg string, args map[string]any) string {
 			c := ctx.(*gin.Context)
 			args[`from`] = GetRealIP(c)
 			connUUID, targetInfo = c.Request.Context().Value(`ConnUUID`).(string)
+			if span := trace.SpanFromContext(c.Request.Context()); span != nil {
+				if sc := span.SpanContext(); sc.IsValid() {
+					args[`trace_id`] = sc.TraceID().String()
+					args[`span_id`] = sc.SpanID().String()
+				}
+			}
 		case *melody.Session:
 			s := ctx.(*melody.Session)
 			args[`from`] = GetAddrIP(s.GetWSConn().UnderlyingConn().RemoteAddr())

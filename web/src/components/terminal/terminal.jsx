@@ -1,10 +1,7 @@
 import React from 'react';
 import { Modal } from 'antd';
 import { TerminalPanel } from '../features/terminal';
-import i18n from '../../locale/locale';
 import './terminal.modal.css';
-
-const title = i18n.t('TERMINAL.TITLE');
 
 /**
  * TerminalModal - Modal wrapper for the new TerminalPanel component
@@ -19,16 +16,17 @@ function TerminalModal(props) {
 
   return (
     <Modal
-      title={`${title} - ${device.hostname || 'Unknown'}`}
       open={open}
       onCancel={onCancel}
       footer={null}
       width="80vw"
       style={{ top: 40 }}
-      bodyStyle={{ padding: 0, height: 'calc(80vh - 55px)', overflow: 'hidden' }}
+      bodyStyle={{ padding: 0, height: '80vh', overflow: 'hidden' }}
       destroyOnClose
       maskClosable={false}
       className="terminal-modal"
+      closable={false}
+      focusTriggerAfterClose={false}
     >
       <div className="terminal-modal-content">
         <TerminalPanel

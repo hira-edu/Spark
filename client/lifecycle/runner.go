@@ -145,6 +145,14 @@ func (r *Runner) Run(mode RunMode) error {
 		golog.Info("runner: Mode = CONSOLE (running in user session, will connect to server)")
 		return r.app.Run(context.Background())
 
+	case RunModeUIOnly:
+		// UI-only mode: no WebSocket connection, Session 0 service handles communication
+		golog.Info("runner: Mode = UI_ONLY (UI in user session, no WebSocket connection)")
+		golog.Info("runner: Session 0 service maintains server connection, this process handles UI only")
+		// Simply keep the process alive for UI/tray icon purposes
+		// The Session 0 service maintains the actual WebSocket connection
+		select {} // Block forever (process stays alive for UI purposes)
+
 	case RunModeUpdate:
 		// Update mode is handled separately in client.go
 		golog.Info("runner: Mode = UPDATE")

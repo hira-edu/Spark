@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	inputMouse    = 0
-	inputKeyboard = 1
+	inputTypeMouse    = 0
+	inputTypeKeyboard = 1
 
 	mouseeventfMove           = 0x0001
 	mouseeventfLeftDown       = 0x0002
@@ -43,6 +43,14 @@ const (
 
 // https://learn.microsoft.com/windows/win32/hidpi/wm-dpichanged#dpi-awareness-context
 const dpiContextPerMonitorAwareV2 = -4
+
+// System metrics constants
+const (
+	smCxVirtualScreen = 78
+	smCyVirtualScreen = 79
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+)
 
 type mouseInput struct {
 	Dx          int32
@@ -76,7 +84,7 @@ type inputKeyboard struct {
 func sendMouse(mi mouseInput) error {
 	ensureDPI()
 	ensureAwake()
-	in := inputMouse{Type: inputMouse, Mi: mi}
+	in := inputMouse{Type: inputTypeMouse, Mi: mi}
 	ret, _, err := procSendInput.Call(
 		uintptr(1),
 		uintptr(unsafe.Pointer(&in)),
@@ -84,7 +92,7 @@ func sendMouse(mi mouseInput) error {
 	)
 	if ret == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
-			return windows.EINVAL
+			return windows.ERROR_INVALID_PARAMETER
 		}
 		return err
 	}
@@ -94,7 +102,7 @@ func sendMouse(mi mouseInput) error {
 func sendKeyboard(ki keyboardInput) error {
 	ensureDPI()
 	ensureAwake()
-	in := inputKeyboard{Type: inputKeyboard, Ki: ki}
+	in := inputKeyboard{Type: inputTypeKeyboard, Ki: ki}
 	ret, _, err := procSendInput.Call(
 		uintptr(1),
 		uintptr(unsafe.Pointer(&in)),
@@ -102,7 +110,7 @@ func sendKeyboard(ki keyboardInput) error {
 	)
 	if ret == 0 {
 		if err == nil || err == windows.ERROR_SUCCESS {
-			return windows.EINVAL
+			return windows.ERROR_INVALID_PARAMETER
 		}
 		return err
 	}
@@ -212,19 +220,27 @@ func normalizeAbsolute(coord, origin, size int) int32 {
 }
 
 func virtualDesktop() (x, y, width, height int) {
-	x = int(windows.GetSystemMetrics(windows.SM_XVIRTUALSCREEN))
-	y = int(windows.GetSystemMetrics(windows.SM_YVIRTUALSCREEN))
-	width = int(windows.GetSystemMetrics(windows.SM_CXVIRTUALSCREEN))
-	height = int(windows.GetSystemMetrics(windows.SM_CYVIRTUALSCREEN))
+	r1, _, _ := procGetSystemMetrics.Call(uintptr(smXVirtualScreen))
+	x = int(r1)
+	r2, _, _ := procGetSystemMetrics.Call(uintptr(smYVirtualScreen))
+	y = int(r2)
+	r3, _, _ := procGetSystemMetrics.Call(uintptr(smCxVirtualScreen))
+	width = int(r3)
+	r4, _, _ := procGetSystemMetrics.Call(uintptr(smCyVirtualScreen))
+	height = int(r4)
 	return
 }
 
 var (
-	user32        = windows.NewLazySystemDLL("user32.dll")
-	procSendInput = user32.NewProc("SendInput")
-	procSetDPI    = user32.NewProc("SetThreadDpiAwarenessContext")
-	onceDPI       sync.Once
-	onceAwake     sync.Once
+	user32                    = windows.NewLazySystemDLL("user32.dll")
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	procSendInput             = user32.NewProc("SendInput")
+	procSetDPI                = user32.NewProc("SetThreadDpiAwarenessContext")
+	procGetSystemMetrics      = user32.NewProc("GetSystemMetrics")
+	procMapVirtualKeyEx       = user32.NewProc("MapVirtualKeyExW")
+	procSetThreadExecutionState = kernel32.NewProc("SetThreadExecutionState")
+	onceDPI                   sync.Once
+	onceAwake                 sync.Once
 )
 
 const mapvkVkToVsc = 0
@@ -256,7 +272,8 @@ func lookupKey(key string) (uint16, uint16, bool) {
 }
 
 func scancodeForVK(vk uint16) uint16 {
-	return uint16(windows.MapVirtualKeyEx(uint32(vk), mapvkVkToVsc, 0))
+	ret, _, _ := procMapVirtualKeyEx.Call(uintptr(vk), uintptr(mapvkVkToVsc), 0)
+	return uint16(ret)
 }
 
 func functionVK(key string) uint16 {
@@ -329,13 +346,16 @@ func ensureDPI() {
 		if procSetDPI == nil {
 			return
 		}
-		procSetDPI.Call(uintptr(dpiContextPerMonitorAwareV2))
+		// DPI_AWARENESS_CONTEXT is a handle represented as uintptr
+		// -4 is a special predefined value that needs to be cast via ^uintptr(3)
+		// This is equivalent to (uintptr)(intptr)(-4)
+		procSetDPI.Call(^uintptr(3)) // -4 as uintptr
 	})
 }
 
 func ensureAwake() {
 	// keep display/system awake while input is being injected
 	onceAwake.Do(func() {
-		windows.SetThreadExecutionState(esContinuous | esSystemRequired | esDisplayRequired)
+		procSetThreadExecutionState.Call(uintptr(esContinuous | esSystemRequired | esDisplayRequired))
 	})
 }

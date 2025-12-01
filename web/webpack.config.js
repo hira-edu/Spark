@@ -2,7 +2,7 @@ const path = require("path");
 const esbuild = require('esbuild');
 const HtmlWebpackPlugin = require("html-webpack-plugin");
 const CopyWebpackPlugin = require("copy-webpack-plugin");
-const {EsbuildPlugin} = require("esbuild-loader");
+const { ESBuildMinifyPlugin } = require("esbuild-loader");
 const {CleanWebpackPlugin} = require("clean-webpack-plugin");
 const AntdDayjsWebpackPlugin = require("antd-dayjs-webpack-plugin");
 const CompressionPlugin = require("compression-webpack-plugin");
@@ -70,7 +70,11 @@ module.exports = (env, args) => {
                 appMountId: 'root',
                 template:  path.resolve(__dirname, 'public/index.html'),
                 filename: 'index.html',
-                inject: true
+                inject: true,
+                favicon: false,
+                meta: {
+                    'theme-color': '#FFFFFF'
+                }
             }),
             new CleanWebpackPlugin(),
             new AntdDayjsWebpackPlugin(),
@@ -97,7 +101,7 @@ module.exports = (env, args) => {
         optimization: {
             minimize: mode === 'production',
             minimizer: [
-                new EsbuildPlugin({
+                new ESBuildMinifyPlugin({
                     css: true,
                     target: 'es2015',
                     implementation: esbuild,

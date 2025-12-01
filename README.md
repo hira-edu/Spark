@@ -336,6 +336,15 @@ Some major dependencies are listed below.
 
 ---
 
+## 📈 Observability
+
+- Server tracing is opt-in via OTLP: set `OTEL_EXPORTER_OTLP_ENDPOINT` (and optionally `SPARK_TRACE_SAMPLE_RATIO`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_INSECURE=true`).
+- HTTP spans are instrumented with `otelgin`; server logs now include `trace_id`/`span_id` when present.
+- Agents expose `/metrics`, `/health`, `/ready` on `:9090` when running as a service.
+- Use the reference collector config at `observability/otel-collector.yaml` and the guide in `docs/observability.md` to ship logs (server, agent, Caddy), traces (OTLP), and metrics (Prometheus/remote_write) to your stack.
+
+---
+
 ## 📜 License
 
 Distributed under the [BSD-2 License](./LICENSE).

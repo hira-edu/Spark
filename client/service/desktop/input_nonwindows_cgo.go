@@ -5,6 +5,13 @@ package desktop
 
 import "github.com/go-vgo/robotgo"
 
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 func movePointerAbsolute(x, y int) error {
 	robotgo.MoveMouse(x, y)
 	return nil

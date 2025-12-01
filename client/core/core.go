@@ -3,17 +3,20 @@ package core
 import (
 	"Spark/client/common"
 	"Spark/client/config"
+	"Spark/client/telemetry"
 	"Spark/modules"
 	"Spark/utils"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +36,13 @@ var (
 	mu                sync.Mutex
 	cancel            context.CancelFunc
 	stopFlag          atomic.Bool
+
+	// Reconnection and circuit breaker
+	reconnectStrategy *telemetry.ReconnectStrategy
+	circuitBreaker    *telemetry.CircuitBreaker
+	connectionStart   time.Time
+	lastHeartbeat     time.Time
+	heartbeatMu       sync.RWMutex
 )
 
 // Start runs the main loop (backwards compatible)
@@ -47,9 +57,26 @@ func Start() {
 // StartWithContext runs the main loop with context for graceful shutdown
 func StartWithContext(ctx context.Context) error {
 	stopFlag.Store(false)
+
+	// Initialize reconnection strategy and circuit breaker
+	reconnectStrategy = telemetry.NewReconnectStrategy(
+		1*time.Second,  // base backoff
+		60*time.Second, // max backoff
+		0.2,            // ±20% jitter
+	)
+	circuitBreaker = telemetry.NewCircuitBreaker(
+		"websocket",     // name
+		10,              // 10 failures -> open
+		3,               // 3 successes -> close from half_open
+		5*time.Minute,   // wait 5 minutes before retry
+	)
+
 	golog.Info("run loop start")
+	telemetry.LogWSEvent("core started", map[string]interface{}{
+		"version": config.Commit,
+	})
+
 	for {
-		golog.Info("attempting websocket connect")
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
@@ -58,58 +85,123 @@ func StartWithContext(ctx context.Context) error {
 				common.WSConn.Close()
 				common.Mutex.Unlock()
 			}
+			telemetry.LogWSEvent("core stopped", map[string]interface{}{
+				"reason": ctx.Err().Error(),
+			})
 			return ctx.Err()
 		default:
 		}
 
 		if stopFlag.Load() {
+			telemetry.LogWSEvent("core stopped", map[string]interface{}{
+				"reason": "stop flag set",
+			})
 			return nil
 		}
 
-		var err error
-		if common.WSConn != nil {
-			common.Mutex.Lock()
-			common.WSConn.Close()
-			common.Mutex.Unlock()
-		}
-		common.Mutex.Lock()
-		common.WSConn, err = connectWS()
-		common.Mutex.Unlock()
+		// Circuit breaker protection
+		err := circuitBreaker.Call(func() error {
+			return attemptConnection(ctx)
+		})
+
 		if err != nil && !stopFlag.Load() {
-			golog.Errorf(`Connection error: %v`, err)
+			telemetry.LogWSError("connection cycle failed", err, map[string]interface{}{
+				"circuit_breaker_state": circuitBreaker.GetState(),
+			})
+
+			// Determine backoff based on circuit breaker state
+			var backoff time.Duration
+			if circuitBreaker.IsOpen() {
+				// Long backoff when circuit breaker is open
+				backoff = 30 * time.Second
+				telemetry.LogWSEvent("circuit breaker open, long backoff", map[string]interface{}{
+					"backoff_seconds": 30,
+				})
+			} else {
+				// Exponential backoff with jitter
+				backoff = reconnectStrategy.NextBackoff()
+				telemetry.WSReconnectAttempts.Inc()
+				telemetry.LogWSEvent("exponential backoff", map[string]interface{}{
+					"backoff_seconds": backoff.Seconds(),
+					"attempt":         reconnectStrategy.GetAttempt(),
+				})
+			}
+
+			// Wait with context cancellation support
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(3 * time.Second):
+			case <-time.After(backoff):
 			}
 			continue
 		}
 
-		err = reportWS(common.WSConn)
-		if err != nil && !stopFlag.Load() {
-			golog.Errorf(`Register error: %v`, err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
-
-		golog.Info("connected and registered with server")
-		checkUpdate(common.WSConn)
-
-		err = handleWS(common.WSConn)
-		if err != nil && !stopFlag.Load() {
-			golog.Errorf(`Execution error: %v`, err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(3 * time.Second):
-			}
-			continue
-		}
+		// Success - reset backoff strategy
+		reconnectStrategy.Reset()
 	}
+}
+
+// attemptConnection performs a single connection attempt (connect + register + handle)
+func attemptConnection(ctx context.Context) error {
+	telemetry.LogWSEvent("attempting connection", nil)
+	telemetry.WSConnectionsTotal.Inc()
+
+	// Close existing connection if any
+	common.Mutex.Lock()
+	if common.WSConn != nil {
+		common.WSConn.Close()
+	}
+	common.Mutex.Unlock()
+
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Connect
+	wsConn, err := connectWS()
+	if err != nil {
+		telemetry.LogWSError("connect failed", err, nil)
+		return categorizeError(fmt.Errorf("connect: %w", err))
+	}
+
+	common.Mutex.Lock()
+	common.WSConn = wsConn
+	common.Mutex.Unlock()
+
+	// Record connection established
+	connectionStart = time.Now()
+	telemetry.GetHealth().SetWSConnected(true)
+
+	// Register
+	err = reportWS(wsConn)
+	if err != nil {
+		telemetry.LogWSError("register failed", err, nil)
+		telemetry.GetHealth().SetWSConnected(false)
+		return fmt.Errorf("register: %w", err)
+	}
+
+	telemetry.LogWSEvent("connected and registered", nil)
+	checkUpdate(wsConn)
+
+	// Handle messages (blocks until disconnect)
+	err = handleWS(wsConn)
+
+	// Record disconnection
+	duration := time.Since(connectionStart)
+	telemetry.WSConnectionDuration.Observe(duration.Seconds())
+	telemetry.GetHealth().SetWSConnected(false)
+
+	if err != nil {
+		telemetry.LogWSError("handle failed", err, map[string]interface{}{
+			"connection_duration_seconds": duration.Seconds(),
+		})
+		return fmt.Errorf("handle: %w", err)
+	}
+
+	return nil
 }
 
 // Stop gracefully stops the main loop
@@ -280,12 +372,80 @@ func checkUpdate(wsConn *common.Conn) error {
 
 func handleWS(wsConn *common.Conn) error {
 	errCount := 0
+	heartbeatMu.Lock()
+	lastHeartbeat = time.Now()
+	heartbeatMu.Unlock()
+	telemetry.GetHealth().SetHeartbeat()
+
+	// Set read deadline to detect network black holes
+	wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
+
 	for {
+		// Refresh read deadline on each iteration
+		wsConn.SetReadDeadline(time.Now().Add(90 * time.Second))
+
 		_, data, err := wsConn.ReadMessage()
 		if err != nil {
-			golog.Error(err)
-			return nil
+			// Extract close reason for diagnostics
+			if ws.IsCloseError(err,
+				ws.CloseNormalClosure,
+				ws.CloseGoingAway,
+				ws.CloseProtocolError,
+				ws.CloseUnsupportedData,
+				ws.CloseNoStatusReceived,
+				ws.CloseAbnormalClosure,
+				ws.CloseInvalidFramePayloadData,
+				ws.ClosePolicyViolation,
+				ws.CloseMessageTooBig,
+				ws.CloseMandatoryExtension,
+				ws.CloseInternalServerErr,
+				ws.CloseServiceRestart,
+				ws.CloseTryAgainLater,
+				ws.CloseTLSHandshake) {
+
+				closeErr := err.(*ws.CloseError)
+				closeCode := strconv.Itoa(closeErr.Code)
+				closeReason := closeErr.Text
+				if closeReason == "" {
+					closeReason = getCloseReasonDescription(closeErr.Code)
+				}
+
+				// Get time since last heartbeat
+				heartbeatMu.RLock()
+				heartbeatAge := time.Since(lastHeartbeat)
+				heartbeatMu.RUnlock()
+
+				telemetry.WSDisconnectsTotal.WithLabelValues(closeReason, closeCode).Inc()
+				telemetry.LogWSError("closed by server", err, map[string]interface{}{
+					"close_code":             closeCode,
+					"close_reason":           closeReason,
+					"last_heartbeat_seconds": heartbeatAge.Seconds(),
+				})
+
+				// Special handling for abnormal closes (1005, 1006)
+				if closeErr.Code == ws.CloseNoStatusReceived || closeErr.Code == ws.CloseAbnormalClosure {
+					telemetry.LogWSEvent("abnormal close detected", map[string]interface{}{
+						"code":                   closeErr.Code,
+						"last_heartbeat_seconds": heartbeatAge.Seconds(),
+						"possible_causes":        "server timeout, network issue, auth failure, or server crash",
+					})
+				}
+			} else {
+				// Network or other error
+				telemetry.LogWSError("read error", err, nil)
+				telemetry.WSDisconnectsTotal.WithLabelValues("network_error", "0").Inc()
+			}
+
+			wsConn.Close()
+			return err
 		}
+
+		// Update heartbeat on every message received
+		heartbeatMu.Lock()
+		lastHeartbeat = time.Now()
+		heartbeatMu.Unlock()
+		telemetry.GetHealth().SetHeartbeat()
+
 		if service, op, isBinary := utils.CheckBinaryPack(data); isBinary && len(data) > 24 {
 			event := hex.EncodeToString(data[6:22])
 			switch service {
@@ -298,33 +458,79 @@ func handleWS(wsConn *common.Conn) error {
 			}
 			continue
 		}
+
 		data, err = utils.Decrypt(data, wsConn.GetSecret())
 		if err != nil {
-			golog.Error(err)
+			telemetry.LogWSError("decrypt failed", err, nil)
 			errCount++
 			if errCount > 3 {
+				telemetry.LogWSEvent("too many decrypt errors, disconnecting", map[string]interface{}{
+					"error_count": errCount,
+				})
 				break
 			}
 			continue
 		}
+
 		pack := modules.Packet{}
-		utils.JSON.Unmarshal(data, &pack)
+		err = utils.JSON.Unmarshal(data, &pack)
 		if err != nil {
-			golog.Error(err)
+			telemetry.LogWSError("unmarshal failed", err, nil)
 			errCount++
 			if errCount > 3 {
+				telemetry.LogWSEvent("too many unmarshal errors, disconnecting", map[string]interface{}{
+					"error_count": errCount,
+				})
 				break
 			}
 			continue
 		}
+
 		errCount = 0
 		if pack.Data == nil {
 			pack.Data = smap{}
 		}
 		go handleAct(pack, wsConn)
 	}
+
 	wsConn.Close()
 	return nil
+}
+
+// getCloseReasonDescription returns a human-readable description of close codes
+func getCloseReasonDescription(code int) string {
+	switch code {
+	case ws.CloseNormalClosure:
+		return "normal_closure"
+	case ws.CloseGoingAway:
+		return "going_away"
+	case ws.CloseProtocolError:
+		return "protocol_error"
+	case ws.CloseUnsupportedData:
+		return "unsupported_data"
+	case ws.CloseNoStatusReceived:
+		return "no_status_received"
+	case ws.CloseAbnormalClosure:
+		return "abnormal_closure"
+	case ws.CloseInvalidFramePayloadData:
+		return "invalid_payload"
+	case ws.ClosePolicyViolation:
+		return "policy_violation"
+	case ws.CloseMessageTooBig:
+		return "message_too_big"
+	case ws.CloseMandatoryExtension:
+		return "mandatory_extension"
+	case ws.CloseInternalServerErr:
+		return "internal_server_error"
+	case ws.CloseServiceRestart:
+		return "service_restart"
+	case ws.CloseTryAgainLater:
+		return "try_again_later"
+	case ws.CloseTLSHandshake:
+		return "tls_handshake_failed"
+	default:
+		return fmt.Sprintf("unknown_%d", code)
+	}
 }
 
 func handleAct(pack modules.Packet, wsConn *common.Conn) {
@@ -338,4 +544,69 @@ func handleAct(pack modules.Packet, wsConn *common.Conn) {
 		}()
 		act(pack, wsConn)
 	}
+}
+
+// categorizeError wraps errors with categorization hints for circuit breaker
+// Permanent errors should open circuit immediately
+// Transient errors count toward threshold
+type errorCategory int
+
+const (
+	errorTransient  errorCategory = iota // Network issues, timeouts
+	errorPermanent                       // Auth failures, 401/403
+	errorServer                          // Server errors, 500s
+)
+
+type categorizedError struct {
+	err      error
+	category errorCategory
+}
+
+func (e *categorizedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *categorizedError) Unwrap() error {
+	return e.err
+}
+
+// categorizeError analyzes error and assigns category
+func categorizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	errStr := err.Error()
+
+	// Permanent errors (auth, config, bad credentials)
+	if strings.Contains(errStr, "401") ||
+		strings.Contains(errStr, "403") ||
+		strings.Contains(errStr, "Unauthorized") ||
+		strings.Contains(errStr, "Forbidden") ||
+		strings.Contains(errStr, "authentication") ||
+		strings.Contains(errStr, "bad credentials") ||
+		err == errNoSecretHeader {
+		return &categorizedError{err: err, category: errorPermanent}
+	}
+
+	// Server errors
+	if strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") ||
+		strings.Contains(errStr, "Internal Server Error") {
+		return &categorizedError{err: err, category: errorServer}
+	}
+
+	// Default: transient (network, timeout, etc.)
+	return &categorizedError{err: err, category: errorTransient}
+}
+
+// isPermanentError checks if error is permanent
+func isPermanentError(err error) bool {
+	var catErr *categorizedError
+	if errors.As(err, &catErr) {
+		return catErr.category == errorPermanent
+	}
+	return false
 }

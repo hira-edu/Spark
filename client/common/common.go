@@ -17,12 +17,13 @@ type Conn struct {
 	*ws.Conn
 	secret    []byte
 	secretHex string
+	writeMu   sync.Mutex // Separate write mutex for better concurrency
 }
 
 const MaxMessageSize = (2 << 15) + 1024
 
 var WSConn *Conn
-var Mutex = &sync.Mutex{}
+var Mutex = &sync.RWMutex{} // Upgraded to RWMutex for read/write separation
 var HTTP = CreateClient()
 
 func CreateConn(wsConn *ws.Conn, secret []byte) *Conn {
@@ -38,19 +39,25 @@ func CreateClient() *req.Client {
 }
 
 func (wsConn *Conn) SendData(data []byte) error {
-	Mutex.Lock()
-	defer Mutex.Unlock()
-	if WSConn == nil {
+	// Use per-connection write mutex instead of global mutex
+	wsConn.writeMu.Lock()
+	defer wsConn.writeMu.Unlock()
+
+	// Check if connection is still valid
+	Mutex.RLock()
+	connected := (WSConn != nil)
+	Mutex.RUnlock()
+
+	if !connected {
 		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
 	}
+
 	wsConn.SetWriteDeadline(utils.Now.Add(5 * time.Second))
 	defer wsConn.SetWriteDeadline(time.Time{})
 	return wsConn.WriteMessage(ws.BinaryMessage, data)
 }
 
 func (wsConn *Conn) SendPack(pack any) error {
-	Mutex.Lock()
-	defer Mutex.Unlock()
 	data, err := utils.JSON.Marshal(pack)
 	if err != nil {
 		return err
@@ -59,6 +66,8 @@ func (wsConn *Conn) SendPack(pack any) error {
 	if err != nil {
 		return err
 	}
+
+	// Use HTTP fallback for large messages
 	if len(data) > MaxMessageSize {
 		_, err = HTTP.R().
 			SetBody(data).
@@ -66,20 +75,39 @@ func (wsConn *Conn) SendPack(pack any) error {
 			Send(`POST`, config.GetBaseURL(false)+`/ws`)
 		return err
 	}
-	if WSConn == nil {
+
+	// Use per-connection write mutex
+	wsConn.writeMu.Lock()
+	defer wsConn.writeMu.Unlock()
+
+	// Check if connection is still valid
+	Mutex.RLock()
+	connected := (WSConn != nil)
+	Mutex.RUnlock()
+
+	if !connected {
 		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
 	}
+
 	wsConn.SetWriteDeadline(utils.Now.Add(5 * time.Second))
 	defer wsConn.SetWriteDeadline(time.Time{})
 	return wsConn.WriteMessage(ws.BinaryMessage, data)
 }
 
 func (wsConn *Conn) SendRawData(event, data []byte, service byte, op byte) error {
-	Mutex.Lock()
-	defer Mutex.Unlock()
-	if WSConn == nil {
+	// Use per-connection write mutex
+	wsConn.writeMu.Lock()
+	defer wsConn.writeMu.Unlock()
+
+	// Check if connection is still valid
+	Mutex.RLock()
+	connected := (WSConn != nil)
+	Mutex.RUnlock()
+
+	if !connected {
 		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
 	}
+
 	buffer := make([]byte, 24)
 	copy(buffer[6:22], event)
 	copy(buffer[:4], []byte{34, 22, 19, 17})

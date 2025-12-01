@@ -20,11 +20,13 @@ const DesktopCanvas = forwardRef(({
     }
   }, [onCanvasClick]);
 
+  const canvasClass = `desktop-canvas ${pointerLocked ? 'desktop-canvas--pointer-locked' : ''}`;
+
   return (
     <div className={`desktop-canvas-wrapper ${className}`}>
       <canvas
         ref={ref}
-        className="desktop-canvas"
+        className={canvasClass}
         tabIndex={0}
         onClick={handleClick}
         onMouseMove={onMouseMove}

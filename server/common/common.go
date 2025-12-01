@@ -91,46 +91,32 @@ func GetRealIP(ctx *gin.Context) string {
 }
 
 func GetRemoteAddr(ctx *gin.Context) string {
-	if remote, ok := ctx.RemoteIP(); ok {
-		if remote.IsLoopback() {
-			forwarded := ctx.GetHeader(`X-Forwarded-For`)
-			if len(forwarded) > 0 {
-				return forwarded
-			}
-			realIP := ctx.GetHeader(`X-Real-IP`)
-			if len(realIP) > 0 {
-				return realIP
-			}
-		} else {
-			if ip := remote.To4(); ip != nil {
-				return ip.String()
-			}
-			if ip := remote.To16(); ip != nil {
-				return ip.String()
-			}
+	remoteStr := ctx.RemoteIP()
+	remote := net.ParseIP(remoteStr)
+
+	if remote != nil && remote.IsLoopback() {
+		forwarded := ctx.GetHeader(`X-Forwarded-For`)
+		if len(forwarded) > 0 {
+			return forwarded
+		}
+		realIP := ctx.GetHeader(`X-Real-IP`)
+		if len(realIP) > 0 {
+			return realIP
 		}
 	}
 
-	remote := net.ParseIP(ctx.Request.RemoteAddr)
 	if remote != nil {
-		if remote.IsLoopback() {
-			forwarded := ctx.GetHeader(`X-Forwarded-For`)
-			if len(forwarded) > 0 {
-				return forwarded
-			}
-			realIP := ctx.GetHeader(`X-Real-IP`)
-			if len(realIP) > 0 {
-				return realIP
-			}
-		} else {
-			if ip := remote.To4(); ip != nil {
-				return ip.String()
-			}
-			if ip := remote.To16(); ip != nil {
-				return ip.String()
-			}
-		}
+		return remote.String()
 	}
+
+	forwarded := ctx.GetHeader(`X-Forwarded-For`)
+	if len(forwarded) > 0 {
+		return forwarded
+	}
+	if realIP := ctx.GetHeader(`X-Real-IP`); len(realIP) > 0 {
+		return realIP
+	}
+
 	addr := ctx.Request.RemoteAddr
 	if pos := strings.LastIndex(addr, `:`); pos > -1 {
 		return strings.Trim(addr[:pos], `[]`)

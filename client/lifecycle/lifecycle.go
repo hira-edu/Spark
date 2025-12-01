@@ -32,4 +32,5 @@ const (
 	RunModeConsole
 	RunModeUninstall
 	RunModeUpdate
+	RunModeUIOnly
 )

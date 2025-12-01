@@ -1,10 +1,7 @@
 import React from 'react';
 import { Modal } from 'antd';
 import { DesktopViewer } from '../features/desktop';
-import i18n from '../../locale/locale';
 import './desktop.modal.css';
-
-const title = i18n.t('DESKTOP.TITLE');
 
 /**
  * DesktopModal - Modal wrapper for the new DesktopViewer component
@@ -19,16 +16,17 @@ function DesktopModal(props) {
 
   return (
     <Modal
-      title={`${title} - ${device.hostname || 'Unknown'}`}
       open={open}
       onCancel={onCancel}
       footer={null}
       width="90vw"
       style={{ top: 20 }}
-      bodyStyle={{ padding: 0, height: 'calc(90vh - 55px)', overflow: 'hidden' }}
+      bodyStyle={{ padding: 0, height: '90vh', overflow: 'hidden' }}
       destroyOnClose
       maskClosable={false}
       className="desktop-modal"
+      closable={false}
+      focusTriggerAfterClose={false}
     >
       <div className="desktop-modal-content">
         <DesktopViewer

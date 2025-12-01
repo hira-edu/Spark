@@ -24,6 +24,9 @@ func DetectMode(args []string) RunMode {
 		case "--console", "--debug":
 			golog.Info("mode: Detected RunModeConsole (explicit --console flag)")
 			return RunModeConsole
+		case "--ui-only":
+			golog.Info("mode: Detected RunModeUIOnly (UI without WebSocket connection)")
+			return RunModeUIOnly
 		}
 	} else {
 		golog.Info("mode: No command line arguments provided")

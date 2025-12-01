@@ -1,0 +1,134 @@
+# OpenTelemetry Collector (contrib) baseline for Spark.
+# - Receives OTLP (logs/traces/metrics) from agents and server
+# - Tails server and Caddy access logs
+# - Exports traces to Tempo/Jaeger via OTLP
+# - Exports metrics via Prometheus remote_write
+# - Exports logs to Loki (recommended) or any OTLP-enabled log backend
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+  # Agent logs (Windows path). Override with SPARK_AGENT_LOG_PATH if needed.
+  filelog/agent:
+    include:
+      - ${SPARK_AGENT_LOG_PATH:-C:/ProgramData/Microsoft/Update/client.log}
+    start_at: beginning
+    include_file_path: true
+    operators:
+      - type: json_parser
+        id: agent_json
+        timestamp:
+          parse_from: attributes.time
+          layout_type: strptime
+          layout: "%Y/%m/%d %H:%M:%S"
+      - type: move
+        from: attributes.msg
+        to: body
+
+  # Agent logs (Linux path).
+  filelog/agent_linux:
+    include:
+      - ${SPARK_AGENT_LOG_PATH_LINUX:-/var/log/spark_client.log}
+      - /opt/spark/logs/client.log
+    start_at: beginning
+    include_file_path: true
+    operators:
+      - type: json_parser
+        id: agent_linux_json
+        timestamp:
+          parse_from: attributes.time
+          layout_type: strptime
+          layout: "%Y/%m/%d %H:%M:%S"
+      - type: move
+        from: attributes.msg
+        to: body
+
+  filelog/spark:
+    include:
+      - /var/log/spark/*.log
+      - /opt/spark/logs/*.log
+    start_at: beginning
+    include_file_path: true
+    operators:
+      - type: json_parser
+        id: spark_json
+        timestamp:
+          parse_from: attributes.time
+          layout_type: strptime
+          layout: "%Y/%m/%d %H:%M:%S"
+      - type: move
+        from: attributes.msg
+        to: body
+
+  filelog/caddy:
+    include:
+      - /var/log/caddy/access.json
+    start_at: beginning
+    include_file_path: true
+    operators:
+      - type: json_parser
+        id: caddy_json
+        timestamp:
+          parse_from: attributes.ts
+          layout: RFC3339
+      - type: move
+        from: attributes.request_id
+        to: attributes.http.request_id
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 1024
+    spike_limit_mib: 256
+
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+
+  resource/defaults:
+    attributes:
+      - key: deployment.environment
+        value: ${DEPLOY_ENVIRONMENT:-prod}
+        action: insert
+
+exporters:
+  otlp/traces:
+    endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-tempo:4317}
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_TRACES_INSECURE:-true}
+  prometheusremotewrite:
+    endpoint: ${PROM_REMOTE_WRITE_ENDPOINT:-http://mimir:9009/api/v1/push}
+  loki:
+    endpoint: ${LOKI_ENDPOINT:-http://loki:3100/loki/api/v1/push}
+    tls:
+      insecure: ${LOKI_INSECURE:-true}
+    default_labels_enabled:
+      exporter: false
+      job: true
+      instance: true
+  debug:
+    verbosity: basic
+
+service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource/defaults]
+      exporters: [otlp/traces]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource/defaults]
+      exporters: [prometheusremotewrite]
+
+    logs:
+      receivers: [otlp, filelog/spark, filelog/caddy, filelog/agent, filelog/agent_linux]
+      processors: [memory_limiter, batch, resource/defaults]
+      exporters: [loki]

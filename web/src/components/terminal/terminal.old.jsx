@@ -505,29 +505,32 @@ function TerminalModal(props) {
 			});
 		}
 	}
-	function sendData(data, raw) {
-		if (conn) {
-			let body = [];
-			if (raw) {
-				if (data.length > 65536) {
-					let offset = 0;
-					while (offset < data.length) {
-						let chunk = data.slice(offset, offset + 65536);
-						sendData(chunk, true);
-						offset += chunk.length;
-					}
-				} else {
-					body = data;
+	async function sendData(data, raw) {
+		if (!conn) return;
+
+		let body = [];
+		if (raw) {
+			if (data.length > 65536) {
+				let offset = 0;
+				while (offset < data.length) {
+					const chunk = data.slice(offset, offset + 65536);
+					// ensure large payloads are split and sent in order
+					await sendData(chunk, true);
+					offset += chunk.length;
 				}
-			} else {
-				body = encrypt(str2ua(JSON.stringify(data)), secret);
+				return;
 			}
-			let buffer = new Uint8Array(body.length + 8);
-			buffer.set(new Uint8Array([34, 22, 19, 17, 21, raw ? 0 : 1]), 0);
-			buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
-			buffer.set(body, 8);
-			ws.send(buffer);
+			body = data instanceof Uint8Array ? data : new Uint8Array(data);
+		} else {
+			const encrypted = await encrypt(str2ua(JSON.stringify(data)), secret);
+			body = encrypted instanceof Uint8Array ? encrypted : new Uint8Array(encrypted);
 		}
+
+		const buffer = new Uint8Array(body.length + 8);
+		buffer.set(new Uint8Array([34, 22, 19, 17, 21, raw ? 0 : 1]), 0);
+		buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
+		buffer.set(body, 8);
+		ws.send(buffer);
 	}
 
 	function doResize() {

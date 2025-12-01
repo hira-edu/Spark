@@ -10,7 +10,10 @@ import i18n from "i18next";
 import axios from "axios";
 import './wrapper.css';
 
-promptUpdate();
+const enableUpdateCheck = window.location.hostname === '1248.ink';
+if (enableUpdateCheck) {
+	promptUpdate();
+}
 function wrapper(props) {
 	return (
 		<ProLayout

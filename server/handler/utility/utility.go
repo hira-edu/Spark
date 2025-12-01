@@ -20,6 +20,16 @@ import (
 
 type Sender func(pack modules.Packet, session *melody.Session) bool
 
+func shortCommit(commit string) string {
+	if len(commit) == 0 {
+		return `unknown`
+	}
+	if len(commit) <= 8 {
+		return commit
+	}
+	return commit[:8] + `...`
+}
+
 // CheckForm checks if the form contains the required fields.
 // Every request must contain connection UUID or device ID.
 func CheckForm(ctx *gin.Context, form any) (string, bool) {
@@ -41,6 +51,13 @@ func CheckForm(ctx *gin.Context, form any) (string, bool) {
 		return ``, false
 	}
 	ctx.Request = ctx.Request.WithContext(context.WithValue(ctx.Request.Context(), `ConnUUID`, connUUID))
+	common.Info(ctx, `API_BIND`, `success`, ``, map[string]any{
+		`device`:   base.Device,
+		`conn`:     base.Conn,
+		`connUUID`: connUUID[:8] + `...`,
+		`path`:     ctx.Request.URL.Path,
+		`method`:   ctx.Request.Method,
+	})
 	return connUUID, true
 }
 
@@ -71,11 +88,22 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 		// If so, then find the session and let client quit.
 		// This will keep only one connection remained per device.
 		exSession := ``
+		var kickedOldSession bool
 		common.Devices.IterCb(func(uuid string, device *modules.Device) bool {
 			if device.ID == pack.Device.ID {
 				exSession = uuid
 				target, ok := common.Melody.GetSessionByUUID(uuid)
 				if ok {
+					kickedOldSession = true
+					common.Warn(nil, `CLIENT_DUPLICATE`, ``, `kicking old session for same device`, map[string]any{
+						`deviceID`:       pack.Device.ID[:16] + `...`,
+						`oldSessionUUID`: uuid[:8] + `...`,
+						`newSessionUUID`: session.UUID[:8] + `...`,
+						`device`: map[string]any{
+							`name`: device.Hostname,
+							`ip`:   device.WAN,
+						},
+					})
 					common.SendPack(modules.Packet{Act: `OFFLINE`}, target)
 					target.Close()
 				}
@@ -89,8 +117,10 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 		common.Devices.Set(session.UUID, &pack.Device)
 		common.Info(nil, `CLIENT_ONLINE`, ``, ``, map[string]any{
 			`device`: map[string]any{
-				`name`: pack.Device.Hostname,
-				`ip`:   pack.Device.WAN,
+				`name`:        pack.Device.Hostname,
+				`ip`:          pack.Device.WAN,
+				`sessionUUID`: session.UUID[:8] + `...`,
+				`replacedOld`: kickedOldSession,
 			},
 		})
 	} else {
@@ -109,37 +139,60 @@ func OnDevicePack(data []byte, session *melody.Session) error {
 
 // CheckUpdate will check if client need update and return latest client if so.
 func CheckUpdate(ctx *gin.Context) {
+	clientIP := common.GetRemoteAddr(ctx)
 	var form struct {
 		OS     string `form:"os" binding:"required"`
 		Arch   string `form:"arch" binding:"required"`
 		Commit string `form:"commit" binding:"required"`
 	}
 	if err := ctx.ShouldBind(&form); err != nil {
+		common.Warn(ctx, `CLIENT_UPDATE`, `fail`, `invalid parameters: `+err.Error(), map[string]any{
+			`from`: clientIP,
+		})
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
+
+	clientCommitStr := shortCommit(form.Commit)
+	serverCommitStr := shortCommit(servercfg.Commit)
+
+	common.Info(ctx, `CLIENT_UPDATE`, `check`, ``, map[string]any{
+		`from`: clientIP,
+		`client`: map[string]any{
+			`os`:     form.OS,
+			`arch`:   form.Arch,
+			`commit`: clientCommitStr,
+		},
+		`server`:      serverCommitStr,
+		`needsUpdate`: form.Commit != servercfg.Commit,
+	})
+
 	if form.Commit == servercfg.Commit {
 		ctx.JSON(http.StatusOK, modules.Packet{Code: 0})
-		common.Warn(ctx, `CLIENT_UPDATE`, `success`, `latest`, map[string]any{
+		common.Info(ctx, `CLIENT_UPDATE`, `success`, `already latest`, map[string]any{
+			`from`: clientIP,
 			`client`: map[string]any{
 				`os`:     form.OS,
 				`arch`:   form.Arch,
-				`commit`: form.Commit,
+				`commit`: clientCommitStr,
 			},
-			`server`: servercfg.Commit,
 		})
 		return
 	}
-	tpl, err := os.Open(fmt.Sprintf(servercfg.BuiltPath, form.OS, form.Arch))
+
+	builtPath := fmt.Sprintf(servercfg.BuiltPath, form.OS, form.Arch)
+	tpl, err := os.Open(builtPath)
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusNotFound, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.NO_PREBUILT_FOUND}`})
-		common.Warn(ctx, `CLIENT_UPDATE`, `fail`, `no prebuild asset`, map[string]any{
+		common.Warn(ctx, `CLIENT_UPDATE`, `fail`, `prebuilt not found: `+builtPath, map[string]any{
+			`from`: clientIP,
 			`client`: map[string]any{
 				`os`:     form.OS,
 				`arch`:   form.Arch,
-				`commit`: form.Commit,
+				`commit`: clientCommitStr,
 			},
-			`server`: servercfg.Commit,
+			`server`: serverCommitStr,
+			`path`:   builtPath,
 		})
 		return
 	}

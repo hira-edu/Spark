@@ -158,6 +158,11 @@ func init() {
 	Config.SaltBytes = append(Config.SaltBytes, bytes.Repeat([]byte{25}, 24)...)
 	Config.SaltBytes = Config.SaltBytes[:24]
 
+	if len(Commit) == 0 {
+		Commit = `dev`
+		golog.Warn(`Commit hash not set at build time; using fallback 'dev'`)
+	}
+
 	golog.SetLevel(utils.If(len(Config.Log.Level) == 0, `info`, Config.Log.Level))
 }
 

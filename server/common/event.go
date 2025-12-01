@@ -25,15 +25,29 @@ func CallEvent(pack modules.Packet, session *melody.Session) {
 	}
 	ev, ok := events.Get(pack.Event)
 	if !ok {
+		Debug(session, `EVENT_CALL`, `miss`, `event not found`, map[string]any{
+			`event`:  pack.Event,
+			`action`: pack.Act,
+		})
 		return
 	}
 	if session != nil && session.UUID != ev.connection {
+		Debug(session, `EVENT_CALL`, `skip`, `session mismatch`, map[string]any{
+			`event`:        pack.Event,
+			`action`:       pack.Act,
+			`sessionUUID`:  session.UUID[:8] + `...`,
+			`expectedUUID`: ev.connection[:8] + `...`,
+		})
 		return
 	}
 	ev.callback(pack, session)
 	if ev.finish != nil {
 		ev.finish <- true
 	}
+	Debug(session, `EVENT_CALL`, `success`, ``, map[string]any{
+		`event`:  pack.Event,
+		`action`: pack.Act,
+	})
 }
 
 // AddEventOnce adds a new event only once and client
@@ -47,6 +61,11 @@ func AddEventOnce(fn EventCallback, connUUID, trigger string, timeout time.Durat
 		remove:     make(chan bool),
 	}
 	events.Set(trigger, ev)
+	Debug(nil, `EVENT_ADD_ONCE`, ``, ``, map[string]any{
+		`event`:      trigger,
+		`connUUID`:   connUUID[:8] + `...`,
+		`timeout_ms`: timeout.Milliseconds(),
+	})
 	defer close(ev.remove)
 	defer close(ev.finish)
 	select {
@@ -70,6 +89,10 @@ func AddEvent(fn EventCallback, connUUID, trigger string) {
 		callback:   fn,
 	}
 	events.Set(trigger, ev)
+	Debug(nil, `EVENT_ADD`, ``, ``, map[string]any{
+		`event`:    trigger,
+		`connUUID`: connUUID[:8] + `...`,
+	})
 }
 
 // RemoveEvent deletes the event with the given event trigger.

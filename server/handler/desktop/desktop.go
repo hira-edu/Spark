@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"Spark/modules"
 	"Spark/server/common"
@@ -41,34 +42,54 @@ func init() {
 
 // InitDesktop handles desktop websocket handshake event
 func InitDesktop(ctx *gin.Context) {
+	start := time.Now()
+	logAbort := func(status int, reason string, extra map[string]any) {
+		if extra == nil {
+			extra = map[string]any{}
+		}
+		extra[`path`] = ctx.Request.URL.String()
+		extra[`ua`] = ctx.Request.UserAgent()
+		extra[`latency_ms`] = time.Since(start).Milliseconds()
+		common.Warn(ctx, `DESKTOP_HANDSHAKE`, `fail`, reason, extra)
+		ctx.AbortWithStatus(status)
+	}
+
 	if !ctx.IsWebsocket() {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		logAbort(http.StatusBadRequest, `not websocket`, nil)
 		return
 	}
 
 	// Validate WebSocket origin to prevent CSWSH attacks
 	if !validateWebSocketOrigin(ctx) {
-		ctx.AbortWithStatus(http.StatusForbidden)
+		logAbort(http.StatusForbidden, `invalid websocket origin`, map[string]any{
+			`origin`: ctx.GetHeader(`Origin`),
+		})
 		return
 	}
 
 	secretStr, ok := ctx.GetQuery(`secret`)
 	if !ok || len(secretStr) != 32 {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		logAbort(http.StatusBadRequest, `missing secret`, map[string]any{
+			`secretLen`: len(secretStr),
+		})
 		return
 	}
 	secret, err := hex.DecodeString(secretStr)
 	if err != nil {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		logAbort(http.StatusBadRequest, `secret decode failed`, map[string]any{
+			`error`: err.Error(),
+		})
 		return
 	}
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		logAbort(http.StatusBadRequest, `missing device`, nil)
 		return
 	}
 	if _, ok := common.CheckDevice(device, ``); !ok {
-		ctx.AbortWithStatus(http.StatusBadRequest)
+		logAbort(http.StatusBadRequest, `device not found`, map[string]any{
+			`device`: device,
+		})
 		return
 	}
 
@@ -76,6 +97,12 @@ func InitDesktop(ctx *gin.Context) {
 		`Secret`:   secret,
 		`Device`:   device,
 		`LastPack`: utils.Unix,
+	})
+
+	common.Info(ctx, `DESKTOP_HANDSHAKE`, `success`, ``, map[string]any{
+		`device`:     device,
+		`secret_len`: len(secret),
+		`latency_ms`: time.Since(start).Milliseconds(),
 	})
 }
 
@@ -142,28 +169,48 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 }
 
 func onDesktopConnect(session *melody.Session) {
+	clientIP := `unknown`
+	if addr, ok := session.Get(`Address`); ok {
+		clientIP = addr.(string)
+	}
+
 	device, ok := session.Get(`Device`)
 	if !ok {
+		common.Warn(session, `DESKTOP_CONN`, `fail`, `no device ID in session`, map[string]any{
+			`from`: clientIP,
+		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|DESKTOP.CREATE_SESSION_FAILED}`}, session)
 		session.Close()
 		return
 	}
-	connUUID, ok := common.CheckDevice(device.(string), ``)
+	deviceID := device.(string)
+
+	connUUID, ok := common.CheckDevice(deviceID, ``)
 	if !ok {
+		common.Warn(session, `DESKTOP_CONN`, `fail`, `device not found`, map[string]any{
+			`from`:     clientIP,
+			`deviceID`: deviceID[:16] + `...`,
+		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
 	}
 	deviceConn, ok := common.Melody.GetSessionByUUID(connUUID)
 	if !ok {
+		common.Warn(session, `DESKTOP_CONN`, `fail`, `device connection not found`, map[string]any{
+			`from`:     clientIP,
+			`deviceID`: deviceID[:16] + `...`,
+			`connUUID`: connUUID[:8] + `...`,
+		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
 	}
+
 	desktopUUID := utils.GetStrUUID()
 	desktop := &desktop{
 		uuid:       desktopUUID,
-		device:     device.(string),
+		device:     deviceID,
 		srcConn:    session,
 		deviceConn: deviceConn,
 	}
@@ -172,8 +219,20 @@ func onDesktopConnect(session *melody.Session) {
 	common.SendPack(modules.Packet{Act: `DESKTOP_INIT`, Data: gin.H{
 		`desktop`: desktopUUID,
 	}, Event: desktopUUID}, deviceConn)
+
+	// Get device info for logging
+	deviceInfo := map[string]any{
+		`uuid`:     desktopUUID[:8] + `...`,
+		`deviceID`: deviceID[:16] + `...`,
+	}
+	if dev, ok := common.Devices.Get(connUUID); ok {
+		deviceInfo[`name`] = dev.Hostname
+		deviceInfo[`ip`] = dev.WAN
+	}
+
 	common.Info(desktop.srcConn, `DESKTOP_CONN`, `success`, ``, map[string]any{
-		`deviceConn`: desktop.deviceConn,
+		`from`:   clientIP,
+		`target`: deviceInfo,
 	})
 }
 
@@ -181,17 +240,27 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	var pack modules.Packet
 	val, ok := session.Get(`Desktop`)
 	if !ok {
+		common.Warn(session, `DESKTOP_MSG`, `fail`, `no desktop session`, nil)
 		return
 	}
 	desktop := val.(*desktop)
 
 	service, op, isBinary := utils.CheckBinaryPack(data)
 	if !isBinary || service != 20 {
+		common.Warn(session, `DESKTOP_MSG`, `fail`, `invalid binary pack`, map[string]any{
+			`desktop`:  desktop.uuid[:8] + `...`,
+			`service`:  service,
+			`isBinary`: isBinary,
+		})
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return
 	}
 	if op != 03 {
+		common.Warn(session, `DESKTOP_MSG`, `fail`, `invalid op code`, map[string]any{
+			`desktop`: desktop.uuid[:8] + `...`,
+			`op`:      op,
+		})
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return
@@ -199,6 +268,9 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 
 	data = utility.SimpleDecrypt(data[8:], session)
 	if utils.JSON.Unmarshal(data, &pack) != nil {
+		common.Warn(session, `DESKTOP_MSG`, `fail`, `JSON unmarshal failed`, map[string]any{
+			`desktop`: desktop.uuid[:8] + `...`,
+		})
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return

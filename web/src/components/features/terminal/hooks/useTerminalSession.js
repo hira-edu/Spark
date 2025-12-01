@@ -34,10 +34,13 @@ export function useTerminalSession(device, options = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN || !secret) return;
 
     const body = await encrypt(new TextEncoder().encode(JSON.stringify(data)), secret);
-    const buffer = new Uint8Array(body.length + 8);
+    // Ensure body is a Uint8Array
+    const bodyArray = body instanceof Uint8Array ? body : new Uint8Array(body);
+    const bodyLength = bodyArray.length;
+    const buffer = new Uint8Array(bodyLength + 8);
     buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
-    buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
-    buffer.set(body, 8);
+    buffer.set(new Uint8Array([bodyLength >> 8, bodyLength & 0xFF]), 6);
+    buffer.set(bodyArray, 8);
     ws.send(buffer);
   }, []);
 

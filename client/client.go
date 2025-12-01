@@ -4,13 +4,16 @@ import (
 	"Spark/client/config"
 	"Spark/client/core"
 	"Spark/client/lifecycle"
+	"Spark/client/telemetry"
 	"Spark/utils"
 	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kataras/golog"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func init() {
@@ -81,6 +85,12 @@ func main() {
 		return
 	}
 
+	// Start observability HTTP server (metrics + health)
+	// Only start in service mode to avoid port conflicts
+	if mode == lifecycle.RunModeService {
+		go startObservabilityServer()
+	}
+
 	// Create application wrapper
 	app := &sparkApp{}
 
@@ -99,6 +109,77 @@ func main() {
 		golog.Error(err)
 		os.Exit(1)
 	}
+}
+
+// startObservabilityServer starts HTTP server for /metrics and /health endpoints
+func startObservabilityServer() {
+	mux := http.NewServeMux()
+
+	// Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Health check endpoint
+	mux.HandleFunc("/health", healthHandler)
+
+	// Readiness endpoint (similar to health but stricter)
+	mux.HandleFunc("/ready", readinessHandler)
+
+	server := &http.Server{
+		Addr:         ":9090",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	golog.Info("observability server starting on :9090")
+	golog.Info("  - /metrics (Prometheus metrics)")
+	golog.Info("  - /health (health check)")
+	golog.Info("  - /ready (readiness check)")
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		golog.Errorf("observability server error: %v", err)
+	}
+}
+
+// healthHandler provides health status
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	health := telemetry.GetHealth()
+	snapshot := health.GetSnapshot()
+
+	// Return 503 if not healthy
+	statusCode := http.StatusOK
+	if !snapshot.IsHealthy() {
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(snapshot)
+}
+
+// readinessHandler provides readiness status (stricter than health)
+func readinessHandler(w http.ResponseWriter, r *http.Request) {
+	health := telemetry.GetHealth()
+	snapshot := health.GetSnapshot()
+
+	// Ready only if WebSocket is connected AND UI is running (if session is active)
+	ready := snapshot.WSConnected && (snapshot.UIProcessRunning || snapshot.ActiveSessionID == 0)
+
+	statusCode := http.StatusOK
+	if !ready {
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ready":           ready,
+		"ws_connected":    snapshot.WSConnected,
+		"ui_running":      snapshot.UIProcessRunning,
+		"active_session":  snapshot.ActiveSessionID,
+		"uptime_seconds":  snapshot.UptimeSeconds,
+	})
 }
 
 // sparkApp implements lifecycle.Application

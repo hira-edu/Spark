@@ -10,6 +10,7 @@ import (
 	"Spark/server/handler/share"
 	"Spark/server/handler/terminal"
 	"Spark/server/handler/utility"
+	"Spark/server/observability"
 	"Spark/utils/cmap"
 	"bytes"
 	"context"
@@ -33,12 +34,24 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var blocked = cmap.New[int64]()
 var lastRequest = time.Now().Unix()
+var wsTracer = otel.Tracer("spark-server/ws")
 
 func main() {
+	otelShutdown, err := observability.Init(context.Background())
+	if err != nil {
+		common.Warn(nil, `OTEL_INIT`, `fail`, err.Error(), nil)
+	}
+	defer otelShutdown(context.Background())
+
 	webFS, err := fs.NewWithNamespace(`web`)
 	if err != nil {
 		common.Fatal(nil, `LOAD_STATIC_RES`, `fail`, err.Error(), nil)
@@ -46,7 +59,8 @@ func main() {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	app := gin.New()
-	app.Use(gin.Recovery())
+	app.Use(otelgin.Middleware("spark-server"))
+	app.Use(requestLogger(), gin.Recovery())
 	{
 		handler.AuthHandler = checkAuth()
 		handler.InitRouter(app.Group(`/api`))
@@ -149,22 +163,62 @@ func main() {
 	common.CloseLog()
 }
 
+func requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		latency := time.Since(start)
+
+		common.Info(c, `HTTP_REQUEST`, `done`, ``, map[string]any{
+			`method`:     c.Request.Method,
+			`path`:       c.Request.URL.Path,
+			`query`:      c.Request.URL.RawQuery,
+			`status`:     c.Writer.Status(),
+			`size`:       c.Writer.Size(),
+			`latency_ms`: latency.Milliseconds(),
+			`ua`:         c.Request.UserAgent(),
+			`origin`:     c.Request.Header.Get(`Origin`),
+			`referer`:    c.Request.Referer(),
+			`upgrade`:    strings.Contains(strings.ToLower(c.GetHeader(`Connection`)), `upgrade`),
+			`proto`:      c.Request.Proto,
+			`host`:       c.Request.Host,
+		})
+	}
+}
+
 func wsHandshake(ctx *gin.Context) {
+	// Child span for handshake lifecycle
+	hCtx, span := wsTracer.Start(ctx.Request.Context(), "ws.handshake", trace.WithSpanKind(trace.SpanKindServer))
+	defer span.End()
+	ctx.Request = ctx.Request.WithContext(hCtx)
+
+	clientIP := common.GetRemoteAddr(ctx)
+
 	if !ctx.IsWebsocket() {
 		// When message is too large to transport via websocket,
 		// client will try to send these data via http.
 		const MaxBodySize = 2 << 18 // 524288 512KB
 		if ctx.Request.ContentLength > MaxBodySize {
+			common.Warn(ctx, `WS_HTTP_REQUEST`, `fail`, `body too large`, map[string]any{
+				`from`: clientIP,
+				`size`: ctx.Request.ContentLength,
+			})
 			ctx.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, modules.Packet{Code: 1})
 			return
 		}
 		body, err := ctx.GetRawData()
 		if err != nil {
+			common.Warn(ctx, `WS_HTTP_REQUEST`, `fail`, `read error: `+err.Error(), map[string]any{
+				`from`: clientIP,
+			})
 			ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: 1})
 			return
 		}
 		session := common.CheckClientReq(ctx)
 		if session == nil {
+			common.Warn(ctx, `WS_HTTP_REQUEST`, `fail`, `unauthorized`, map[string]any{
+				`from`: clientIP,
+			})
 			ctx.AbortWithStatusJSON(http.StatusUnauthorized, modules.Packet{Code: 1})
 			return
 		}
@@ -176,14 +230,33 @@ func wsHandshake(ctx *gin.Context) {
 	clientUUID, _ := hex.DecodeString(ctx.GetHeader(`UUID`))
 	clientKey, _ := hex.DecodeString(ctx.GetHeader(`Key`))
 	if len(clientUUID) != 16 || len(clientKey) != 32 {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `invalid credentials length`, map[string]any{
+			`from`:    clientIP,
+			`uuidLen`: len(clientUUID),
+			`keyLen`:  len(clientKey),
+		})
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 	decrypted, err := common.DecAES(clientKey, config.Config.SaltBytes)
 	if err != nil || !bytes.Equal(decrypted, clientUUID) {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `auth failed`, map[string]any{
+			`from`: clientIP,
+			`error`: func() string {
+				if err != nil {
+					return err.Error()
+				} else {
+					return `key mismatch`
+				}
+			}(),
+		})
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
+	common.Info(ctx, `WS_HANDSHAKE`, `success`, ``, map[string]any{
+		`from`: clientIP,
+		`uuid`: hex.EncodeToString(clientUUID)[:8] + `...`,
+	})
 	secret := append(utils.GetUUID(), utils.GetUUID()...)
 	ctx.Writer.Header().Add(`Secret`, hex.EncodeToString(secret))
 	err = common.Melody.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
@@ -192,13 +265,26 @@ func wsHandshake(ctx *gin.Context) {
 		`Address`:  common.GetRemoteAddr(ctx),
 	})
 	if err != nil {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `upgrade error: `+err.Error(), map[string]any{
+			`from`: clientIP,
+		})
+		span.RecordError(err)
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
+	span.SetAttributes(
+		attribute.String("ws.client_ip", clientIP),
+		attribute.String("ws.uuid_prefix", hex.EncodeToString(clientUUID)[:8]),
+	)
 }
 
 func wsOnConnect(session *melody.Session) {
+	ctx, span := wsTracer.Start(context.Background(), "ws.connect", trace.WithAttributes(
+		attribute.String("session.uuid", session.UUID),
+	))
+	defer span.End()
 	pingDevice(session)
+	_ = ctx
 }
 
 func wsOnMessage(session *melody.Session, _ []byte) {
@@ -206,6 +292,12 @@ func wsOnMessage(session *melody.Session, _ []byte) {
 }
 
 func wsOnMessageBinary(session *melody.Session, data []byte) {
+	ctx, span := wsTracer.Start(context.Background(), "ws.message", trace.WithAttributes(
+		attribute.String("session.uuid", session.UUID),
+		attribute.Int("payload.len", len(data)),
+	))
+	defer span.End()
+
 	var pack modules.Packet
 
 	dataLen := len(data)
@@ -245,24 +337,54 @@ func wsOnMessageBinary(session *melody.Session, data []byte) {
 
 	data, ok := common.Decrypt(data, session)
 	if !(ok && utils.JSON.Unmarshal(data, &pack) == nil) {
+		addr, _ := session.Get(`Address`)
+		common.Warn(nil, `WS_MESSAGE`, `fail`, `decrypt or parse failed`, map[string]any{
+			`from`:        addr,
+			`sessionUUID`: session.UUID[:8] + `...`,
+			`dataLen`:     dataLen,
+		})
 		common.SendPack(modules.Packet{Code: -1}, session)
 		session.CloseWithMsg(melody.FormatCloseMessage(1000, `invalid request`))
+		span.RecordError(fmt.Errorf("decrypt/parse failed"))
+		span.SetStatus(codes.Error, "decrypt/parse failed")
 		return
 	}
+	span.SetAttributes(
+		attribute.String("packet.act", pack.Act),
+		attribute.String("packet.event", pack.Event),
+	)
+
 	if pack.Act == `DEVICE_UP` || pack.Act == `DEVICE_UPDATE` {
 		session.Set(`LastPack`, utils.Unix)
 		utility.OnDevicePack(data, session)
 		return
 	}
 	if !common.Devices.Has(session.UUID) {
+		addr, _ := session.Get(`Address`)
+		common.Warn(nil, `WS_MESSAGE`, `fail`, `device not registered`, map[string]any{
+			`from`:        addr,
+			`sessionUUID`: session.UUID[:8] + `...`,
+			`action`:      pack.Act,
+		})
 		session.CloseWithMsg(melody.FormatCloseMessage(1001, `invalid device id`))
+		span.SetStatus(codes.Error, "device not registered")
 		return
 	}
+	_, actSpan := wsTracer.Start(ctx, "ws.action", trace.WithAttributes(
+		attribute.String("act", pack.Act),
+		attribute.String("session.uuid", session.UUID),
+	))
 	common.CallEvent(pack, session)
+	actSpan.End()
 	session.Set(`LastPack`, utils.Unix)
 }
 
 func wsOnDisconnect(session *melody.Session) {
+	_, span := wsTracer.Start(context.Background(), "ws.disconnect", trace.WithAttributes(
+		attribute.String("session.uuid", session.UUID),
+	))
+	defer span.End()
+
 	if device, ok := common.Devices.Get(session.UUID); ok {
 		terminal.CloseSessionsByDevice(device.ID)
 		desktop.CloseSessionsByDevice(device.ID)
@@ -317,15 +439,38 @@ func wsHealthCheck(container *melody.Melody) {
 			val, ok := s.Get(`LastPack`)
 			if !ok {
 				queue = append(queue, s)
+				addr, _ := s.Get(`Address`)
+				common.Warn(nil, `WS_HEALTH_CHECK`, `timeout`, `no LastPack set`, map[string]any{
+					`from`:        addr,
+					`sessionUUID`: uuid[:8] + `...`,
+				})
 				return true
 			}
 			lastPack, ok := val.(int64)
 			if !ok {
 				queue = append(queue, s)
+				addr, _ := s.Get(`Address`)
+				common.Warn(nil, `WS_HEALTH_CHECK`, `timeout`, `invalid LastPack type`, map[string]any{
+					`from`:        addr,
+					`sessionUUID`: uuid[:8] + `...`,
+				})
 				return true
 			}
-			if timestamp-lastPack > MaxIdleSeconds {
+			idleSeconds := timestamp - lastPack
+			if idleSeconds > MaxIdleSeconds {
 				queue = append(queue, s)
+				addr, _ := s.Get(`Address`)
+				device, _ := common.Devices.Get(uuid)
+				deviceInfo := map[string]any{`uuid`: uuid[:8] + `...`}
+				if device != nil {
+					deviceInfo[`name`] = device.Hostname
+					deviceInfo[`ip`] = device.WAN
+				}
+				common.Warn(nil, `WS_HEALTH_CHECK`, `timeout`, fmt.Sprintf(`idle for %d seconds`, idleSeconds), map[string]any{
+					`from`:        addr,
+					`device`:      deviceInfo,
+					`idleSeconds`: idleSeconds,
+				})
 			}
 			return true
 		})

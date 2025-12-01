@@ -245,15 +245,18 @@ function handleRTCCandidate(data) {
 	});
 }
 
-function sendData(data) {
-	if (conn && ws && ws.readyState === WebSocket.OPEN) {
-		let body = encrypt(str2ua(JSON.stringify(data)), secret);
-		let buffer = new Uint8Array(body.length + 8);
-		buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
-		buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
-		buffer.set(body, 8);
-		ws.send(buffer);
-	}
+async function sendData(data) {
+	if (!conn || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+	// encrypt returns a Promise; normalise to a Uint8Array so .length and .set offsets are valid
+	const encrypted = await encrypt(str2ua(JSON.stringify(data)), secret);
+	const body = encrypted instanceof Uint8Array ? encrypted : new Uint8Array(encrypted);
+	const buffer = new Uint8Array(body.length + 8);
+
+	buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
+	buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
+	buffer.set(body, 8);
+	ws.send(buffer);
 }
 
 function queueInput(event) {

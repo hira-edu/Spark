@@ -246,13 +246,16 @@ function Guest() {
 		}
 	}
 
-	function sendData(body) {
+	async function sendData(body) {
 		const ws = wsRef.current;
 		if (!ws || ws.readyState !== WebSocket.OPEN || !secretRef.current) {
 			return;
 		}
-		const payload = encrypt(str2ua(JSON.stringify(body)), secretRef.current);
+
+		const encrypted = await encrypt(str2ua(JSON.stringify(body)), secretRef.current);
+		const payload = encrypted instanceof Uint8Array ? encrypted : new Uint8Array(encrypted);
 		const buffer = new Uint8Array(payload.length + 8);
+
 		buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
 		buffer.set(new Uint8Array([payload.length >> 8, payload.length & 0xFF]), 6);
 		buffer.set(payload, 8);
