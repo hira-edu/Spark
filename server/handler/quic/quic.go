@@ -284,17 +284,32 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 	}
 
 	// Generate a fresh random secret for this session (security best practice)
-	secret := make([]byte, 32)
-	if _, err := io.ReadFull(cryptoRand.Reader, secret); err != nil {
+	randomSecret := make([]byte, 32)
+	if _, err := io.ReadFull(cryptoRand.Reader, randomSecret); err != nil {
 		return nil, fmt.Errorf("failed to generate secret: %w", err)
 	}
+
+	// Derive session key from random secret using HKDF for forward secrecy
+	// This ensures the session key is derived from both server material and random entropy
+	sessionKey := make([]byte, 32)
+	kdf := hkdf.New(sha256.New, randomSecret, s.hmacKey, []byte("spark-quic-session-v1"))
+	if _, err := io.ReadFull(kdf, sessionKey); err != nil {
+		return nil, fmt.Errorf("failed to derive session key: %w", err)
+	}
+
+	// Compute HMAC on handshake response (authenticates server and prevents MitM)
+	// HMAC = HMAC-SHA256(hmacKey, randomSecret + deviceID)
+	mac := hmac.New(sha256.New, s.hmacKey)
+	mac.Write(randomSecret)
+	mac.Write([]byte(deviceID))
+	handshakeHMAC := hex.EncodeToString(mac.Sum(nil))
 
 	// Create session context
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	session := &QUICSession{
 		UUID:        connUUID,
-		Secret:      secret,
+		Secret:      sessionKey, // Use derived key, not random secret
 		Conn:        conn,
 		Stream:      stream,
 		LastSeen:    time.Now(),
@@ -303,9 +318,10 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 		cancel:      cancel,
 	}
 
-	// Send handshake response
+	// Send handshake response with secret and HMAC
 	response := map[string]string{
-		"secret": hex.EncodeToString(secret),
+		"secret": hex.EncodeToString(randomSecret), // Send random secret, client will derive same key
+		"hmac":   handshakeHMAC,
 	}
 
 	respData, err := json.Marshal(response)

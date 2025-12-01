@@ -190,6 +190,27 @@ func init() {
 		golog.Warn(`Commit hash not set at build time; using fallback 'dev'`)
 	}
 
+	// Initialize transport defaults if not configured
+	if Config.Transport == nil {
+		Config.Transport = &transport{}
+	}
+	if Config.Transport.LongPolling == nil {
+		Config.Transport.LongPolling = &longPolling{Enable: true} // Default: enabled
+	}
+	if Config.Transport.QUIC == nil {
+		Config.Transport.QUIC = &quic{
+			Enable: true,
+			Listen: Config.Listen, // Use same port as main server
+		}
+	}
+	if Config.Transport.DNS == nil {
+		Config.Transport.DNS = &dnsConfig{
+			Enable: false, // Default: disabled (requires DNS domain setup)
+			Listen: ":53",
+			Domain: "", // Must be configured by operator
+		}
+	}
+
 	golog.SetLevel(utils.If(len(Config.Log.Level) == 0, `info`, Config.Log.Level))
 }
 

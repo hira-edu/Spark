@@ -41,7 +41,7 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 
 		// DNS tunneling config
 		DNSServer: dnsServer,
-		DNSDomain: config.Config.DNSTunnelDomain,
+		DNSDomain: config.Config.DNSDomain,
 
 		// Long polling config
 		LongPollTimeout: 30 * time.Second,
@@ -93,9 +93,11 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 }
 
 // connectWithAutoFallback automatically chooses between new and legacy connection methods
-// Uses config.Config.EnableTransportFallback to determine behavior
+// Uses individual transport flags to determine behavior
 func connectWithAutoFallback(ctx context.Context) (*common.Conn, error) {
-	if config.Config.EnableTransportFallback {
+	// Check if any fallback transports are enabled
+	hasFallback := config.Config.EnableQUIC || config.Config.EnableLongPoll || config.Config.EnableDNS
+	if hasFallback {
 		return connectWithFallback(ctx)
 	}
 	// Legacy WebSocket-only connection

@@ -16,6 +16,8 @@ let ComponentMap = {
   Desktop: null,
   Execute: null,
   Share: null,
+  Audio: null,
+  Webcam: null,
 };
 
 /**
@@ -41,6 +43,8 @@ const OverviewDashboard = () => {
   const [generate, setGenerate] = useState(false);
   const [terminal, setTerminal] = useState(false);
   const [share, setShare] = useState(false);
+  const [audio, setAudio] = useState(false);
+  const [webcam, setWebcam] = useState(false);
   const [screenBlob, setScreenBlob] = useState('');
 
   // Load component dynamically
@@ -65,12 +69,12 @@ const OverviewDashboard = () => {
 
   // Stop auto-refresh when any modal is open
   useEffect(() => {
-    if (!execute && !desktop && !procMgr && !explorer && !generate && !terminal && !share) {
+    if (!execute && !desktop && !procMgr && !explorer && !generate && !terminal && !share && !audio && !webcam) {
       startAutoRefresh(3000);
     } else {
       stopAutoRefresh();
     }
-  }, [execute, desktop, procMgr, explorer, generate, terminal, share, startAutoRefresh, stopAutoRefresh]);
+  }, [execute, desktop, procMgr, explorer, generate, terminal, share, audio, webcam, startAutoRefresh, stopAutoRefresh]);
 
   // Handle device actions
   const handleDeviceAction = (action, device) => {
@@ -82,6 +86,8 @@ const OverviewDashboard = () => {
       execute: setExecute,
       desktop: setDesktop,
       share: setShare,
+      audio: setAudio,
+      webcam: setWebcam,
     };
 
     if (hooksMap[action]) {
@@ -188,6 +194,20 @@ const OverviewDashboard = () => {
           open={!!share}
           onClose={() => setShare(false)}
           devices={devices}
+        />
+      )}
+      {ComponentMap.Audio && (
+        <ComponentMap.Audio
+          open={audio}
+          device={audio}
+          onCancel={setAudio.bind(null, false)}
+        />
+      )}
+      {ComponentMap.Webcam && (
+        <ComponentMap.Webcam
+          open={webcam}
+          device={webcam}
+          onCancel={setWebcam.bind(null, false)}
         />
       )}
 

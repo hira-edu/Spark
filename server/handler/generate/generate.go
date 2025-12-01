@@ -26,6 +26,15 @@ type clientCfg struct {
 	Path   string `json:"path"`
 	UUID   string `json:"uuid"`
 	Key    string `json:"key"`
+
+	// Transport fallback configuration
+	EnableQUIC     bool   `json:"enable_quic"`      // Enable QUIC transport
+	QUICPort       int    `json:"quic_port"`        // QUIC port (default: host port)
+	EnableLongPoll bool   `json:"enable_longpoll"`  // Enable long polling
+	EnableDNS      bool   `json:"enable_dns"`       // Enable DNS tunneling
+	DNSDomain      string `json:"dns_domain"`       // DNS domain for tunneling
+	DNSServer      string `json:"dns_server"`       // DNS server address
+	EnableMimicry  bool   `json:"enable_mimicry"`   // Enable protocol mimicry
 }
 
 var (
@@ -40,6 +49,15 @@ func CheckClient(ctx *gin.Context) {
 		Port   uint16 `json:"port" yaml:"port" form:"port" binding:"required"`
 		Path   string `json:"path" yaml:"path" form:"path" binding:"required"`
 		Secure string `json:"secure" yaml:"secure" form:"secure"`
+
+		// Transport fallback options
+		EnableQUIC     string `json:"enable_quic" yaml:"enable_quic" form:"enable_quic"`
+		QUICPort       uint16 `json:"quic_port" yaml:"quic_port" form:"quic_port"`
+		EnableLongPoll string `json:"enable_longpoll" yaml:"enable_longpoll" form:"enable_longpoll"`
+		EnableDNS      string `json:"enable_dns" yaml:"enable_dns" form:"enable_dns"`
+		DNSDomain      string `json:"dns_domain" yaml:"dns_domain" form:"dns_domain"`
+		DNSServer      string `json:"dns_server" yaml:"dns_server" form:"dns_server"`
+		EnableMimicry  string `json:"enable_mimicry" yaml:"enable_mimicry" form:"enable_mimicry"`
 	}
 	if err := ctx.ShouldBind(&form); err != nil {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
@@ -50,13 +68,60 @@ func CheckClient(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(http.StatusNotFound, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.NO_PREBUILT_FOUND}`})
 		return
 	}
+	// Use server config defaults when form doesn't specify transport settings
+	enableQUIC := servercfg.Config.Transport.QUIC.Enable
+	if form.EnableQUIC != "" {
+		enableQUIC = form.EnableQUIC == `true`
+	}
+
+	enableLongPoll := servercfg.Config.Transport.LongPolling.Enable
+	if form.EnableLongPoll != "" {
+		enableLongPoll = form.EnableLongPoll == `true`
+	}
+
+	enableDNS := servercfg.Config.Transport.DNS.Enable
+	if form.EnableDNS != "" {
+		enableDNS = form.EnableDNS == `true`
+	}
+
+	// Use default QUIC port if not specified (defaults to main port)
+	quicPort := int(form.Port)
+	if form.QUICPort > 0 {
+		quicPort = int(form.QUICPort)
+	}
+
+	// DNS domain from server config or form
+	dnsDomain := servercfg.Config.Transport.DNS.Domain
+	if form.DNSDomain != "" {
+		dnsDomain = form.DNSDomain
+	}
+
+	// DNS server defaults to 8.8.8.8:53 if not specified
+	dnsServer := "8.8.8.8:53"
+	if form.DNSServer != "" {
+		dnsServer = form.DNSServer
+	}
+
+	// Mimicry defaults to false
+	enableMimicry := false
+	if form.EnableMimicry == `true` {
+		enableMimicry = true
+	}
+
 	_, err = genConfig(clientCfg{
-		Secure: form.Secure == `true`,
-		Host:   form.Host,
-		Port:   int(form.Port),
-		Path:   form.Path,
-		UUID:   strings.Repeat(`FF`, 16),
-		Key:    strings.Repeat(`FF`, 32),
+		Secure:         form.Secure == `true`,
+		Host:           form.Host,
+		Port:           int(form.Port),
+		Path:           form.Path,
+		UUID:           strings.Repeat(`FF`, 16),
+		Key:            strings.Repeat(`FF`, 32),
+		EnableQUIC:     enableQUIC,
+		QUICPort:       quicPort,
+		EnableLongPoll: enableLongPoll,
+		EnableDNS:      enableDNS,
+		DNSDomain:      dnsDomain,
+		DNSServer:      dnsServer,
+		EnableMimicry:  enableMimicry,
 	})
 	if err != nil {
 		if err == ErrTooLargeEntity {
@@ -77,6 +142,15 @@ func GenerateClient(ctx *gin.Context) {
 		Port   uint16 `json:"port" yaml:"port" form:"port" binding:"required"`
 		Path   string `json:"path" yaml:"path" form:"path" binding:"required"`
 		Secure string `json:"secure" yaml:"secure" form:"secure"`
+
+		// Transport fallback options
+		EnableQUIC     string `json:"enable_quic" yaml:"enable_quic" form:"enable_quic"`
+		QUICPort       uint16 `json:"quic_port" yaml:"quic_port" form:"quic_port"`
+		EnableLongPoll string `json:"enable_longpoll" yaml:"enable_longpoll" form:"enable_longpoll"`
+		EnableDNS      string `json:"enable_dns" yaml:"enable_dns" form:"enable_dns"`
+		DNSDomain      string `json:"dns_domain" yaml:"dns_domain" form:"dns_domain"`
+		DNSServer      string `json:"dns_server" yaml:"dns_server" form:"dns_server"`
+		EnableMimicry  string `json:"enable_mimicry" yaml:"enable_mimicry" form:"enable_mimicry"`
 	}
 	if err := ctx.ShouldBind(&form); err != nil {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
@@ -94,13 +168,60 @@ func GenerateClient(ctx *gin.Context) {
 		ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.CONFIG_GENERATE_FAILED}`})
 		return
 	}
+	// Use server config defaults when form doesn't specify transport settings
+	enableQUIC := servercfg.Config.Transport.QUIC.Enable
+	if form.EnableQUIC != "" {
+		enableQUIC = form.EnableQUIC == `true`
+	}
+
+	enableLongPoll := servercfg.Config.Transport.LongPolling.Enable
+	if form.EnableLongPoll != "" {
+		enableLongPoll = form.EnableLongPoll == `true`
+	}
+
+	enableDNS := servercfg.Config.Transport.DNS.Enable
+	if form.EnableDNS != "" {
+		enableDNS = form.EnableDNS == `true`
+	}
+
+	// Use default QUIC port if not specified (defaults to main port)
+	quicPort := int(form.Port)
+	if form.QUICPort > 0 {
+		quicPort = int(form.QUICPort)
+	}
+
+	// DNS domain from server config or form
+	dnsDomain := servercfg.Config.Transport.DNS.Domain
+	if form.DNSDomain != "" {
+		dnsDomain = form.DNSDomain
+	}
+
+	// DNS server defaults to 8.8.8.8:53 if not specified
+	dnsServer := "8.8.8.8:53"
+	if form.DNSServer != "" {
+		dnsServer = form.DNSServer
+	}
+
+	// Mimicry defaults to false
+	enableMimicry := false
+	if form.EnableMimicry == `true` {
+		enableMimicry = true
+	}
+
 	cfgBytes, err := genConfig(clientCfg{
-		Secure: form.Secure == `true`,
-		Host:   form.Host,
-		Port:   int(form.Port),
-		Path:   form.Path,
-		UUID:   hex.EncodeToString(clientUUID),
-		Key:    hex.EncodeToString(clientKey),
+		Secure:         form.Secure == `true`,
+		Host:           form.Host,
+		Port:           int(form.Port),
+		Path:           form.Path,
+		UUID:           hex.EncodeToString(clientUUID),
+		Key:            hex.EncodeToString(clientKey),
+		EnableQUIC:     enableQUIC,
+		QUICPort:       quicPort,
+		EnableLongPoll: enableLongPoll,
+		EnableDNS:      enableDNS,
+		DNSDomain:      dnsDomain,
+		DNSServer:      dnsServer,
+		EnableMimicry:  enableMimicry,
 	})
 	if err != nil {
 		if err == ErrTooLargeEntity {

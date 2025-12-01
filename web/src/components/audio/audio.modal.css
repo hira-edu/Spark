@@ -1,0 +1,23 @@
+.audio-modal {
+  top: 40px !important;
+}
+
+.audio-modal .ant-modal-content {
+  background: transparent;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.audio-modal .ant-modal-body {
+  padding: 0;
+  height: 80vh;
+  overflow: hidden;
+}
+
+.audio-modal-content {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}

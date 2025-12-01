@@ -160,10 +160,11 @@ func attemptConnection(ctx context.Context) error {
 	default:
 	}
 
-	// Connect using transport fallback if enabled
+	// Connect using transport fallback if any fallback transports are enabled
 	var wsConn *common.Conn
 	var err error
-	if config.Config.EnableTransportFallback {
+	hasFallback := config.Config.EnableQUIC || config.Config.EnableLongPoll || config.Config.EnableDNS
+	if hasFallback {
 		wsConn, err = connectWithAutoFallback(ctx)
 	} else {
 		wsConn, err = connectWS()

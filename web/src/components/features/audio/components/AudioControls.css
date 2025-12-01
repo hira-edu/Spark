@@ -1,0 +1,106 @@
+.audio-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.audio-controls-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+/* Volume Control */
+.audio-controls-volume {
+  padding: 16px;
+  background: rgba(59, 130, 246, 0.05);
+  border-radius: 8px;
+}
+
+.audio-controls-mute-btn {
+  font-size: 20px;
+  color: #3b82f6 !important;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.audio-controls-mute-btn--muted {
+  color: #ff4d4f !important;
+}
+
+.audio-controls-slider {
+  flex: 1;
+  margin: 0 !important;
+}
+
+.audio-controls-volume-label {
+  min-width: 48px;
+  text-align: right;
+  font-size: 14px;
+  font-weight: 600;
+  color: #3b82f6;
+}
+
+/* Action Buttons */
+.audio-controls-actions {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.audio-controls-record-btn,
+.audio-controls-stop-btn {
+  min-width: 160px;
+  height: 40px;
+  font-weight: 600;
+  border-radius: 8px;
+}
+
+.audio-controls-record-btn:not(.ant-btn-primary) {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: #3b82f6;
+}
+
+.audio-controls-record-btn:not(.ant-btn-primary):hover {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #60a5fa;
+}
+
+.audio-controls-record-btn.ant-btn-primary {
+  animation: recordingPulse 2s ease-in-out infinite;
+}
+
+@keyframes recordingPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(255, 77, 79, 0);
+  }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .audio-controls {
+    gap: 16px;
+  }
+
+  .audio-controls-volume {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .audio-controls-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .audio-controls-record-btn,
+  .audio-controls-stop-btn {
+    width: 100%;
+  }
+}

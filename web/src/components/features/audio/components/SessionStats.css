@@ -1,0 +1,58 @@
+.session-stats {
+  width: 100%;
+}
+
+.session-stats-recording {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.session-stats-recording-tag {
+  font-size: 14px;
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-weight: 600;
+  animation: recordingBlink 2s ease-in-out infinite;
+}
+
+@keyframes recordingBlink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.session-stats-card {
+  background: rgba(255, 255, 255, 0.02) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 8px !important;
+  transition: all 0.3s ease;
+}
+
+.session-stats-card:hover {
+  background: rgba(255, 255, 255, 0.05) !important;
+  border-color: rgba(59, 130, 246, 0.3) !important;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.session-stats-card .ant-statistic-title {
+  color: #a0a0a0;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.session-stats-card .ant-statistic-content {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .session-stats-card .ant-statistic-content {
+    font-size: 18px;
+  }
+}

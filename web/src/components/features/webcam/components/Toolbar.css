@@ -1,0 +1,51 @@
+.webcam-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  background: rgba(26, 26, 46, 0.95);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.2);
+  backdrop-filter: blur(10px);
+}
+
+.webcam-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.webcam-toolbar-icon {
+  font-size: 20px;
+  color: #3b82f6;
+}
+
+.webcam-toolbar-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.webcam-toolbar-status {
+  font-weight: 500;
+}
+
+.webcam-toolbar-stats {
+  margin-left: 8px;
+}
+
+.webcam-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.webcam-toolbar-close {
+  color: #e0e0e0 !important;
+  transition: all 0.3s ease;
+}
+
+.webcam-toolbar-close:hover {
+  color: #ff4d4f !important;
+  background: rgba(255, 77, 79, 0.1) !important;
+}

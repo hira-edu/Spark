@@ -48,6 +48,8 @@ const DeviceCard = ({ device, onAction }) => {
   const moreActions = [
     { key: 'execute', label: i18n.t('OVERVIEW.EXECUTE') },
     { key: 'screenshot', label: i18n.t('OVERVIEW.SCREENSHOT') },
+    { key: 'audio', label: i18n.t('OVERVIEW.AUDIO') },
+    { key: 'webcam', label: i18n.t('OVERVIEW.WEBCAM') },
     { key: 'share', label: i18n.t('COMMON.SHARE') || 'Share' },
     { type: 'divider' },
     { key: 'lock', label: i18n.t('OVERVIEW.LOCK') },

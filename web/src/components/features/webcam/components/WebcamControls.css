@@ -1,0 +1,103 @@
+.webcam-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.webcam-controls-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.webcam-controls-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #a0a0a0;
+  margin-bottom: 4px;
+}
+
+.webcam-controls-value {
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #3b82f6;
+  margin-top: 4px;
+}
+
+.webcam-controls-select .ant-select-selector {
+  background: rgba(59, 130, 246, 0.1) !important;
+  border-color: rgba(59, 130, 246, 0.3) !important;
+  color: #e0e0e0 !important;
+}
+
+.webcam-controls-select .ant-select-arrow {
+  color: #3b82f6 !important;
+}
+
+.webcam-controls-actions {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.webcam-controls-snapshot-btn,
+.webcam-controls-record-btn,
+.webcam-controls-stop-btn {
+  min-width: 160px;
+  height: 40px;
+  font-weight: 600;
+  border-radius: 8px;
+}
+
+.webcam-controls-snapshot-btn {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: #3b82f6;
+}
+
+.webcam-controls-snapshot-btn:hover {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #60a5fa;
+}
+
+.webcam-controls-record-btn:not(.ant-btn-primary) {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.3);
+  color: #3b82f6;
+}
+
+.webcam-controls-record-btn:not(.ant-btn-primary):hover {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: rgba(59, 130, 246, 0.5);
+  color: #60a5fa;
+}
+
+.webcam-controls-record-btn.ant-btn-primary {
+  animation: recordingPulse 2s ease-in-out infinite;
+}
+
+@keyframes recordingPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 77, 79, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(255, 77, 79, 0);
+  }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .webcam-controls-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .webcam-controls-snapshot-btn,
+  .webcam-controls-record-btn,
+  .webcam-controls-stop-btn {
+    width: 100%;
+  }
+}

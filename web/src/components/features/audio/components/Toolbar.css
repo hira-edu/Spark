@@ -1,0 +1,46 @@
+.audio-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  background: rgba(26, 26, 46, 0.95);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.2);
+  backdrop-filter: blur(10px);
+}
+
+.audio-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.audio-toolbar-icon {
+  font-size: 20px;
+  color: #3b82f6;
+}
+
+.audio-toolbar-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.audio-toolbar-status {
+  font-weight: 500;
+}
+
+.audio-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.audio-toolbar-close {
+  color: #e0e0e0 !important;
+  transition: all 0.3s ease;
+}
+
+.audio-toolbar-close:hover {
+  color: #ff4d4f !important;
+  background: rgba(255, 77, 79, 0.1) !important;
+}
