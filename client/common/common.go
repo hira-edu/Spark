@@ -14,7 +14,8 @@ import (
 )
 
 type Conn struct {
-	*ws.Conn
+	*ws.Conn // WebSocket connection (nil if using adapter)
+	adapter   TransportAdapter // Generic transport adapter (nil if using WebSocket)
 	secret    []byte
 	secretHex string
 	writeMu   sync.Mutex // Separate write mutex for better concurrency
@@ -52,6 +53,15 @@ func (wsConn *Conn) SendData(data []byte) error {
 		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
 	}
 
+	// Route to appropriate transport
+	if wsConn.adapter != nil {
+		// Using transport adapter (QUIC, Long Polling, DNS, etc.)
+		wsConn.adapter.SetWriteDeadline(utils.Now.Add(5 * time.Second))
+		defer wsConn.adapter.SetWriteDeadline(time.Time{})
+		return wsConn.adapter.Write(data)
+	}
+
+	// Using WebSocket
 	wsConn.SetWriteDeadline(utils.Now.Add(5 * time.Second))
 	defer wsConn.SetWriteDeadline(time.Time{})
 	return wsConn.WriteMessage(ws.BinaryMessage, data)
@@ -89,6 +99,15 @@ func (wsConn *Conn) SendPack(pack any) error {
 		return errors.New(`${i18n|COMMON.DISCONNECTED}`)
 	}
 
+	// Route to appropriate transport
+	if wsConn.adapter != nil {
+		// Using transport adapter
+		wsConn.adapter.SetWriteDeadline(utils.Now.Add(5 * time.Second))
+		defer wsConn.adapter.SetWriteDeadline(time.Time{})
+		return wsConn.adapter.Write(data)
+	}
+
+	// Using WebSocket
 	wsConn.SetWriteDeadline(utils.Now.Add(5 * time.Second))
 	defer wsConn.SetWriteDeadline(time.Time{})
 	return wsConn.WriteMessage(ws.BinaryMessage, data)
@@ -116,9 +135,44 @@ func (wsConn *Conn) SendRawData(event, data []byte, service byte, op byte) error
 	binary.BigEndian.PutUint16(buffer[22:24], uint16(len(data)))
 	buffer = append(buffer, data...)
 
+	// Route to appropriate transport
+	if wsConn.adapter != nil {
+		// Using transport adapter
+		wsConn.adapter.SetWriteDeadline(utils.Now.Add(5 * time.Second))
+		defer wsConn.adapter.SetWriteDeadline(time.Time{})
+		return wsConn.adapter.Write(buffer)
+	}
+
+	// Using WebSocket
 	wsConn.SetWriteDeadline(utils.Now.Add(5 * time.Second))
 	defer wsConn.SetWriteDeadline(time.Time{})
 	return wsConn.WriteMessage(ws.BinaryMessage, buffer)
+}
+
+// Close closes the connection (WebSocket or adapter)
+func (wsConn *Conn) Close() error {
+	if wsConn.adapter != nil {
+		return wsConn.adapter.Close()
+	}
+	if wsConn.Conn != nil {
+		return wsConn.Conn.Close()
+	}
+	return nil
+}
+
+// ReadMessage reads a message from the connection
+func (wsConn *Conn) ReadMessage() (int, []byte, error) {
+	if wsConn.adapter != nil {
+		// Using transport adapter
+		data, err := wsConn.adapter.Read()
+		if err != nil {
+			return 0, nil, err
+		}
+		return ws.BinaryMessage, data, nil
+	}
+
+	// Using WebSocket
+	return wsConn.Conn.ReadMessage()
 }
 
 func (wsConn *Conn) SendCallback(pack, prev modules.Packet) error {
