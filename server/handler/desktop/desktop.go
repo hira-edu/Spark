@@ -2,7 +2,6 @@ package desktop
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -89,20 +88,6 @@ func InitDesktop(ctx *gin.Context) {
 		return
 	}
 
-	secretStr, ok := ctx.GetQuery(`secret`)
-	if !ok || len(secretStr) != 32 {
-		logAbort(http.StatusBadRequest, `missing secret`, map[string]any{
-			`secretLen`: len(secretStr),
-		})
-		return
-	}
-	secret, err := hex.DecodeString(secretStr)
-	if err != nil {
-		logAbort(http.StatusBadRequest, `secret decode failed`, map[string]any{
-			`error`: err.Error(),
-		})
-		return
-	}
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
 		logAbort(http.StatusBadRequest, `missing device`, nil)
@@ -121,19 +106,16 @@ func InitDesktop(ctx *gin.Context) {
 	}
 
 	desktopSessions.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
-		`Secret`:   secret,
 		`Device`:   device,
 		`LastPack`: utils.Unix,
 	})
 
 	common.Info(ctx, `DESKTOP_HANDSHAKE`, `success`, ``, map[string]any{
 		`device`:     device,
-		`secret_len`: len(secret),
 		`latency_ms`: time.Since(start).Milliseconds(),
 	})
 	span.SetAttributes(
 		attribute.String("desktop.device", device),
-		attribute.Int("desktop.secret_len", len(secret)),
 		attribute.Int64("latency_ms", time.Since(start).Milliseconds()),
 		attribute.String("origin", ctx.GetHeader(`Origin`)),
 	)

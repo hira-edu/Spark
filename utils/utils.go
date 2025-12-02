@@ -45,51 +45,25 @@ func Max[T int | int32 | int64 | uint | uint32 | uint64 | float32 | float64](a, 
 
 // XOR performs simple XOR encryption (deprecated, use StreamEncrypt instead)
 // Kept for backwards compatibility during transition
+// XOR - encryption removed; returns data unchanged
+// TLS provides transport security, making XOR encryption redundant
 func XOR(data []byte, key []byte) []byte {
-	if len(key) == 0 {
-		return data
-	}
-	for i := 0; i < len(data); i++ {
-		data[i] = data[i] ^ key[i%len(key)]
-	}
+	_ = key // Unused
 	return data
 }
 
-// StreamEncrypt encrypts data using AES-CTR for streaming purposes
-// Uses the first 32 bytes of key as AES key and derives IV from key
-// This is suitable for real-time streaming where each session has a unique key
+// StreamEncrypt - encryption removed; returns data unchanged
+// TLS provides transport security, making stream encryption redundant
 func StreamEncrypt(data []byte, key []byte) []byte {
-	if len(key) < 32 {
-		// Fallback to XOR if key is too short (shouldn't happen)
-		return XOR(data, key)
-	}
-
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return XOR(data, key)
-	}
-
-	// Derive IV from key (last 16 bytes or XOR of key bytes)
-	iv := make([]byte, 16)
-	if len(key) >= 48 {
-		copy(iv, key[32:48])
-	} else {
-		// Derive IV by XORing key bytes (matches JavaScript implementation)
-		for i := 0; i < len(key); i++ {
-			iv[i%16] ^= key[i]
-		}
-	}
-
-	result := make([]byte, len(data))
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(result, data)
-	return result
+	_ = key // Unused
+	return data
 }
 
-// StreamDecrypt decrypts data encrypted with StreamEncrypt
-// AES-CTR is symmetric so encrypt and decrypt are the same operation
+// StreamDecrypt - decryption removed; returns data unchanged
+// TLS provides transport security, making stream decryption redundant
 func StreamDecrypt(data []byte, key []byte) []byte {
-	return StreamEncrypt(data, key)
+	_ = key // Unused
+	return data
 }
 
 func GenRandByte(n int) []byte {
@@ -122,53 +96,20 @@ func GetSHA256(data []byte) ([]byte, string) {
 	return result[:16], hex.EncodeToString(result)
 }
 
-// Encrypt uses AES-CTR with random IV and SHA-256 for integrity
-// Format: [Version(1)] [IV(16)] [SHA256-Checksum(16)] [Encrypted(data + nonce(64))]
-// Version 2 uses SHA-256, Version 1 (legacy) uses MD5
+// Encrypt - encryption removed; returns a copy of data unchanged
+// TLS provides transport security, making application-layer encryption redundant
 func Encrypt(data []byte, key []byte) ([]byte, error) {
-	// Generate random IV (more secure than deriving from plaintext)
-	iv := make([]byte, 16)
-	rand.Reader.Read(iv)
-
-	// Add random nonce to prevent replay attacks
-	nonce := make([]byte, 64)
-	rand.Reader.Read(nonce)
-	plaintext := append(data, nonce...)
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	// Encrypt with random IV
-	stream := cipher.NewCTR(block, iv)
-	encBuffer := make([]byte, len(plaintext))
-	stream.XORKeyStream(encBuffer, plaintext)
-
-	// Calculate SHA-256 checksum (truncated to 16 bytes)
-	checksum, _ := GetSHA256(plaintext)
-
-	// Format: [Version(1)] [IV(16)] [Checksum(16)] [Encrypted]
-	result := make([]byte, 1+16+16+len(encBuffer))
-	result[0] = 2 // Version 2 = SHA-256
-	copy(result[1:17], iv)
-	copy(result[17:33], checksum)
-	copy(result[33:], encBuffer)
-
-	return result, nil
+	_ = key // Unused
+	// Return a copy for safety (avoid shared slice modifications)
+	return append([]byte(nil), data...), nil
 }
 
-// Decrypt supports both V2 (SHA-256) and V1 (MD5/legacy) formats
+// Decrypt - decryption removed; returns a copy of data unchanged
+// TLS provides transport security, making application-layer encryption redundant
 func Decrypt(data []byte, key []byte) ([]byte, error) {
-	dataLen := len(data)
-
-	// Check for V2 format (starts with version byte 2)
-	if dataLen > 33+64 && data[0] == 2 {
-		return decryptV2(data, key)
-	}
-
-	// Legacy V1 format: MD5[16 bytes] + Data[n bytes] + Nonce[64 bytes]
-	return decryptV1(data, key)
+	_ = key // Unused
+	// Return a copy for safety (avoid shared slice modifications)
+	return append([]byte(nil), data...), nil
 }
 
 // decryptV2 handles new SHA-256 based encryption

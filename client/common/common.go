@@ -14,7 +14,7 @@ import (
 )
 
 type Conn struct {
-	*ws.Conn // WebSocket connection (nil if using adapter)
+	*ws.Conn                   // WebSocket connection (nil if using adapter)
 	adapter   TransportAdapter // Generic transport adapter (nil if using WebSocket)
 	secret    []byte
 	secretHex string
@@ -69,10 +69,6 @@ func (wsConn *Conn) SendData(data []byte) error {
 
 func (wsConn *Conn) SendPack(pack any) error {
 	data, err := utils.JSON.Marshal(pack)
-	if err != nil {
-		return err
-	}
-	data, err = utils.Encrypt(data, wsConn.secret)
 	if err != nil {
 		return err
 	}

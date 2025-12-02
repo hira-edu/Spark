@@ -74,10 +74,10 @@ const (
 
 // Screen capture settings
 const (
-	fpsDefault   = 24 // Default frames per second
+	fpsDefault   = 30 // Default frames per second (increased from 24 for smoother experience)
 	blockSize    = 96 // Pixel block size for delta encoding
 	frameBuffer  = 3  // Max queued frames before dropping
-	imageQuality = 40 // JPEG quality (0-100) - used for default codec (lower default to reduce bandwidth)
+	imageQuality = 30 // JPEG quality (0-100) - lower for faster encoding & smaller frames
 )
 
 // Magic bytes for binary protocol
@@ -118,8 +118,8 @@ func UpdateRTT(rttMs int64) {
 }
 
 func clampFPSValue(fps int32) int32 {
-	if fps < 12 {
-		return 12
+	if fps < 15 {
+		return 15 // Minimum 15 FPS for usable experience
 	}
 	if fps > 60 {
 		return 60
@@ -634,9 +634,7 @@ func worker() {
 
 			if err != nil {
 				if err == errNoImage {
-					// FIXED: On ErrNoImageYet, maintain cadence and continue (Issue #4)
-					// No error counting - this is expected when screen is idle
-					time.Sleep(10 * time.Millisecond)
+					// Screen idle - DXGI detected no changes, continue without delay
 					continue
 				}
 

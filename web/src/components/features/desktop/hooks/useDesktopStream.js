@@ -72,6 +72,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     setLatency(0);
     setMonitors([]);
     setResolution({ width: 0, height: 0 });
+    setCursor({ x: 0, y: 0, hotX: 0, hotY: 0, width: 0, height: 0, visible: false, data: null, hash: 0, format: 'argb32' });
 
     const canvas = canvasRef.current;
     if (canvas && ctxRef.current) {
@@ -222,7 +223,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         hotY: cursorData.hotY || 0,
         width: cursorData.width || 0,
         height: cursorData.height || 0,
-        visible: cursorData.visible !== false,
+        visible: cursorData.visible === true, // Explicit check - only true if server says true
         data: cursorData.data || null,
         hash: cursorData.hash || 0,
         format: cursorData.format || 'argb32',

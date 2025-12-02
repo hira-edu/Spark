@@ -66,10 +66,10 @@ func StartWithContext(ctx context.Context) error {
 		0.2,            // ±20% jitter
 	)
 	circuitBreaker = telemetry.NewCircuitBreaker(
-		"websocket",     // name
-		10,              // 10 failures -> open
-		3,               // 3 successes -> close from half_open
-		5*time.Minute,   // wait 5 minutes before retry
+		"websocket",   // name
+		10,            // 10 failures -> open
+		3,             // 3 successes -> close from half_open
+		5*time.Minute, // wait 5 minutes before retry
 	)
 
 	golog.Info("run loop start")
@@ -323,10 +323,6 @@ func reportWS(wsConn *common.Conn) error {
 	if err != nil {
 		return err
 	}
-	data, err = utils.Decrypt(data, common.WSConn.GetSecret())
-	if err != nil {
-		return err
-	}
 	err = utils.JSON.Unmarshal(data, &pack)
 	if err != nil {
 		return err
@@ -470,19 +466,6 @@ func handleWS(wsConn *common.Conn) error {
 			continue
 		}
 
-		data, err = utils.Decrypt(data, wsConn.GetSecret())
-		if err != nil {
-			telemetry.LogWSError("decrypt failed", err, nil)
-			errCount++
-			if errCount > 3 {
-				telemetry.LogWSEvent("too many decrypt errors, disconnecting", map[string]interface{}{
-					"error_count": errCount,
-				})
-				break
-			}
-			continue
-		}
-
 		pack := modules.Packet{}
 		err = utils.JSON.Unmarshal(data, &pack)
 		if err != nil {
@@ -563,9 +546,9 @@ func handleAct(pack modules.Packet, wsConn *common.Conn) {
 type errorCategory int
 
 const (
-	errorTransient  errorCategory = iota // Network issues, timeouts
-	errorPermanent                       // Auth failures, 401/403
-	errorServer                          // Server errors, 500s
+	errorTransient errorCategory = iota // Network issues, timeouts
+	errorPermanent                      // Auth failures, 401/403
+	errorServer                         // Server errors, 500s
 )
 
 type categorizedError struct {
