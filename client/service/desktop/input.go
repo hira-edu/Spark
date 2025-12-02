@@ -60,17 +60,29 @@ func HandleInput(pack modules.Packet) error {
 	if !ok {
 		return errInputInvalid
 	}
-	if allow, ok := pack.GetData(`allowControl`, reflect.Bool); ok && !allow.(bool) {
-		return errInputUnsupported
-	}
 	if pack.Data == nil {
 		return errInputInvalid
 	}
 	session, ok := sessions.Get(desktopIDVal.(string))
-	if !ok || session.escape {
+	if !ok || session.escape.Load() {
 		return errInputSessionGone
 	}
-	bounds := displayBounds
+	if allow, ok := pack.GetData(`allowControl`, reflect.Bool); ok {
+		session.allowControl.Store(allow.(bool))
+		if !allow.(bool) {
+			return errInputUnsupported
+		}
+	}
+	if !session.allowControl.Load() {
+		return errInputUnsupported
+	}
+
+	// FIXED: Load displayBounds from atomic.Value (Issue #3)
+	boundsVal := displayBounds.Load()
+	if boundsVal == nil {
+		return errNoImage
+	}
+	bounds := boundsVal.(image.Rectangle)
 	if bounds.Dx() == 0 || bounds.Dy() == 0 {
 		return errNoImage
 	}

@@ -95,7 +95,7 @@ Add STUN/TURN lists to help WebRTC connections, especially when clients are behi
 ```
 
 - Server reads these lists to send to browsers; clients also honor `SPARK_WEBRTC_TURN`, `SPARK_WEBRTC_STUN`, `SPARK_WEBRTC_TURN_USERNAME`, and `SPARK_WEBRTC_TURN_PASSWORD` env vars (comma-separated URLs) when present.
-- To enable VP8/VP9 encoding for WebRTC, build the client with libvpx installed and `CGO_ENABLED=1 go build -tags vpx ./client`; without it, the WebRTC path falls back to stubs.
+- Default desktop streaming uses built-in JPEG/RAW codecs only (no external DLLs or drivers needed). Optional VP8/VP9/H.264 hardware paths require custom builds with the appropriate SDKs/libs; the stock binaries do not depend on them.
 
 ---
 
