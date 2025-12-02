@@ -28,27 +28,27 @@ import (
 
 const (
 	// Configuration constants (no hardcoded values in logic)
-	defaultPollTimeout     = 30 * time.Second
-	defaultSessionTimeout  = 5 * time.Minute
+	defaultPollTimeout    = 30 * time.Second
+	defaultSessionTimeout = 5 * time.Minute
 	maxQueueSize          = 1000
 	maxMessageSize        = common.MaxMessageSize
 	cleanupInterval       = 1 * time.Minute
 
 	// Rate limiting constants
-	sendRateLimitQPS      = 10  // Sends per second per UUID
-	sendRateLimitBurst    = 20  // Burst allowance per UUID
+	sendRateLimitQPS   = 10 // Sends per second per UUID
+	sendRateLimitBurst = 20 // Burst allowance per UUID
 )
 
 // Session represents a long polling session
 type Session struct {
-	UUID          string
-	Secret        []byte
-	LastSeen      time.Time
-	MessageQueue  chan *modules.Packet
-	RateLimiter   *rate.Limiter // Per-UUID rate limiter
-	mu            sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	UUID         string
+	Secret       []byte
+	LastSeen     time.Time
+	MessageQueue chan *modules.Packet
+	RateLimiter  *rate.Limiter // Per-UUID rate limiter
+	mu           sync.RWMutex
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // SessionManager manages all long polling sessions
@@ -310,22 +310,13 @@ send:
 		return
 	}
 
-	// Encrypt
-	encData, err := utils.Encrypt(data, session.Secret)
-	if err != nil {
-		ctx.AbortWithStatus(http.StatusInternalServerError)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "encrypt failed")
-		return
-	}
-
 	// Send response
-	ctx.Data(http.StatusOK, "application/octet-stream", encData)
+	ctx.Data(http.StatusOK, "application/octet-stream", data)
 
 	span.SetAttributes(
 		attribute.String("longpoll.uuid", uuid),
 		attribute.Int("longpoll.message_count", len(messages)),
-		attribute.Int("longpoll.data_size", len(encData)),
+		attribute.Int("longpoll.data_size", len(data)),
 	)
 }
 
@@ -381,8 +372,8 @@ func Send(ctx *gin.Context) {
 	// Update last seen
 	session.updateLastSeen()
 
-	// Read encrypted body
-	encData, err := io.ReadAll(io.LimitReader(ctx.Request.Body, maxMessageSize))
+	// Read body
+	rawData, err := io.ReadAll(io.LimitReader(ctx.Request.Body, maxMessageSize))
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.RecordError(err)
@@ -390,18 +381,9 @@ func Send(ctx *gin.Context) {
 		return
 	}
 
-	// Decrypt
-	data, err := utils.Decrypt(encData, session.Secret)
-	if err != nil {
-		ctx.AbortWithStatus(http.StatusBadRequest)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "decrypt failed")
-		return
-	}
-
 	// Unmarshal packet
 	var packet modules.Packet
-	if err := json.Unmarshal(data, &packet); err != nil {
+	if err := json.Unmarshal(rawData, &packet); err != nil {
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "unmarshal failed")
@@ -422,7 +404,7 @@ func Send(ctx *gin.Context) {
 	span.SetAttributes(
 		attribute.String("longpoll.uuid", uuid),
 		attribute.String("longpoll.packet_act", packet.Act),
-		attribute.Int("longpoll.data_size", len(data)),
+		attribute.Int("longpoll.data_size", len(rawData)),
 	)
 }
 

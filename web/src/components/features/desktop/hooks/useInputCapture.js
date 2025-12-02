@@ -20,6 +20,11 @@ export function useInputCapture(canvasRef, options = {}) {
   const inputBufferRef = useRef([]);
   const inputTimerRef = useRef(null);
   const focusedRef = useRef(false);
+  const releasePointerLock = useCallback(() => {
+    if (document.pointerLockElement) {
+      document.exitPointerLock?.();
+    }
+  }, []);
 
   // Clamp value between min and max
   const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
@@ -27,10 +32,22 @@ export function useInputCapture(canvasRef, options = {}) {
   // Queue an input event
   const queueInput = useCallback((event) => {
     if (!enabled) return;
-    if (inputBufferRef.current.length >= INPUT_BUFFER_LIMIT) {
-      inputBufferRef.current.shift();
+    const buffer = inputBufferRef.current;
+
+    // Coalesce high-frequency move/scroll events to the latest sample
+    if (event?.type === 'move' || event?.type === 'scroll') {
+      for (let i = buffer.length - 1; i >= 0; i -= 1) {
+        if (buffer[i].type === event.type) {
+          buffer[i] = event;
+          return;
+        }
+      }
     }
-    inputBufferRef.current.push(event);
+
+    if (buffer.length >= INPUT_BUFFER_LIMIT) {
+      buffer.shift();
+    }
+    buffer.push(event);
   }, [enabled]);
 
   // Flush the input buffer
@@ -146,11 +163,11 @@ export function useInputCapture(canvasRef, options = {}) {
 
   // Handle pointer lock change
   const handlePointerLockChange = useCallback(() => {
-    const canvas = canvasRef.current;
-    const locked = document.pointerLockElement === canvas;
-    focusedRef.current = locked;
-    setPointerLocked(locked);
-  }, [canvasRef]);
+    // Always treat as unlocked to keep cursor visible
+    releasePointerLock();
+    focusedRef.current = false;
+    setPointerLocked(false);
+  }, [releasePointerLock]);
 
   // Handle pointer lock error
   const handlePointerLockError = useCallback(() => {
@@ -159,14 +176,8 @@ export function useInputCapture(canvasRef, options = {}) {
 
   // Request pointer lock
   const requestPointerLock = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || !enabled) return;
-
-    if (document.pointerLockElement === canvas) {
-      return;
-    }
-
-    canvas.requestPointerLock?.();
+    // Intentionally disabled to keep cursor visible
+    return;
   }, [canvasRef, enabled]);
 
   // Exit pointer lock
@@ -182,6 +193,9 @@ export function useInputCapture(canvasRef, options = {}) {
 
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    // Ensure any stale pointer lock from previous sessions is cleared
+    releasePointerLock();
 
     // Attach canvas events
     canvas.addEventListener('mousemove', handleMouseMove);
@@ -220,9 +234,7 @@ export function useInputCapture(canvasRef, options = {}) {
       }
 
       // Exit pointer lock
-      if (document.pointerLockElement === canvas) {
-        document.exitPointerLock?.();
-      }
+      releasePointerLock();
 
       // Clear buffer
       inputBufferRef.current = [];
@@ -241,6 +253,7 @@ export function useInputCapture(canvasRef, options = {}) {
     handlePointerLockChange,
     handlePointerLockError,
     flushBuffer,
+    releasePointerLock,
   ]);
 
   return {

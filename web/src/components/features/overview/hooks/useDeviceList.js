@@ -5,13 +5,27 @@ import { message } from 'antd';
 /**
  * useDeviceList - Hook to manage device list fetching and operations
  */
+const VIEW_MODE_KEY = 'overviewViewMode';
+
+const getInitialViewMode = () => {
+  if (typeof window === 'undefined') return 'list';
+  const saved = window.localStorage.getItem(VIEW_MODE_KEY);
+  return saved === 'grid' || saved === 'list' ? saved : 'list';
+};
+
 const useDeviceList = () => {
   const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
-  const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
+  const [viewMode, setViewMode] = useState(getInitialViewMode); // 'grid' or 'list' (default list)
   const [sortBy, setSortBy] = useState('hostname');
   const refreshIntervalRef = useRef(null);
+
+  // Persist view mode so user choice sticks across sessions
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem(VIEW_MODE_KEY, viewMode);
+  }, [viewMode]);
 
   // Fetch device list
   const fetchDevices = useCallback(async () => {

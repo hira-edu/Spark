@@ -96,7 +96,7 @@ function Share(props) {
 		navigator.clipboard?.writeText(text).then(() => {
 			message.success(i18n.t('COMMON.COPIED') || 'Copied');
 		}).catch(() => {
-			message.warn(i18n.t('COMMON.REQUEST_FAILED'));
+			message.warning(i18n.t('COMMON.REQUEST_FAILED'));
 		});
 	}
 
@@ -135,7 +135,7 @@ function Share(props) {
 		}).catch(err => {
 			const msg = err?.response?.data?.msg;
 			if (msg) {
-				message.warn(translate(msg));
+				message.warning(translate(msg));
 			}
 		}).finally(() => setCreating(false));
 	}

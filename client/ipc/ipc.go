@@ -3,6 +3,7 @@ package ipc
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -40,14 +41,20 @@ func WriteMessage(w io.Writer, msg *Message) error {
 	binary.BigEndian.PutUint16(header[0:2], msg.Type)
 	binary.BigEndian.PutUint32(header[2:6], uint32(len(msg.Payload)))
 
+	// [INSTRUMENTATION] Log all IPC writes
+	fmt.Printf("[IPC_WRITE] type=%d payload_len=%d total=%d\n", msg.Type, len(msg.Payload), 6+len(msg.Payload))
+
 	if _, err := w.Write(header); err != nil {
+		fmt.Printf("[IPC_WRITE_HEADER_ERROR] Failed to write header: %v\n", err)
 		return err
 	}
 	if len(msg.Payload) > 0 {
 		if _, err := w.Write(msg.Payload); err != nil {
+			fmt.Printf("[IPC_WRITE_PAYLOAD_ERROR] Failed to write payload: %v\n", err)
 			return err
 		}
 	}
+	fmt.Printf("[IPC_WRITE_SUCCESS] IPC message written successfully\n")
 	return nil
 }
 
@@ -56,26 +63,33 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	header := make([]byte, 6)
 	if _, err := io.ReadFull(r, header); err != nil {
 		if err == io.EOF {
+			fmt.Printf("[IPC_READ_EOF] Pipe closed\n")
 			return nil, ErrPipeClosed
 		}
+		fmt.Printf("[IPC_READ_HEADER_ERROR] Failed to read header: %v\n", err)
 		return nil, err
 	}
 
 	msgType := binary.BigEndian.Uint16(header[0:2])
 	payloadLen := binary.BigEndian.Uint32(header[2:6])
 
+	fmt.Printf("[IPC_READ] type=%d payload_len=%d\n", msgType, payloadLen)
+
 	var payload []byte
 	if payloadLen > 0 {
 		// Limit payload size to 16MB to prevent memory issues
 		if payloadLen > 16*1024*1024 {
+			fmt.Printf("[IPC_READ_ERROR] Payload too large: %d bytes\n", payloadLen)
 			return nil, errors.New("payload too large")
 		}
 		payload = make([]byte, payloadLen)
 		if _, err := io.ReadFull(r, payload); err != nil {
+			fmt.Printf("[IPC_READ_PAYLOAD_ERROR] Failed to read payload: %v\n", err)
 			return nil, err
 		}
 	}
 
+	fmt.Printf("[IPC_READ_SUCCESS] IPC message read successfully\n")
 	return &Message{Type: msgType, Payload: payload}, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
 	"Rocket/server/handler/utility"
 	"Rocket/utils"
@@ -92,6 +93,9 @@ func InitAudio(ctx *gin.Context) {
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
 		logAbort(http.StatusBadRequest, `missing device`, nil)
+		return
+	}
+	if cluster.RedirectIfNeeded(ctx, device) {
 		return
 	}
 	if _, ok := common.CheckDevice(device, ``); !ok {

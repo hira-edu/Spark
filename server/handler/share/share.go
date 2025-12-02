@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"Rocket/server/cluster"
 	"github.com/gin-gonic/gin"
 	"github.com/kataras/golog"
 )
@@ -206,6 +207,9 @@ func InitGuestDesktop(ctx *gin.Context) {
 	}
 
 	// Check device exists
+	if cluster.RedirectIfNeeded(ctx, entry.Device) {
+		return
+	}
 	connUUID, ok := common.CheckDevice(entry.Device, ``)
 	if !ok {
 		logAccess(token, ctx, false, "device not connected")
@@ -687,6 +691,45 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		}, guest.deviceConn)
 		return
 
+	case `DESKTOP_CLIPBOARD`:
+		if guest.viewOnly {
+			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+			return
+		}
+		if payload, ok := normalizeClipboard(pack.Data); ok {
+			payload[`desktop`] = desktopUUID
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
+			return
+		}
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+
+	case `DESKTOP_FILE_DROP`:
+		if guest.viewOnly {
+			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+			return
+		}
+		if payload, ok := normalizeFileDrop(pack.Data); ok {
+			payload[`desktop`] = desktopUUID
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
+			return
+		}
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+
+	case `DESKTOP_AUDIO`:
+		if guest.viewOnly {
+			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+			return
+		}
+		if payload, ok := normalizeAudioControl(pack.Data); ok {
+			payload[`desktop`] = desktopUUID
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
+			return
+		}
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+
 	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
 		if guest.viewOnly {
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
@@ -774,6 +817,10 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 			if pack.Code != 0 {
 				sendGuestPack(pack, guest.srcConn)
 			}
+		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
+			if pack.Code != 0 {
+				sendGuestPack(pack, guest.srcConn)
+			}
 		case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, `DESKTOP_WEBRTC_ICE`:
 			sendGuestPack(pack, guest.srcConn)
 		}
@@ -830,6 +877,9 @@ const (
 	maxGuestInputBatch = 32
 	maxSDPLength       = 1 << 15
 	maxCandidateLength = 4096
+	maxClipboardBytes  = 64 * 1024
+	maxFileDropEntries = 5
+	maxFileNameLength  = 255
 )
 
 func normalizeInputEvents(data map[string]any) ([]any, bool) {
@@ -918,4 +968,92 @@ func isValidICECandidate(candidate string) bool {
 	}
 	return strings.Contains(candidate, " ") &&
 		(strings.HasPrefix(candidate, "candidate:") || strings.Contains(candidate, "typ "))
+}
+
+func normalizeClipboard(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	text, ok := data[`text`].(string)
+	if !ok || len(text) == 0 {
+		return nil, false
+	}
+	if len(text) > maxClipboardBytes {
+		text = text[:maxClipboardBytes]
+	}
+	payload := gin.H{`text`: text}
+	if mime, ok := data[`mime`].(string); ok && len(mime) > 0 {
+		payload[`mime`] = strings.ToLower(mime)
+	}
+	return payload, true
+}
+
+func normalizeFileDrop(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	rawFiles, ok := data[`files`]
+	if !ok {
+		return nil, false
+	}
+	list, ok := rawFiles.([]any)
+	if !ok || len(list) == 0 {
+		return nil, false
+	}
+
+	files := make([]gin.H, 0, len(list))
+	for _, item := range list {
+		if len(files) >= maxFileDropEntries {
+			break
+		}
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m[`name`].(string)
+		if len(name) > maxFileNameLength {
+			name = name[:maxFileNameLength]
+		}
+		size := int64(0)
+		switch v := m[`size`].(type) {
+		case float64:
+			size = int64(v)
+		case int64:
+			size = v
+		case int:
+			size = int64(v)
+		}
+		if len(name) == 0 && size <= 0 {
+			continue
+		}
+		file := gin.H{`name`: name}
+		if size > 0 {
+			file[`size`] = size
+		}
+		if mime, ok := m[`type`].(string); ok && len(mime) > 0 {
+			file[`type`] = mime
+		}
+		files = append(files, file)
+	}
+	if len(files) == 0 {
+		return nil, false
+	}
+	return gin.H{`files`: files}, true
+}
+
+func normalizeAudioControl(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return gin.H{}, true
+	}
+	payload := gin.H{}
+	if muted, ok := data[`muted`].(bool); ok {
+		payload[`muted`] = muted
+	}
+	if op, ok := data[`op`].(string); ok && len(op) > 0 {
+		payload[`op`] = strings.ToLower(op)
+	}
+	if mode, ok := data[`mode`].(string); ok && len(mode) > 0 {
+		payload[`mode`] = strings.ToLower(mode)
+	}
+	return payload, true
 }

@@ -11,11 +11,11 @@ import (
 )
 
 var (
-	mongoClient   *mongo.Client
-	mongoDB       *mongo.Database
-	mongoEnabled  bool
-	mongoCtx      = context.Background()
-	mongoTimeout  = 10 * time.Second
+	mongoClient  *mongo.Client
+	mongoDB      *mongo.Database
+	mongoEnabled bool
+	mongoCtx     = context.Background()
+	mongoTimeout = 10 * time.Second
 )
 
 // InitMongoDB initializes MongoDB connection
@@ -150,6 +150,75 @@ func createIndexes(ctx context.Context) error {
 	_, err = rateLimitCol.Indexes().CreateMany(ctx, rateLimitIndexes)
 	if err != nil {
 		return fmt.Errorf("failed to create rate_limits indexes: %w", err)
+	}
+
+	// Controllers collection indexes
+	controllerIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "lastSeen", Value: 1}},
+			Options: options.Index().SetName("lastSeen_1"),
+		},
+	}
+	if _, err := mongoDB.Collection(controllersCollection).Indexes().CreateMany(ctx, controllerIndexes); err != nil {
+		return fmt.Errorf("failed to create controllers indexes: %w", err)
+	}
+
+	// Devices collection indexes
+	deviceIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "controllerId", Value: 1}},
+			Options: options.Index().SetName("controllerId_1"),
+		},
+		{
+			Keys:    bson.D{{Key: "lastSeen", Value: 1}},
+			Options: options.Index().SetName("lastSeen_1"),
+		},
+		{
+			Keys:    bson.D{{Key: "leaseExpiresAt", Value: 1}},
+			Options: options.Index().SetName("leaseExpiresAt_1"),
+		},
+	}
+	if _, err := mongoDB.Collection(devicesCollection).Indexes().CreateMany(ctx, deviceIndexes); err != nil {
+		return fmt.Errorf("failed to create devices indexes: %w", err)
+	}
+
+	// Sessions collection indexes
+	sessionIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "deviceId", Value: 1}},
+			Options: options.Index().SetName("deviceId_1"),
+		},
+		{
+			Keys:    bson.D{{Key: "controllerId", Value: 1}},
+			Options: options.Index().SetName("controllerId_1"),
+		},
+		{
+			Keys:    bson.D{{Key: "leaseExpiresAt", Value: 1}},
+			Options: options.Index().SetName("leaseExpiresAt_1"),
+		},
+		{
+			Keys:    bson.D{{Key: "state", Value: 1}},
+			Options: options.Index().SetName("state_1"),
+		},
+	}
+	if _, err := mongoDB.Collection(sessionsCollection).Indexes().CreateMany(ctx, sessionIndexes); err != nil {
+		return fmt.Errorf("failed to create sessions indexes: %w", err)
+	}
+
+	// Audits collection indexes
+	auditIndexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "ts", Value: 1}},
+			Options: options.Index().SetName("ts_1"),
+		},
+	}
+	if _, err := mongoDB.Collection(auditsCollection).Indexes().CreateMany(ctx, auditIndexes); err != nil {
+		return fmt.Errorf("failed to create audits indexes: %w", err)
+	}
+
+	// Client logs collection indexes
+	if err := CreateClientLogIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to create client_logs indexes: %w", err)
 	}
 
 	return nil

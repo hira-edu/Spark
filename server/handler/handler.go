@@ -31,6 +31,7 @@ func InitRouter(ctx *gin.RouterGroup) {
 	ctx.Any(`/bridge/push`, bridge.BridgePush)
 	ctx.Any(`/bridge/pull`, bridge.BridgePull)
 	ctx.Any(`/client/update`, utility.CheckUpdate) // Client, for update.
+	ctx.POST(`/client/logs/upload`, UploadClientLogs) // Client log streaming (uses secret auth)
 
 	// Public guest access endpoints (no auth required)
 	ctx.GET(`/share/validate`, share.ValidateShareToken)
@@ -55,6 +56,7 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.POST(`/device/exec`, utility.ExecDeviceCmd)
 		group.POST(`/device/list`, utility.GetDevices)
 		group.POST(`/device/:act`, utility.CallDevice)
+		group.GET(`/cluster/status`, utility.GetClusterStatus)
 		group.POST(`/client/check`, generate.CheckClient)
 		group.POST(`/client/generate`, generate.GenerateClient)
 		group.Any(`/device/terminal`, terminal.InitTerminal)
@@ -74,6 +76,9 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.GET(`/share/:id/access-log`, share.GetShareAccessLog)
 		group.POST(`/share/revoke`, share.RevokeShare)
 		group.POST(`/share/delete`, share.DeleteShare)
+
+		// Client logs endpoints (auth required)
+		group.GET(`/client/logs`, GetClientLogs)
 	}
 }
 

@@ -19,19 +19,22 @@ import (
 
 // vpxEncoder wraps libvpx VP8/VP9 encoding with encoder caching for performance.
 // The encoder is created lazily and reused across frames of the same dimensions.
+// Supports adaptive bitrate based on network conditions.
 type vpxEncoder struct {
 	codec            VPXCodec
-	bitRate          int
+	baseBitRate      int // Base bitrate (used when not adaptive)
 	keyFrameInterval int
+	aqm              *AdaptiveQualityManager // Adaptive quality manager (nil = fixed bitrate)
 
 	// Cached encoder state
-	mu          sync.Mutex
-	cachedEnc   codec.ReadCloser
-	cachedWidth int
-	cachedHeight int
-	frameQueue  chan *image.RGBA
-	resultQueue chan encodeResult
-	closed      bool
+	mu               sync.Mutex
+	cachedEnc        codec.ReadCloser
+	cachedWidth      int
+	cachedHeight     int
+	cachedBitRate    int // Bitrate used for cached encoder
+	frameQueue       chan *image.RGBA
+	resultQueue      chan encodeResult
+	closed           bool
 }
 
 type encodeResult struct {
@@ -60,9 +63,29 @@ func NewVPXEncoder(codecType VPXCodec, cfg VPXEncoderConfig) (VPXEncoder, error)
 
 	return &vpxEncoder{
 		codec:            codecType,
-		bitRate:          bitRate,
+		baseBitRate:      bitRate,
 		keyFrameInterval: keyFrameInterval,
+		aqm:              nil, // Adaptive mode disabled by default
 	}, nil
+}
+
+// EnableAdaptiveQuality enables adaptive bitrate control based on network conditions.
+func (e *vpxEncoder) EnableAdaptiveQuality(aqm *AdaptiveQualityManager) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.aqm = aqm
+	// Force encoder recreation on next frame with new bitrate
+	if e.cachedEnc != nil {
+		e.cachedEnc.Close()
+		e.cachedEnc = nil
+	}
+}
+
+// DisableAdaptiveQuality disables adaptive bitrate and uses fixed base bitrate.
+func (e *vpxEncoder) DisableAdaptiveQuality() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.aqm = nil
 }
 
 func (e *vpxEncoder) Encode(img *image.RGBA, duration time.Duration) (media.Sample, error) {
@@ -85,8 +108,17 @@ func (e *vpxEncoder) Encode(img *image.RGBA, duration time.Duration) (media.Samp
 		return media.Sample{}, errors.New("encoder closed")
 	}
 
-	// Check if we need to recreate the encoder (dimensions changed or first use)
-	needNewEncoder := e.cachedEnc == nil || e.cachedWidth != width || e.cachedHeight != height
+	// Determine bitrate to use (adaptive or fixed)
+	targetBitRate := e.baseBitRate
+	if e.aqm != nil {
+		targetBitRate = e.aqm.GetCurrentBitrate()
+	}
+
+	// Check if we need to recreate the encoder (dimensions changed, bitrate changed, or first use)
+	needNewEncoder := e.cachedEnc == nil ||
+		e.cachedWidth != width ||
+		e.cachedHeight != height ||
+		e.cachedBitRate != targetBitRate
 
 	if needNewEncoder {
 		// Close existing encoder if any
@@ -95,8 +127,8 @@ func (e *vpxEncoder) Encode(img *image.RGBA, duration time.Duration) (media.Samp
 			e.cachedEnc = nil
 		}
 
-		// Create new encoder with proper dimensions
-		builder, err := e.videoBuilder()
+		// Create new encoder with proper dimensions and bitrate
+		builder, err := e.videoBuilder(targetBitRate)
 		if err != nil {
 			return media.Sample{}, err
 		}
@@ -118,6 +150,7 @@ func (e *vpxEncoder) Encode(img *image.RGBA, duration time.Duration) (media.Samp
 		e.cachedEnc = enc
 		e.cachedWidth = width
 		e.cachedHeight = height
+		e.cachedBitRate = targetBitRate
 		e.frameQueue = reader.frameQueue
 		e.resultQueue = make(chan encodeResult, 1)
 
@@ -139,6 +172,13 @@ func (e *vpxEncoder) Encode(img *image.RGBA, duration time.Duration) (media.Samp
 		if result.err != nil {
 			return media.Sample{}, result.err
 		}
+
+		// Check frame size limit if adaptive quality is enabled
+		if e.aqm != nil && e.aqm.ShouldDropFrame(int64(len(result.sample.Data))) {
+			// Frame exceeds maximum size, drop it
+			return media.Sample{}, nil
+		}
+
 		result.sample.Duration = duration
 		return result.sample, nil
 	case <-time.After(100 * time.Millisecond):
@@ -224,14 +264,14 @@ func (r *streamingFrameReader) Read() (image.Image, func(), error) {
 // Implement video.Reader interface
 var _ video.Reader = (*streamingFrameReader)(nil)
 
-func (e *vpxEncoder) videoBuilder() (codec.VideoEncoderBuilder, error) {
+func (e *vpxEncoder) videoBuilder(bitRate int) (codec.VideoEncoderBuilder, error) {
 	switch e.codec {
 	case VPXCodecVP9:
 		params, err := vpx.NewVP9Params()
 		if err != nil {
 			return nil, err
 		}
-		params.BitRate = e.bitRate
+		params.BitRate = bitRate
 		params.KeyFrameInterval = e.keyFrameInterval
 		return &params, nil
 	default:
@@ -239,7 +279,7 @@ func (e *vpxEncoder) videoBuilder() (codec.VideoEncoderBuilder, error) {
 		if err != nil {
 			return nil, err
 		}
-		params.BitRate = e.bitRate
+		params.BitRate = bitRate
 		params.KeyFrameInterval = e.keyFrameInterval
 		return &params, nil
 	}

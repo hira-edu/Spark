@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,11 @@ const (
 	webRTCDefaultBR    = 900000
 	maxInputPayload    = 1 << 16
 )
+
+// adaptiveQualityEncoder is implemented by encoders that can react to network conditions.
+type adaptiveQualityEncoder interface {
+	EnableAdaptiveQuality(aqm *AdaptiveQualityManager)
+}
 
 type rtcSession struct {
 	desktopID     string
@@ -101,6 +107,12 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC) (*rtcSession, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Attach adaptive quality manager for bitrate enforcement when available.
+	if adaptiveQualityManager != nil {
+		if enc, ok := encoder.(adaptiveQualityEncoder); ok {
+			enc.EnableAdaptiveQuality(adaptiveQualityManager)
+		}
+	}
 	var webcamStop func()
 	if isWebRTCWebcamEnabled() {
 		if stopFn, err := startWebcamTrack(rtc); err == nil {
@@ -148,7 +160,8 @@ func (r *rtcSession) sendFrame(img *image.RGBA, interval time.Duration) error {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	last := r.lastSent
+	// Use atomic load/store for lastSent to prevent race conditions
+	last := atomic.LoadInt64(&r.lastSent)
 	if last != 0 && now-last < r.targetFrameNs {
 		return nil
 	}
@@ -159,7 +172,7 @@ func (r *rtcSession) sendFrame(img *image.RGBA, interval time.Duration) error {
 	if err := r.rtc.SendFrame(sample.Data, sample.Duration); err != nil {
 		return err
 	}
-	r.lastSent = now
+	atomic.StoreInt64(&r.lastSent, now)
 	return nil
 }
 
@@ -167,6 +180,13 @@ func (r *rtcSession) sendFrame(img *image.RGBA, interval time.Duration) error {
 func handleRTCInput(desktopID string, payload []byte) error {
 	if len(payload) == 0 || len(payload) > maxInputPayload {
 		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
+	}
+	sess, ok := sessions.Get(desktopID)
+	if !ok || sess.escape.Load() {
+		return errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
+	}
+	if !sess.allowControl.Load() {
+		return errInputUnsupported
 	}
 	var body map[string]any
 	if err := json.Unmarshal(payload, &body); err != nil {
@@ -182,8 +202,9 @@ func handleRTCInput(desktopID string, payload []byte) error {
 	pack := modules.Packet{
 		Act: `DESKTOP_INPUT`,
 		Data: map[string]any{
-			`desktop`: desktopID,
-			`events`:  body[`events`],
+			`desktop`:      desktopID,
+			`events`:       body[`events`],
+			`allowControl`: sess.allowControl.Load(),
 		},
 	}
 	return HandleInput(pack)

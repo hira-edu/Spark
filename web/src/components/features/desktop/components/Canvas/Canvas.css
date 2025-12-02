@@ -14,7 +14,7 @@
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
-  cursor: pointer;
+  cursor: none !important; /* Hide local cursor - remote cursor will be rendered on canvas */
   outline: none;
 }
 
@@ -23,7 +23,7 @@
 }
 
 .desktop-canvas--pointer-locked {
-  cursor: none;
+  cursor: default !important;
 }
 
 /* Pointer Lock Indicator */

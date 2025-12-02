@@ -55,7 +55,7 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	defer sess.lock.Unlock()
 
 	// Check escape flag under lock
-	if sess.escape {
+	if sess.escape.Load() {
 		return nil, errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
 	}
 
@@ -158,7 +158,7 @@ func HandleWebRTCAnswer(pack modules.Packet) error {
 	sess.lock.Lock()
 	defer sess.lock.Unlock()
 
-	if sess.escape || sess.rtc == nil {
+	if sess.escape.Load() || sess.rtc == nil {
 		return errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
 	}
 	return sess.rtc.rtc.SetRemoteDescription(webrtc.SessionDescription{
@@ -195,7 +195,7 @@ func HandleWebRTCIce(pack modules.Packet) error {
 	sess.lock.Lock()
 	defer sess.lock.Unlock()
 
-	if sess.escape || sess.rtc == nil {
+	if sess.escape.Load() || sess.rtc == nil {
 		return errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
 	}
 

@@ -6,6 +6,8 @@ import (
 	"Rocket/server/storage"
 	"Rocket/utils"
 	"context"
+	"fmt"
+	"Rocket/server/config"
 	"strings"
 	"time"
 
@@ -71,8 +73,27 @@ func Login(ctx *gin.Context) {
 	}
 
 	dbCtx := context.Background()
-	user, err := userRepo.ValidatePassword(dbCtx, body.Username, body.Password)
-	if err != nil {
+
+	var user *storage.User
+	var err error
+
+	// If MongoDB is disabled, fall back to static config auth.
+	if userRepo == nil {
+		if pwd, ok := config.Config.Auth[body.Username]; ok && pwd == body.Password {
+			user = &storage.User{
+				Username: body.Username,
+				Role:     "admin",
+				Email:    "",
+				Enabled:  true,
+			}
+		} else {
+			err = fmt.Errorf("invalid credentials")
+		}
+	} else {
+		user, err = userRepo.ValidatePassword(dbCtx, body.Username, body.Password)
+	}
+
+	if err != nil || user == nil {
 		common.Warn(ctx, "LOGIN_FAILED", "invalid_credentials", body.Username, map[string]any{
 			"ip": ctx.ClientIP(),
 		})
@@ -81,7 +102,9 @@ func Login(ctx *gin.Context) {
 	}
 
 	// Update last login
-	userRepo.UpdateLastLogin(dbCtx, user.Username, ctx.ClientIP())
+	if userRepo != nil {
+		userRepo.UpdateLastLogin(dbCtx, user.Username, ctx.ClientIP())
+	}
 
 	// Create session
 	token := utils.GetStrUUID()
@@ -105,6 +128,8 @@ func Login(ctx *gin.Context) {
 		true,  // Secure - required for HTTPS
 		true,  // HttpOnly
 	)
+	// Set SameSite attribute for modern browser compatibility
+	ctx.Header("Set-Cookie", ctx.Writer.Header().Get("Set-Cookie")+"; SameSite=Lax")
 
 	common.Info(ctx, "LOGIN_SUCCESS", "", "", map[string]any{
 		"user": user.Username,
@@ -141,6 +166,7 @@ func Logout(ctx *gin.Context) {
 
 	// Clear cookie
 	ctx.SetCookie("Authorization", "", -1, "/", "", true, true)
+	ctx.Header("Set-Cookie", ctx.Writer.Header().Get("Set-Cookie")+"; SameSite=Lax")
 
 	ctx.JSON(200, modules.Packet{Code: 0})
 }
@@ -148,11 +174,11 @@ func Logout(ctx *gin.Context) {
 // CheckAuth is a middleware that verifies user authentication
 func CheckAuth() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		// Skip auth for public endpoints
-		if isPublicEndpoint(ctx.Request.URL.Path) {
-			ctx.Next()
-			return
-		}
+	// Skip auth for public endpoints
+	if isPublicEndpoint(ctx.Request.URL.Path) {
+		ctx.Next()
+		return
+	}
 
 		token, err := ctx.Cookie("Authorization")
 		if err != nil || token == "" {
@@ -195,6 +221,24 @@ func GetCurrentUser(ctx *gin.Context) {
 		return
 	}
 
+	// Mongo disabled: synthesize from session/config.
+	if userRepo == nil {
+		role, _ := ctx.Get("role")
+		ctx.JSON(200, modules.Packet{
+			Code: 0,
+			Data: gin.H{
+				"user": gin.H{
+					"username":    username,
+					"role":        role,
+					"email":       "",
+					"createdAt":   nil,
+					"lastLoginAt": nil,
+				},
+			},
+		})
+		return
+	}
+
 	dbCtx := context.Background()
 	user, err := userRepo.GetUser(dbCtx, username.(string))
 	if err != nil || user == nil {
@@ -218,6 +262,17 @@ func GetCurrentUser(ctx *gin.Context) {
 
 // CheckSetup checks if initial setup is needed (no users exist)
 func CheckSetup(ctx *gin.Context) {
+	// When MongoDB is disabled, fall back to static config users.
+	if userRepo == nil {
+		ctx.JSON(200, modules.Packet{
+			Code: 0,
+			Data: gin.H{
+				"needsSetup": len(config.Config.Auth) == 0,
+			},
+		})
+		return
+	}
+
 	dbCtx := context.Background()
 	count, err := userRepo.CountUsers(dbCtx)
 	if err != nil {
@@ -296,6 +351,11 @@ func ChangePassword(ctx *gin.Context) {
 	username, exists := ctx.Get("user")
 	if !exists {
 		ctx.JSON(401, modules.Packet{Code: 1, Msg: "${i18n|AUTH.UNAUTHORIZED}"})
+		return
+	}
+
+	if userRepo == nil {
+		ctx.JSON(400, modules.Packet{Code: 1, Msg: "password changes require MongoDB"})
 		return
 	}
 

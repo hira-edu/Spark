@@ -32,24 +32,24 @@ import (
 
 const (
 	// Configuration constants
-	defaultDNSPort       = "53"
-	maxDNSMessageSize    = 512          // Standard DNS UDP message size
-	maxTXTRecordSize     = 255          // Max TXT record length
-	dnsTTL               = 60           // DNS TTL in seconds
-	sessionTimeout       = 5 * time.Minute
-	maxChunks            = 100          // Max chunks per message
-	cleanupInterval      = 1 * time.Minute
-	dnsSigBytes          = 16           // Truncated HMAC size for DNS signatures
+	defaultDNSPort    = "53"
+	maxDNSMessageSize = 512 // Standard DNS UDP message size
+	maxTXTRecordSize  = 255 // Max TXT record length
+	dnsTTL            = 60  // DNS TTL in seconds
+	sessionTimeout    = 5 * time.Minute
+	maxChunks         = 100 // Max chunks per message
+	cleanupInterval   = 1 * time.Minute
+	dnsSigBytes       = 16 // Truncated HMAC size for DNS signatures
 
 	// Rate limiting constants
-	rateLimitQPS         = 10           // Queries per second per IP
-	rateLimitBurst       = 20           // Burst allowance per IP
-	rateLimiterCleanup   = 5 * time.Minute
+	rateLimitQPS       = 10 // Queries per second per IP
+	rateLimitBurst     = 20 // Burst allowance per IP
+	rateLimiterCleanup = 5 * time.Minute
 
 	// Security constants
-	nonceWindow          = 300          // Accept nonces within 5 minute window
-	maxQueryNameLength   = 253          // Max DNS name length
-	maxDataPartLength    = 200          // Max data part in query (prevents abuse)
+	nonceWindow        = 300 // Accept nonces within 5 minute window
+	maxQueryNameLength = 253 // Max DNS name length
+	maxDataPartLength  = 200 // Max data part in query (prevents abuse)
 )
 
 // DNSSession represents a DNS tunneling session
@@ -59,7 +59,7 @@ type DNSSession struct {
 	LastSeen     time.Time
 	MessageQueue chan *modules.Packet
 	ChunkBuffer  map[uint32]map[int]string // seq -> chunk_id -> data
-	NonceCache   map[string]time.Time       // nonce -> timestamp (prevents replay)
+	NonceCache   map[string]time.Time      // nonce -> timestamp (prevents replay)
 	mu           sync.RWMutex
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -390,19 +390,14 @@ func (s *DNSServer) handlePoll(ctx context.Context, uuid string, parts []string)
 	// Check for queued messages
 	select {
 	case msg := <-session.MessageQueue:
-		// Marshal and encrypt message
+		// Marshal message (no encryption)
 		data, err := json.Marshal(msg)
 		if err != nil {
 			return "error=marshal_failed"
 		}
 
-		encData, err := utils.Encrypt(data, session.Secret)
-		if err != nil {
-			return "error=encrypt_failed"
-		}
-
 		// Encode to base32 (DNS-safe)
-		return encodeBase32(encData)
+		return encodeBase32(data)
 
 	default:
 		// No messages
@@ -536,15 +531,9 @@ func (s *DNSServer) handleSend(ctx context.Context, uuid string, parts []string)
 		return "error=decode_failed"
 	}
 
-	// Decrypt
-	decrypted, err := utils.Decrypt(decoded, session.Secret)
-	if err != nil {
-		return "error=decrypt_failed"
-	}
-
 	// Unmarshal packet
 	var packet modules.Packet
-	if err := json.Unmarshal(decrypted, &packet); err != nil {
+	if err := json.Unmarshal(decoded, &packet); err != nil {
 		return "error=unmarshal_failed"
 	}
 

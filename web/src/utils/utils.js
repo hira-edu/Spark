@@ -1,6 +1,7 @@
 import axios from "axios";
 import Qs from "qs";
 import i18n, {getLang} from "../locale/locale";
+import en from "../locale/en";
 import {message} from "antd";
 
 let orderCompare;
@@ -47,7 +48,8 @@ function tsToTime(ts) {
 	let hours = Math.floor(ts / 3600);
 	ts %= 3600;
 	let minutes = Math.floor(ts / 60);
-	return `${String(hours) + i18n.t('COMMON.HOURS') + ' ' + String(minutes) + i18n.t('COMMON.MINUTES')}`;
+	// Always return English units; no runtime translation lookup
+	return `${String(hours)} h ${String(minutes)} m`;
 }
 
 function getBaseURL(ws, suffix) {
@@ -94,10 +96,24 @@ function post(url, data, ext) {
 	form.remove();
 }
 
+// Resolve a translation key from the static English bundle to avoid runtime lookups
+function resolveEnKey(path) {
+	if (typeof path !== 'string') return path;
+	const parts = path.split('.');
+	let cur = en;
+	for (let i = 0; i < parts.length; i += 1) {
+		if (cur && Object.prototype.hasOwnProperty.call(cur, parts[i])) {
+			cur = cur[parts[i]];
+		} else {
+			return path;
+		}
+	}
+	return typeof cur === 'string' ? cur : path;
+}
+
 function translate(text) {
-	return text.replace(/\$\{i18n\|([a-zA-Z0-9_.]+)\}/g, (match, key) => {
-		return i18n.t(key);
-	});
+	if (typeof text !== 'string') return text;
+	return text.replace(/\$\{i18n\|([a-zA-Z0-9_.]+)\}/g, (match, key) => resolveEnKey(key));
 }
 
 function preventClose(e) {
@@ -115,7 +131,7 @@ function catchBlobReq(err) {
 			try {
 				data = JSON.parse(str);
 			} catch (e) { }
-			message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.REQUEST_FAILED'));
+			message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.REQUEST_FAILED'));
 		});
 	}
 }
@@ -154,153 +170,22 @@ function str2hex(str) {
 	return ua2hex(new TextEncoder().encode(str));
 }
 
-// AES-CTR encryption for streaming data (matches Go StreamEncrypt)
+// Encryption/decryption disabled: return pass-through copies for clarity.
 async function encrypt(data, secret) {
-	// Ensure secret is at least 32 bytes
-	if (secret.length < 32) {
-		// Fallback to simple XOR for short keys (shouldn't happen)
-		let buf = new Uint8Array(data);
-		for (let i = 0; i < buf.length; i++) {
-			buf[i] ^= secret[i % secret.length];
-		}
-		return buf;
-	}
-
-	try {
-		// Use first 32 bytes as AES key
-		const keyData = secret.slice(0, 32);
-		const key = await crypto.subtle.importKey(
-			'raw',
-			keyData,
-			{ name: 'AES-CTR' },
-			false,
-			['encrypt']
-		);
-
-		// Derive IV from key (use bytes 32-48 or derive from key)
-		let iv;
-		if (secret.length >= 48) {
-			iv = secret.slice(32, 48);
-		} else {
-			// Derive IV by XORing key bytes (matches Go implementation)
-			iv = new Uint8Array(16);
-			for (let i = 0; i < secret.length; i++) {
-				iv[i % 16] ^= secret[i];
-			}
-		}
-
-		const encrypted = await crypto.subtle.encrypt(
-			{ name: 'AES-CTR', counter: iv, length: 128 },
-			key,
-			data
-		);
-		return new Uint8Array(encrypted);
-	} catch (e) {
-		// Fallback to simple XOR on error
-		console.warn('AES encryption failed, falling back to XOR:', e);
-		let buf = new Uint8Array(data);
-		for (let i = 0; i < buf.length; i++) {
-			buf[i] ^= secret[i % secret.length];
-		}
-		return buf;
-	}
+	return new Uint8Array(data);
 }
 
-// AES-CTR decryption for streaming data (matches Go StreamDecrypt)
 async function decrypt(data, secret) {
-	data = new Uint8Array(data);
-
-	// Ensure secret is at least 32 bytes
-	if (secret.length < 32) {
-		// Fallback to simple XOR for short keys
-		for (let i = 0; i < data.length; i++) {
-			data[i] ^= secret[i % secret.length];
-		}
-		return ua2str(data);
-	}
-
-	try {
-		// Use first 32 bytes as AES key
-		const keyData = secret.slice(0, 32);
-		const key = await crypto.subtle.importKey(
-			'raw',
-			keyData,
-			{ name: 'AES-CTR' },
-			false,
-			['decrypt']
-		);
-
-		// Derive IV from key (same as encrypt)
-		let iv;
-		if (secret.length >= 48) {
-			iv = secret.slice(32, 48);
-		} else {
-			// Derive IV by XORing key bytes (matches Go implementation)
-			iv = new Uint8Array(16);
-			for (let i = 0; i < secret.length; i++) {
-				iv[i % 16] ^= secret[i];
-			}
-		}
-
-		const decrypted = await crypto.subtle.decrypt(
-			{ name: 'AES-CTR', counter: iv, length: 128 },
-			key,
-			data
-		);
-		return ua2str(new Uint8Array(decrypted));
-	} catch (e) {
-		// Fallback to simple XOR on error
-		console.warn('AES decryption failed, falling back to XOR:', e);
-		for (let i = 0; i < data.length; i++) {
-			data[i] ^= secret[i % secret.length];
-		}
-		return ua2str(data);
-	}
+	const buf = new Uint8Array(data);
+	return ua2str(buf);
 }
 
-// Synchronous encrypt for cases where async doesn't work
 function encryptSync(data, secret) {
-	if (secret.length < 32) {
-		let buf = new Uint8Array(data);
-		for (let i = 0; i < buf.length; i++) {
-			buf[i] ^= secret[i % secret.length];
-		}
-		return buf;
-	}
-	// Use a simple AES-CTR-like stream cipher for sync operation
-	// This is a simplified implementation for compatibility
-	let buf = new Uint8Array(data);
-	const key = secret.slice(0, 32);
-	const iv = secret.length >= 48 ? secret.slice(32, 48) : secret.slice(0, 16);
-
-	// Simple CTR mode implementation
-	const blockSize = 16;
-	let counter = new Uint8Array(iv);
-	let keystream = new Uint8Array(blockSize);
-	let keystreamPos = blockSize; // Force generation on first use
-
-	for (let i = 0; i < buf.length; i++) {
-		if (keystreamPos >= blockSize) {
-			// Generate new keystream block (simplified - XOR based)
-			for (let j = 0; j < blockSize; j++) {
-				keystream[j] = key[j] ^ counter[j] ^ key[j + 16];
-			}
-			// Increment counter
-			for (let j = blockSize - 1; j >= 0; j--) {
-				counter[j]++;
-				if (counter[j] !== 0) break;
-			}
-			keystreamPos = 0;
-		}
-		buf[i] ^= keystream[keystreamPos++];
-	}
-	return buf;
+	return new Uint8Array(data);
 }
 
 function decryptSync(data, secret) {
-	data = new Uint8Array(data);
-	const decrypted = encryptSync(data, secret);
-	return ua2str(decrypted);
+	return ua2str(new Uint8Array(data));
 }
 
 export {post, request, waitTime, formatSize, tsToTime, getBaseURL, genRandHex, translate, preventClose, catchBlobReq, hex2ua, ua2hex, str2ua, ua2str, hex2str, str2hex, encrypt, decrypt, encryptSync, decryptSync, orderCompare};

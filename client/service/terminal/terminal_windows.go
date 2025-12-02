@@ -20,12 +20,12 @@ import (
 )
 
 var (
-	kernel32                    = syscall.NewLazyDLL("kernel32.dll")
-	procCreatePseudoConsole     = kernel32.NewProc("CreatePseudoConsole")
-	procResizePseudoConsole     = kernel32.NewProc("ResizePseudoConsole")
-	procClosePseudoConsole      = kernel32.NewProc("ClosePseudoConsole")
-	procInitializeProcThreadAttrList = kernel32.NewProc("InitializeProcThreadAttributeList")
-	procUpdateProcThreadAttribute    = kernel32.NewProc("UpdateProcThreadAttribute")
+	kernel32                          = syscall.NewLazyDLL("kernel32.dll")
+	procCreatePseudoConsole           = kernel32.NewProc("CreatePseudoConsole")
+	procResizePseudoConsole           = kernel32.NewProc("ResizePseudoConsole")
+	procClosePseudoConsole            = kernel32.NewProc("ClosePseudoConsole")
+	procInitializeProcThreadAttrList  = kernel32.NewProc("InitializeProcThreadAttributeList")
+	procUpdateProcThreadAttribute     = kernel32.NewProc("UpdateProcThreadAttribute")
 	procDeleteProcThreadAttributeList = kernel32.NewProc("DeleteProcThreadAttributeList")
 )
 
@@ -40,18 +40,18 @@ type COORD struct {
 }
 
 type terminal struct {
-	lastPack   int64
-	rawEvent   []byte
-	escape     bool
-	event      string
-	cmd        *exec.Cmd
-	hPC        uintptr // Pseudo Console handle
-	ptyIn      *os.File
-	ptyOut     *os.File
-	stdin      io.WriteCloser
-	stdout     io.ReadCloser
-	useLegacy  bool // fallback to pipes if ConPTY not available
-	mu         sync.Mutex
+	lastPack  int64
+	rawEvent  []byte
+	escape    bool
+	event     string
+	cmd       *exec.Cmd
+	hPC       uintptr // Pseudo Console handle
+	ptyIn     *os.File
+	ptyOut    *os.File
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	useLegacy bool // fallback to pipes if ConPTY not available
+	mu        sync.Mutex
 }
 
 var terminals = cmap.New[*terminal]()
@@ -197,7 +197,6 @@ func InitTerminal(pack modules.Packet) error {
 				buffer, _ = utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
 					`output`: hex.EncodeToString(buffer),
 				}})
-				buffer = utils.StreamEncrypt(buffer, common.WSConn.GetSecret())
 				common.WSConn.SendRawData(session.rawEvent, buffer, 21, 01)
 			}
 
@@ -208,7 +207,6 @@ func InitTerminal(pack modules.Packet) error {
 					doKillTerminal(session)
 				}
 				data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`})
-				data = utils.StreamEncrypt(data, common.WSConn.GetSecret())
 				common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
 				break
 			}
@@ -243,7 +241,6 @@ func readConPTY(session *terminal) {
 			buffer, _ = utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
 				`output`: hex.EncodeToString(buffer),
 			}})
-			buffer = utils.StreamEncrypt(buffer, common.WSConn.GetSecret())
 			common.WSConn.SendRawData(session.rawEvent, buffer, 21, 01)
 		}
 
@@ -254,7 +251,6 @@ func readConPTY(session *terminal) {
 				doKillTerminal(session)
 			}
 			data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`})
-			data = utils.StreamEncrypt(data, common.WSConn.GetSecret())
 			common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
 			break
 		}
@@ -366,7 +362,6 @@ func KillTerminal(pack modules.Packet) {
 	}
 	terminals.Remove(uuid)
 	data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`, Msg: `${i18n|TERMINAL.SESSION_CLOSED}`})
-	data = utils.StreamEncrypt(data, common.WSConn.GetSecret())
 	common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
 	session.escape = true
 	session.rawEvent = nil

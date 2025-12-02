@@ -5,15 +5,6 @@ import './Canvas.css';
  * InputOverlay - Shows pointer lock indicator and connection overlays
  */
 const InputOverlay = ({ pointerLocked, status, onReconnect }) => {
-  // Pointer lock indicator
-  if (pointerLocked) {
-    return (
-      <div className="pointer-lock-indicator">
-        <span>Press ESC to release cursor</span>
-      </div>
-    );
-  }
-
   // Connection status overlays
   if (status !== 'connected') {
     return (

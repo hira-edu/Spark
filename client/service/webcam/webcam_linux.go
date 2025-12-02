@@ -40,6 +40,7 @@ type WebcamSession struct {
 	stop        chan struct{}
 	senderStop  chan struct{}
 	mu          sync.Mutex
+	wg          sync.WaitGroup // FIXED: WaitGroup for graceful shutdown (Issue #12)
 	running     bool
 	width       uint32
 	height      uint32
@@ -224,7 +225,8 @@ func HandleSelect(pack modules.Packet) error {
 		return fmt.Errorf("failed to start capture: %w", err)
 	}
 
-	// Start packet sender
+	// FIXED: Start packet sender with WaitGroup (Issue #12)
+	webcamSession.wg.Add(1)
 	go webcamPacketSender(webcamSession)
 
 	webcamSession.running = true
@@ -235,6 +237,7 @@ func HandleSelect(pack modules.Packet) error {
 
 // webcamPacketSender reads encoded frames from channel and sends packets to server
 func webcamPacketSender(session *WebcamSession) {
+	defer session.wg.Done() // FIXED: Signal completion (Issue #12)
 	defer fmt.Printf("[INFO] Webcam packet sender stopped\n")
 
 	for {
@@ -293,7 +296,8 @@ func startCapture(session *WebcamSession) error {
 		return fmt.Errorf("failed to start streaming: %w", err)
 	}
 
-	// Start capture goroutine
+	// FIXED: Start capture goroutine with WaitGroup (Issue #12)
+	session.wg.Add(1)
 	go captureLoop(session)
 
 	return nil
@@ -301,6 +305,7 @@ func startCapture(session *WebcamSession) error {
 
 // captureLoop continuously captures frames from webcam
 func captureLoop(session *WebcamSession) {
+	defer session.wg.Done() // FIXED: Signal completion (Issue #12)
 	defer func() {
 		if session.cam != nil {
 			session.cam.StopStreaming()
@@ -308,59 +313,65 @@ func captureLoop(session *WebcamSession) {
 		fmt.Printf("[INFO] Webcam capture loop stopped\n")
 	}()
 
+	// FIXED: Use ticker for precise frame timing (Issue #7)
 	frameDuration := time.Second / time.Duration(session.fps)
-	timeout := uint32(2) // 2 second timeout
+	ticker := time.NewTicker(frameDuration)
+	defer ticker.Stop()
+
+	fmt.Printf("[INFO] Webcam capture loop started with ticker: %v\n", frameDuration)
 
 	for {
 		select {
 		case <-session.stop:
 			return
-		default:
-		}
 
-		// Wait for frame with timeout
-		err := session.cam.WaitForFrame(timeout)
-		if err != nil {
-			switch err.(type) {
-			case *webcam.Timeout:
-				// Timeout is normal, continue
-				continue
-			default:
-				fmt.Printf("[ERROR] Frame wait error: %v\n", err)
-				time.Sleep(frameDuration)
+		case <-ticker.C:
+			// FIXED: Non-blocking frame wait (100ms timeout per tick)
+			// V4L2 WaitForFrame can block, so use short timeout
+			err := session.cam.WaitForFrame(1) // 1 second max wait
+			if err != nil {
+				switch err.(type) {
+				case *webcam.Timeout:
+					// Timeout is normal, continue to next tick
+					atomic.AddUint64(&session.errors, 1)
+					continue
+				default:
+					fmt.Printf("[ERROR] Frame wait error: %v\n", err)
+					atomic.AddUint64(&session.errors, 1)
+					continue
+				}
+			}
+
+			// Read frame
+			frame, err := session.cam.ReadFrame()
+			if err != nil {
+				fmt.Printf("[ERROR] Frame read error: %v\n", err)
+				atomic.AddUint64(&session.errors, 1)
 				continue
 			}
-		}
 
-		// Read frame
-		frame, err := session.cam.ReadFrame()
-		if err != nil {
-			fmt.Printf("[ERROR] Frame read error: %v\n", err)
-			continue
-		}
+			if len(frame) == 0 {
+				continue
+			}
 
-		if len(frame) == 0 {
-			continue
-		}
+			// Encode frame as JPEG
+			jpegData, err := encodeFrame(frame, session)
+			if err != nil {
+				fmt.Printf("[ERROR] Frame encoding error: %v\n", err)
+				atomic.AddUint64(&session.errors, 1)
+				continue
+			}
 
-		// Encode frame as JPEG
-		jpegData, err := encodeFrame(frame, session)
-		if err != nil {
-			fmt.Printf("[ERROR] Frame encoding error: %v\n", err)
-			continue
+			// Send encoded frame
+			select {
+			case session.frameData <- jpegData:
+				// Successfully queued
+			default:
+				// Channel full, drop frame
+				fmt.Printf("[WARN] Frame data channel full, dropping frame\n")
+				atomic.AddUint64(&session.errors, 1)
+			}
 		}
-
-		// Send encoded frame
-		select {
-		case session.frameData <- jpegData:
-			// Successfully queued
-		default:
-			// Channel full, drop frame
-			fmt.Printf("[WARN] Frame data channel full, dropping frame\n")
-		}
-
-		// Rate limit
-		time.Sleep(frameDuration)
 	}
 }
 
@@ -493,8 +504,10 @@ func KillWebcam(pack modules.Packet) {
 	webcamSession.mu.Unlock()
 
 	if wasRunning {
-		// Wait for capture loop to clean up
-		time.Sleep(100 * time.Millisecond)
+		// FIXED: Wait for goroutines to finish properly (Issue #12)
+		fmt.Printf("[INFO] Waiting for webcam goroutines to finish...\n")
+		webcamSession.wg.Wait()
+		fmt.Printf("[INFO] All webcam goroutines stopped\n")
 	}
 
 	// Print statistics

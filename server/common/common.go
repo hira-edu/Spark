@@ -45,39 +45,12 @@ func SendPack(pack modules.Packet, session *melody.Session) bool {
 	if err != nil {
 		return false
 	}
-	data, ok := Encrypt(data, session)
-	if !ok {
-		return false
-	}
+	// No encryption - send JSON directly
 	err = session.WriteBinary(data)
 	return err == nil
 }
 
-func Encrypt(data []byte, session *melody.Session) ([]byte, bool) {
-	temp, ok := session.Get(`Secret`)
-	if !ok {
-		return nil, false
-	}
-	secret := temp.([]byte)
-	dec, err := utils.Encrypt(data, secret)
-	if err != nil {
-		return nil, false
-	}
-	return dec, true
-}
-
-func Decrypt(data []byte, session *melody.Session) ([]byte, bool) {
-	temp, ok := session.Get(`Secret`)
-	if !ok {
-		return nil, false
-	}
-	secret := temp.([]byte)
-	dec, err := utils.Decrypt(data, secret)
-	if err != nil {
-		return nil, false
-	}
-	return dec, true
-}
+// Encryption removed - these functions are no longer needed
 
 func GetAddrIP(addr net.Addr) string {
 	switch addr.(type) {
@@ -172,36 +145,33 @@ func CheckDevice(deviceID, connUUID string) (string, bool) {
 	return ``, false
 }
 
+// Config encryption/decryption - kept for backward compatibility with old clients
 func EncAES(data []byte, key []byte) ([]byte, error) {
-	hash, _ := utils.GetMD5(data)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	stream := cipher.NewCTR(block, hash)
-	encBuffer := make([]byte, len(data))
-	stream.XORKeyStream(encBuffer, data)
-	return append(hash, encBuffer...), nil
+	// New clients: just return plaintext
+	return data, nil
 }
 
 func DecAES(data []byte, key []byte) ([]byte, error) {
-	// MD5[16 bytes] + Data[n bytes]
-	dataLen := len(data)
-	if dataLen <= 16 {
-		return nil, utils.ErrEntityInvalid
+	// Support old encrypted format: MD5[16] + Encrypted[16]
+	if len(data) <= 16 {
+		// New format: plaintext (just return as-is)
+		return data, nil
 	}
+
+	// Old format: try to decrypt
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
 	stream := cipher.NewCTR(block, data[:16])
-	decBuffer := make([]byte, dataLen-16)
+	decBuffer := make([]byte, len(data)-16)
 	stream.XORKeyStream(decBuffer, data[16:])
 	hash, _ := utils.GetMD5(decBuffer)
 	if !bytes.Equal(hash, data[:16]) {
-		return nil, utils.ErrFailedVerification
+		// Decryption failed, might be new format - return as-is
+		return data, nil
 	}
-	return decBuffer[:dataLen-16], nil
+	return decBuffer, nil
 }
 
 // Legacy function registration system - DEPRECATED

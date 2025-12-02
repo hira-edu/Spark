@@ -51,9 +51,11 @@ export function useTerminalSession(device, options = {}) {
 
     data = new Uint8Array(data);
 
-    // Check for raw output (binary header)
+    // Check for raw output (binary header: magic[4] + service + op + event[16] + length[2])
     if (data[0] === 34 && data[1] === 22 && data[2] === 19 && data[3] === 17 && data[4] === 21 && data[5] === 0) {
-      const output = ua2str(data.slice(8));
+      // Binary protocol: 4-byte magic + 1-byte service + 1-byte op + 16-byte event + 2-byte length + payload
+      // Skip 24-byte header to get actual terminal output
+      const output = ua2str(data.slice(24));
       if (onOutput) {
         onOutput(output);
       }
@@ -74,12 +76,12 @@ export function useTerminalSession(device, options = {}) {
       }
 
       if (parsed?.act === 'WARN') {
-        message.warn(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+        message.warning(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
         return;
       }
 
       if (parsed?.act === 'QUIT') {
-        message.warn(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+        message.warning(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
         disconnect();
         return;
       }
@@ -131,7 +133,7 @@ export function useTerminalSession(device, options = {}) {
       console.error('WebSocket error:', e);
       setStatus('error');
       cleanup();
-      message.warn(i18n.t('COMMON.CONNECTION_FAILED'));
+      message.warning(i18n.t('COMMON.CONNECTION_FAILED'));
     };
 
     // Keep-alive ping

@@ -84,21 +84,10 @@ func deriveSaltBytes(salt string) []byte {
 	return saltBytes[:24]
 }
 
-// encAES encrypts using AES-CTR with MD5 as IV
-// keyLen specifies required key length (16 for AES-128, 24 for AES-192)
+// Config encryption removed - returns plaintext
 func encAES(data []byte, key []byte, keyLen int) ([]byte, error) {
-	if len(key) != keyLen {
-		return nil, fmt.Errorf("key must be %d bytes, got %d", keyLen, len(key))
-	}
-	hash := getMD5(data)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-	stream := cipher.NewCTR(block, hash)
-	encBuffer := make([]byte, len(data))
-	stream.XORKeyStream(encBuffer, data)
-	return append(hash, encBuffer...), nil
+	// Just return the data as-is (no encryption, no MD5 hash)
+	return data, nil
 }
 
 // generateClientKey creates auth key by encrypting UUID with salt (uses AES-192)

@@ -9,6 +9,12 @@ const defaultIceServers = [
 	{urls: 'stun:stun.cloudflare.com:3478'},
 ];
 
+const MAGIC_PREFIX = [34, 22, 19, 17];
+const SERVICE_IDS = [20, 21];
+const BASE_HEADER_LENGTH = MAGIC_PREFIX.length + 2;
+const EVENT_ID_LENGTH = 16;
+const FRAME_HEADER_LENGTH = BASE_HEADER_LENGTH + EVENT_ID_LENGTH;
+
 function Guest() {
 	const canvasRef = useRef(null);
 	const videoRef = useRef(null);
@@ -118,6 +124,7 @@ function Guest() {
 	function startSession() {
 		const canvas = canvasRef.current;
 		if (!canvas || !share) return;
+		setResolution('0x0');
 		stopInput();
 		stopWebRTC();
 		if (wsRef.current) {
@@ -132,6 +139,7 @@ function Guest() {
 		wsRef.current = ws;
 		ws.onopen = () => {
 			setStatus('streaming');
+			sendData({act: 'DESKTOP_SHOT'});
 			if (allowControlRef.current) {
 				startInput();
 			}
@@ -153,96 +161,130 @@ function Guest() {
 		};
 	}
 
-	function parseBlocks(ab, canvas, canvasCtx) {
-		ab = ab.slice(5);
-		const dv = new DataView(ab);
-		const op = dv.getUint8(0);
+	async function parseBlocks(raw, canvas, canvasCtx) {
+		if (!canvas || !canvasCtx || !raw) return;
+
+		let buffer = null;
+		if (raw instanceof ArrayBuffer) {
+			buffer = raw;
+		} else if (raw?.arrayBuffer) {
+			buffer = await raw.arrayBuffer();
+		}
+		if (!buffer) return;
+
+		const bytes = new Uint8Array(buffer);
+		if (bytes.length < BASE_HEADER_LENGTH) return;
+		for (let i = 0; i < MAGIC_PREFIX.length; i++) {
+			if (bytes[i] !== MAGIC_PREFIX[i]) return;
+		}
+		const service = bytes[4];
+		if (!SERVICE_IDS.includes(service)) return;
+
+		const op = bytes[5];
 		if (webrtcState === 'connected' && op !== 2 && op !== 3) {
 			return;
 		}
+
 		if (op === 3) {
-			handleJSON(ab.slice(1));
+			await handleJSON(bytes.slice(BASE_HEADER_LENGTH));
 			return;
 		}
+
+		if (bytes.length < FRAME_HEADER_LENGTH) return;
+		const payloadOffset = FRAME_HEADER_LENGTH;
+		const view = new DataView(buffer);
+
 		if (op === 2) {
-			const width = dv.getUint16(3, false);
-			const height = dv.getUint16(5, false);
+			const bodyLength = view.getUint16(payloadOffset + 0, false);
+			if (bodyLength < 4 || payloadOffset + 2 + bodyLength > view.byteLength) {
+				return;
+			}
+			const width = view.getUint16(payloadOffset + 2, false);
+			const height = view.getUint16(payloadOffset + 4, false);
 			if (width === 0 || height === 0) return;
-			canvas.width = width;
-			canvas.height = height;
+			if (canvas.width !== width || canvas.height !== height) {
+				canvas.width = width;
+				canvas.height = height;
+				canvasCtx.imageSmoothingEnabled = false;
+			}
 			setResolution(`${width}x${height}`);
 			return;
 		}
-		let offset = 1;
-		while (offset < ab.byteLength) {
-			const bl = dv.getUint16(offset + 0, false); // body length
-			const it = dv.getUint16(offset + 2, false); // image type
-			const dx = dv.getUint16(offset + 4, false); // image block x
-			const dy = dv.getUint16(offset + 6, false); // image block y
-			const bw = dv.getUint16(offset + 8, false); // image block width
-			const bh = dv.getUint16(offset + 10, false); // image block height
+
+		let offset = payloadOffset;
+		while (offset + 12 <= view.byteLength) {
+			const bl = view.getUint16(offset + 0, false); // body length
+			const it = view.getUint16(offset + 2, false); // image type
+			const dx = view.getUint16(offset + 4, false); // image block x
+			const dy = view.getUint16(offset + 6, false); // image block y
+			const bw = view.getUint16(offset + 8, false); // image block width
+			const bh = view.getUint16(offset + 10, false); // image block height
 			const il = bl - 10; // image length
-			offset += 12;
-			updateImage(ab.slice(offset, offset + il), it, dx, dy, bw, bh, canvasCtx);
-			offset += il;
+			const dataStart = offset + 12;
+			const dataEnd = dataStart + il;
+			if (il < 0 || dataEnd > view.byteLength) {
+				break;
+			}
+			updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, canvasCtx);
+			offset = dataEnd;
 		}
 	}
 
 	function updateImage(ab, it, dx, dy, bw, bh, canvasCtx) {
-		switch (it) {
-		case 0:
+		if (it === 0) {
 			canvasCtx.putImageData(new ImageData(new Uint8ClampedArray(ab), bw, bh), dx, dy, 0, 0, bw, bh);
-			break;
-		case 1:
-			createImageBitmap(new Blob([ab]), 0, 0, bw, bh, {
-				premultiplyAlpha: 'none',
-				colorSpaceConversion: 'none'
-			}).then((ib) => {
-				canvasCtx.drawImage(ib, 0, 0, bw, bh, dx, dy, bw, bh);
-			});
-			break;
-		default:
-			break;
+			return;
 		}
+		createImageBitmap(new Blob([ab]), 0, 0, bw, bh, {
+			premultiplyAlpha: 'none',
+			colorSpaceConversion: 'none'
+		}).then((ib) => {
+			canvasCtx.drawImage(ib, 0, 0, bw, bh, dx, dy, bw, bh);
+		}).catch(() => {});
 	}
 
-	function handleJSON(ab) {
+	async function handleJSON(ab) {
 		const secret = secretRef.current;
 		if (!secret) return;
-		let data = decrypt(ab, secret);
+		let data;
 		try {
-			data = JSON.parse(data);
+			const decrypted = await decrypt(ab, secret);
+			data = JSON.parse(decrypted);
 		} catch (_) {
 			return;
 		}
-		if (data?.act === 'DESKTOP_WEBRTC_ANSWER') {
-			if (data.code && data.code !== 0) {
-				message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
-				stopWebRTC();
+		try {
+			if (data?.act === 'DESKTOP_WEBRTC_ANSWER') {
+				if (data.code && data.code !== 0) {
+					message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+					stopWebRTC();
+					return;
+				}
+				handleRTCAnswer(data.data || data);
 				return;
 			}
-			handleRTCAnswer(data.data || data);
-			return;
-		}
-		if (data?.act === 'DESKTOP_WEBRTC_ICE') {
-			if (data.code && data.code !== 0) {
+			if (data?.act === 'DESKTOP_WEBRTC_ICE') {
+				if (data.code && data.code !== 0) {
+					return;
+				}
+				handleRTCCandidate(data.data || data);
 				return;
 			}
-			handleRTCCandidate(data.data || data);
-			return;
-		}
-		if (data?.act === 'DESKTOP_INPUT' && data.code && data.code !== 0) {
-			message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
-			return;
-		}
-		if (data?.act === 'WARN') {
-			message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
-			return;
-		}
-		if (data?.act === 'QUIT') {
-			message.warn(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
-			setStatus('disconnected');
-			cleanupAll();
+			if (data?.act === 'DESKTOP_INPUT' && data.code && data.code !== 0) {
+				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				return;
+			}
+			if (data?.act === 'WARN') {
+				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				return;
+			}
+			if (data?.act === 'QUIT') {
+				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				setStatus('disconnected');
+				cleanupAll();
+			}
+		} catch (_) {
+			// ignore malformed payloads
 		}
 	}
 

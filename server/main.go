@@ -2,6 +2,7 @@ package main
 
 import (
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
 	"Rocket/server/config"
 	"Rocket/server/handler"
@@ -21,6 +22,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"github.com/gofrs/flock"
 	"github.com/rakyll/statik/fs"
 	"golang.org/x/crypto/acme/autocert"
 	"io"
@@ -45,6 +47,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const serverLockPath = "/tmp/rocket-server.lock"
+
 var blocked = cmap.New[int64]()
 var lastRequest = time.Now().Unix()
 var wsTracer = otel.Tracer("rocket-server/ws")
@@ -56,6 +60,30 @@ func main() {
 	}
 	defer otelShutdown(context.Background())
 
+	lock := flock.New(serverLockPath)
+	locked, err := lock.TryLock()
+	if err != nil {
+		common.Fatal(nil, `INSTANCE_LOCK`, `fail`, err.Error(), map[string]any{
+			`path`: serverLockPath,
+		})
+		return
+	}
+	if !locked {
+		common.Fatal(nil, `INSTANCE_LOCK`, `fail`, `another rocket-server instance is already running`, map[string]any{
+			`path`: serverLockPath,
+		})
+		return
+	}
+	defer lock.Unlock()
+	common.Info(nil, `INSTANCE_LOCK`, `acquired`, ``, map[string]any{
+		`path`: serverLockPath,
+	})
+
+	var clusterMgr *cluster.Manager
+	if common.GetControllerID() == "" {
+		common.SetControllerID(utils.GetStrUUID())
+	}
+
 	// Initialize MongoDB if enabled
 	if config.Config.MongoDB != nil && config.Config.MongoDB.Enable {
 		if err := storage.InitMongoDB(config.Config.MongoDB.URI, config.Config.MongoDB.Database); err != nil {
@@ -65,12 +93,48 @@ func main() {
 		common.Info(nil, `MONGODB_INIT`, `success`, ``, map[string]any{
 			`database`: config.Config.MongoDB.Database,
 		})
-		defer storage.CloseMongoDB()
 
 		// Initialize auth module after MongoDB is ready
 		authHandler.Init()
 	} else {
 		common.Warn(nil, `MONGODB_INIT`, `disabled`, `Share persistence will not be available`, nil)
+	}
+
+	if config.Config.Cluster != nil && config.Config.Cluster.Enable && storage.IsMongoEnabled() {
+		useStreams := true
+		if config.Config.Cluster.UseChangeStreams != nil {
+			useStreams = *config.Config.Cluster.UseChangeStreams
+		}
+		preferProxy := true
+		if config.Config.Cluster.PreferProxy != nil {
+			preferProxy = *config.Config.Cluster.PreferProxy
+		}
+		proxyTimeout := time.Duration(config.Config.Cluster.ProxyTimeoutSeconds) * time.Second
+		if proxyTimeout == 0 {
+			proxyTimeout = 10 * time.Second
+		}
+
+		clusterCfg := cluster.Config{
+			Enable:           true,
+			ControllerID:     config.Config.Cluster.ControllerID,
+			ControllerIDFile: config.Config.Cluster.ControllerIDFile,
+			PublicURL:        config.Config.Cluster.PublicURL,
+			LeaseTTL:         time.Duration(config.Config.Cluster.LeaseTTLSeconds) * time.Second,
+			SessionLeaseTTL:  time.Duration(config.Config.Cluster.SessionLeaseSeconds) * time.Second,
+			StaleAfter:       time.Duration(config.Config.Cluster.StaleAfterSeconds) * time.Second,
+			CleanupInterval:  time.Duration(config.Config.Cluster.CleanupIntervalSeconds) * time.Second,
+			UseChangeStreams: useStreams,
+			PreferProxy:      preferProxy,
+			ProxyTimeout:     proxyTimeout,
+		}
+
+		clusterMgr, err = cluster.Init(clusterCfg)
+		if err != nil {
+			common.Fatal(nil, `CLUSTER_INIT`, `fail`, err.Error(), nil)
+			return
+		}
+	} else if common.GetControllerID() == "" {
+		common.SetControllerID(utils.GetStrUUID())
 	}
 
 	webFS, err := fs.NewWithNamespace(`web`)
@@ -267,6 +331,10 @@ func main() {
 		}
 	}
 
+	if clusterMgr != nil {
+		clusterMgr.Stop()
+	}
+
 	// Shutdown MongoDB if running
 	if storage.IsMongoEnabled() {
 		if err := storage.CloseMongoDB(); err != nil {
@@ -347,26 +415,41 @@ func wsHandshake(ctx *gin.Context) {
 
 	clientUUID, _ := hex.DecodeString(ctx.GetHeader(`UUID`))
 	clientKey, _ := hex.DecodeString(ctx.GetHeader(`Key`))
-	if len(clientUUID) != 16 || len(clientKey) != 32 {
-		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `invalid credentials length`, map[string]any{
+
+	// Accept both old (32-byte encrypted) and new (16-byte plaintext) key formats
+	if len(clientUUID) != 16 {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `invalid UUID length`, map[string]any{
 			`from`:    clientIP,
 			`uuidLen`: len(clientUUID),
-			`keyLen`:  len(clientKey),
 		})
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
-	decrypted, err := common.DecAES(clientKey, config.Config.SaltBytes)
-	if err != nil || !bytes.Equal(decrypted, clientUUID) {
+
+	// Verify authentication based on key format
+	var authValid bool
+	if len(clientKey) == 32 {
+		// Old format: 32-byte encrypted key (MD5 hash + encrypted UUID)
+		// Try to decrypt and compare with UUID
+		decrypted, err := common.DecAES(clientKey, config.Config.SaltBytes)
+		authValid = (err == nil && bytes.Equal(decrypted, clientUUID))
+	} else if len(clientKey) == 16 {
+		// New format: 16-byte plaintext key (just UUID, no encryption)
+		authValid = bytes.Equal(clientKey, clientUUID)
+	} else {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `invalid key length`, map[string]any{
+			`from`:   clientIP,
+			`keyLen`: len(clientKey),
+		})
+		ctx.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	if !authValid {
 		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `auth failed`, map[string]any{
-			`from`: clientIP,
-			`error`: func() string {
-				if err != nil {
-					return err.Error()
-				} else {
-					return `key mismatch`
-				}
-			}(),
+			`from`:   clientIP,
+			`keyLen`: len(clientKey),
+			`error`:  `key mismatch`,
 		})
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
@@ -377,16 +460,16 @@ func wsHandshake(ctx *gin.Context) {
 	})
 	secret := append(utils.GetUUID(), utils.GetUUID()...)
 	ctx.Writer.Header().Add(`Secret`, hex.EncodeToString(secret))
-	err = common.Melody.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
+	upgradeErr := common.Melody.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
 		`Secret`:   secret,
 		`LastPack`: utils.Unix,
 		`Address`:  common.GetRemoteAddr(ctx),
 	})
-	if err != nil {
-		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `upgrade error: `+err.Error(), map[string]any{
+	if upgradeErr != nil {
+		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `upgrade error: `+upgradeErr.Error(), map[string]any{
 			`from`: clientIP,
 		})
-		span.RecordError(err)
+		span.RecordError(upgradeErr)
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
@@ -419,52 +502,101 @@ func wsOnMessageBinary(session *melody.Session, data []byte) {
 	var pack modules.Packet
 
 	dataLen := len(data)
-	if dataLen > 24 {
-		if service, op, isBinary := utils.CheckBinaryPack(data); isBinary {
-			switch service {
-			case 20:
-				switch op {
-				case 00, 01, 02, 03:
+
+	// Any inbound bytes indicate the channel is alive.
+	session.Set(`LastPack`, utils.Unix)
+
+	// Check for binary protocol FIRST (before size check)
+	// Binary frames can be 24+ bytes (header + optional payload)
+	if service, op, isBinary := utils.CheckBinaryPack(data); isBinary {
+		if dataLen < 24 {
+			previewLen := dataLen
+			if previewLen > 64 {
+				previewLen = 64
+			}
+			addr, _ := session.Get(`Address`)
+			common.Warn(nil, `WS_MESSAGE`, `fail`, `truncated binary frame`, map[string]any{
+				`from`:        addr,
+				`sessionUUID`: session.UUID[:8] + `...`,
+				`service`:     service,
+				`op`:          op,
+				`dataLen`:     dataLen,
+				`payloadHex`:  hex.EncodeToString(data[:previewLen]),
+			})
+			span.RecordError(fmt.Errorf("binary frame too short: service=%d op=%d len=%d", service, op, dataLen))
+			span.SetStatus(codes.Error, "truncated binary frame")
+			return
+		}
+
+		switch service {
+		case 20:
+			switch op {
+			case 00, 01, 02, 03:
+				if dataLen >= 24 {
 					event := hex.EncodeToString(data[6:22])
-					copy(data[6:], data[22:])
 					common.CallEvent(modules.Packet{
 						Act:   `RAW_DATA_ARRIVE`,
 						Event: event,
 						Data: gin.H{
-							`data`: utils.GetSlicePrefix(&data, dataLen-16),
-						},
-					}, session)
-				}
-			case 21:
-				switch op {
-				case 00, 01:
-					event := hex.EncodeToString(data[6:22])
-					copy(data[6:], data[22:])
-					common.CallEvent(modules.Packet{
-						Act:   `RAW_DATA_ARRIVE`,
-						Event: event,
-						Data: gin.H{
-							`data`: utils.GetSlicePrefix(&data, dataLen-16),
+							`data`: utils.GetSlicePrefix(&data, dataLen),
 						},
 					}, session)
 				}
 			}
+		case 21:
+			switch op {
+			case 00, 01:
+				if dataLen >= 24 {
+					event := hex.EncodeToString(data[6:22])
+					common.CallEvent(modules.Packet{
+						Act:   `RAW_DATA_ARRIVE`,
+						Event: event,
+						Data: gin.H{
+							`data`: utils.GetSlicePrefix(&data, dataLen),
+						},
+					}, session)
+				}
+			}
+		default:
+			previewLen := dataLen
+			if previewLen > 64 {
+				previewLen = 64
+			}
+			addr, _ := session.Get(`Address`)
+			common.Warn(nil, `WS_MESSAGE`, `fail`, `unknown binary service`, map[string]any{
+				`from`:        addr,
+				`sessionUUID`: session.UUID[:8] + `...`,
+				`service`:     service,
+				`op`:          op,
+				`dataLen`:     dataLen,
+				`payloadHex`:  hex.EncodeToString(data[:previewLen]),
+			})
+			span.RecordError(fmt.Errorf("unknown binary service=%d op=%d len=%d", service, op, dataLen))
+			span.SetStatus(codes.Error, "unknown binary service")
 			return
 		}
+		return
 	}
 
-	data, ok := common.Decrypt(data, session)
-	if !(ok && utils.JSON.Unmarshal(data, &pack) == nil) {
+	// No decryption - parse JSON directly
+	if utils.JSON.Unmarshal(data, &pack) != nil {
 		addr, _ := session.Get(`Address`)
-		common.Warn(nil, `WS_MESSAGE`, `fail`, `decrypt or parse failed`, map[string]any{
+		common.Warn(nil, `WS_MESSAGE`, `fail`, `parse failed`, map[string]any{
 			`from`:        addr,
 			`sessionUUID`: session.UUID[:8] + `...`,
 			`dataLen`:     dataLen,
+			`dataHex`: func() string {
+				max := dataLen
+				if max > 64 {
+					max = 64
+				}
+				return hex.EncodeToString(data[:max])
+			}(),
 		})
-		common.SendPack(modules.Packet{Code: -1}, session)
-		session.CloseWithMsg(melody.FormatCloseMessage(1000, `invalid request`))
-		span.RecordError(fmt.Errorf("decrypt/parse failed"))
-		span.SetStatus(codes.Error, "decrypt/parse failed")
+		// Don't close connection on parse failures - just log and continue
+		session.Set(`LastPack`, utils.Unix)
+		span.RecordError(fmt.Errorf("parse failed"))
+		span.SetStatus(codes.Error, "parse failed")
 		return
 	}
 	span.SetAttributes(

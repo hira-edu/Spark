@@ -7,6 +7,9 @@ import "errors"
 
 var errNotImplemented = errors.New("IPC not implemented on this platform")
 
+// ErrBridgeAlreadyRunning indicates another bridge process owns the pipe
+var ErrBridgeAlreadyRunning = errors.New("another desktop bridge is already running for this session")
+
 func GetPipeName(sessionID uint32) string {
 	return ""
 }

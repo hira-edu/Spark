@@ -53,9 +53,18 @@ func NewShareRepository() *ShareRepository {
 	}
 }
 
+// ensureCollection binds the collection lazily after Mongo initializes.
+func (r *ShareRepository) ensureCollection() *mongo.Collection {
+	if r.col != nil {
+		return r.col
+	}
+	r.col = GetCollection("shares")
+	return r.col
+}
+
 // Create inserts a new share
 func (r *ShareRepository) Create(ctx context.Context, share *ShareEntry) error {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -72,7 +81,7 @@ func (r *ShareRepository) Create(ctx context.Context, share *ShareEntry) error {
 
 // GetByID retrieves a share by ID
 func (r *ShareRepository) GetByID(ctx context.Context, id string) (*ShareEntry, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return nil, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -93,7 +102,7 @@ func (r *ShareRepository) GetByID(ctx context.Context, id string) (*ShareEntry, 
 
 // GetByToken retrieves a share by token
 func (r *ShareRepository) GetByToken(ctx context.Context, token string) (*ShareEntry, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return nil, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -115,7 +124,7 @@ func (r *ShareRepository) GetByToken(ctx context.Context, token string) (*ShareE
 // MarkUsed atomically marks a single-use token as used
 // Returns error if already used (prevents race condition)
 func (r *ShareRepository) MarkUsed(ctx context.Context, id, usedBy string) error {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -151,7 +160,7 @@ func (r *ShareRepository) MarkUsed(ctx context.Context, id, usedBy string) error
 
 // UpdateDesktop updates the desktop UUID for a share
 func (r *ShareRepository) UpdateDesktop(ctx context.Context, id, desktop string) error {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -175,7 +184,7 @@ func (r *ShareRepository) UpdateDesktop(ctx context.Context, id, desktop string)
 
 // AppendAccessLog appends an access log entry (limited to last 100 entries)
 func (r *ShareRepository) AppendAccessLog(ctx context.Context, token string, entry AccessLogEntry) error {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -258,7 +267,7 @@ func (r *ShareRepository) ListByDevice(ctx context.Context, deviceID string) ([]
 
 // Delete removes a share by ID
 func (r *ShareRepository) Delete(ctx context.Context, id string) error {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -275,7 +284,7 @@ func (r *ShareRepository) Delete(ctx context.Context, id string) error {
 
 // DeleteByDevice removes all shares for a device
 func (r *ShareRepository) DeleteByDevice(ctx context.Context, deviceID string) (int64, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return 0, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -292,7 +301,7 @@ func (r *ShareRepository) DeleteByDevice(ctx context.Context, deviceID string) (
 
 // DeleteExpired removes all expired shares
 func (r *ShareRepository) DeleteExpired(ctx context.Context, before time.Time) (int64, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return 0, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -317,7 +326,7 @@ func (r *ShareRepository) DeleteExpired(ctx context.Context, before time.Time) (
 
 // CountByDevice counts shares for a device
 func (r *ShareRepository) CountByDevice(ctx context.Context, deviceID string) (int64, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return 0, fmt.Errorf("MongoDB not initialized")
 	}
 

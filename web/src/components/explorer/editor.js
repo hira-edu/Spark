@@ -85,7 +85,7 @@ function TextEditor(props) {
 			editorRef.current.editor.setFontSize(currentFontSize + 1);
 		} else if (e.key === 'shrink') {
 			if (currentFontSize <= 14) {
-				message.warn(i18n.t('EXPLORER.REACHED_MIN_FONT_SIZE'));
+				message.warning(i18n.t('EXPLORER.REACHED_MIN_FONT_SIZE'));
 				return;
 			}
 			currentFontSize--;

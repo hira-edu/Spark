@@ -16,7 +16,7 @@ type User struct {
 	ID           string    `bson:"_id" json:"id"`
 	Username     string    `bson:"username" json:"username"`
 	PasswordHash string    `bson:"passwordHash" json:"-"` // Never expose in JSON
-	Role         string    `bson:"role" json:"role"`       // admin, user, etc.
+	Role         string    `bson:"role" json:"role"`      // admin, user, etc.
 	Email        string    `bson:"email" json:"email"`
 	CreatedAt    time.Time `bson:"createdAt" json:"createdAt"`
 	UpdatedAt    time.Time `bson:"updatedAt" json:"updatedAt"`

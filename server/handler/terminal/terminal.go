@@ -2,10 +2,14 @@ package terminal
 
 import (
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
+	servercfg "Rocket/server/config"
 	"Rocket/server/handler/utility"
+	"Rocket/server/storage"
 	"Rocket/utils"
 	"Rocket/utils/melody"
+	"context"
 	"encoding/hex"
 	"github.com/gin-gonic/gin"
 	"net/http"
@@ -43,19 +47,30 @@ func InitTerminal(ctx *gin.Context) {
 	ctx.Request = ctx.Request.WithContext(ctxSpan)
 	start := time.Now()
 
+	common.Info(ctx, `TERMINAL_HANDSHAKE`, ``, `start`, map[string]any{
+		`from`: ctx.ClientIP(),
+	})
+
 	if !ctx.IsWebsocket() {
+		common.Warn(ctx, `TERMINAL_HANDSHAKE`, `fail`, `not websocket`, nil)
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.SetStatus(codes.Error, "not websocket")
 		return
 	}
 	secretStr, ok := ctx.GetQuery(`secret`)
 	if !ok || len(secretStr) != 32 {
+		common.Warn(ctx, `TERMINAL_HANDSHAKE`, `fail`, `invalid secret`, map[string]any{
+			`secretLen`: len(secretStr),
+		})
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.SetStatus(codes.Error, "missing secret")
 		return
 	}
 	secret, err := hex.DecodeString(secretStr)
 	if err != nil {
+		common.Warn(ctx, `TERMINAL_HANDSHAKE`, `fail`, `secret decode failed`, map[string]any{
+			`error`: err.Error(),
+		})
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "secret decode failed")
@@ -63,11 +78,21 @@ func InitTerminal(ctx *gin.Context) {
 	}
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
+		common.Warn(ctx, `TERMINAL_HANDSHAKE`, `fail`, `missing device`, nil)
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.SetStatus(codes.Error, "missing device")
 		return
 	}
+	if cluster.RedirectIfNeeded(ctx, device) {
+		common.Info(ctx, `TERMINAL_HANDSHAKE`, ``, `redirected`, map[string]any{
+			`device`: device,
+		})
+		return
+	}
 	if _, ok := common.CheckDevice(device, ``); !ok {
+		common.Warn(ctx, `TERMINAL_HANDSHAKE`, `fail`, `device not found`, map[string]any{
+			`device`: device,
+		})
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		span.SetStatus(codes.Error, "device not found")
 		return
@@ -92,17 +117,25 @@ func terminalEventWrapper(terminal *terminal) common.EventCallback {
 	return func(pack modules.Packet, device *melody.Session) {
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
 			data := *pack.Data[`data`].(*[]byte)
+			common.Info(nil, `TERMINAL_RAW_DATA`, ``, ``, map[string]any{
+				`dataLen`: len(data),
+				`op`:      data[5],
+			})
 			if data[5] == 00 {
 				terminal.session.WriteBinary(data)
 				return
 			}
 
 			if data[5] != 01 {
+				common.Warn(nil, `TERMINAL_RAW_DATA`, ``, `unexpected op code`, map[string]any{
+					`op`: data[5],
+				})
 				return
 			}
 			data = data[8:]
 			data = utility.SimpleDecrypt(data, device)
 			if utils.JSON.Unmarshal(data, &pack) != nil {
+				common.Warn(nil, `TERMINAL_RAW_DATA`, ``, `JSON parse failed`, nil)
 				return
 			}
 		}
@@ -179,6 +212,19 @@ func onTerminalConnect(session *melody.Session) {
 	}
 	session.Set(`Terminal`, terminal)
 	common.AddEvent(terminalEventWrapper(terminal), connUUID, uuid)
+
+	if storage.IsMongoEnabled() {
+		go func(sessID, deviceID string) {
+			ctx, cancel := storage.WithTimeout(context.Background())
+			defer cancel()
+			if mgr := cluster.Current(); mgr != nil {
+				mgr.StartSession(ctx, sessID, deviceID, "", "terminal")
+			} else {
+				_ = storage.StartSession(ctx, sessID, deviceID, "", "terminal", common.GetControllerID(), sessionLeaseTTL())
+			}
+		}(uuid, terminal.device)
+	}
+
 	common.SendPack(modules.Packet{Act: `TERMINAL_INIT`, Data: gin.H{
 		`terminal`: uuid,
 	}, Event: uuid}, deviceConn)
@@ -196,12 +242,14 @@ func onTerminalMessage(session *melody.Session, data []byte) {
 	terminal := val.(*terminal)
 
 	service, op, isBinary := utils.CheckBinaryPack(data)
-	if !isBinary || service != 21 {
+	if !isBinary {
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return
 	}
-	if op == 00 {
+
+	// Handle raw terminal input/output (service 21, op 00)
+	if service == 21 && op == 00 {
 		session.Set(`LastPack`, utils.Unix)
 		rawEvent, _ := hex.DecodeString(terminal.uuid)
 		data = append(data, rawEvent...)
@@ -210,7 +258,9 @@ func onTerminalMessage(session *melody.Session, data []byte) {
 		terminal.deviceConn.WriteBinary(data)
 		return
 	}
-	if op != 01 {
+
+	// Handle encrypted JSON commands (service 20 or 21, op 01 or 03)
+	if !((service == 20 && op == 03) || (service == 21 && op == 01)) {
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return
@@ -267,6 +317,17 @@ func onTerminalMessage(session *melody.Session, data []byte) {
 		common.SendPack(modules.Packet{Act: `TERMINAL_PING`, Data: gin.H{
 			`terminal`: terminal.uuid,
 		}, Event: terminal.uuid}, terminal.deviceConn)
+		if storage.IsMongoEnabled() {
+			go func(sessID string) {
+				ctx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				if mgr := cluster.Current(); mgr != nil {
+					mgr.HeartbeatSession(ctx, sessID)
+				} else {
+					_ = storage.HeartbeatSession(ctx, sessID, sessionLeaseTTL())
+				}
+			}(terminal.uuid)
+		}
 		return
 	}
 	session.Close()
@@ -286,6 +347,17 @@ func onTerminalDisconnect(session *melody.Session) {
 		`terminal`: terminal.uuid,
 	}, Event: terminal.uuid}, terminal.deviceConn)
 	common.RemoveEvent(terminal.uuid)
+	if storage.IsMongoEnabled() {
+		go func(sessID string) {
+			ctx, cancel := storage.WithTimeout(context.Background())
+			defer cancel()
+			if mgr := cluster.Current(); mgr != nil {
+				mgr.CloseSession(ctx, sessID, `client_quit`)
+			} else {
+				_ = storage.CloseSession(ctx, sessID)
+			}
+		}(terminal.uuid)
+	}
 	session.Set(`Terminal`, nil)
 	terminal = nil
 }
@@ -323,4 +395,11 @@ func CloseSessionsByDevice(deviceID string) {
 	for _, session := range queue {
 		session.Close()
 	}
+}
+
+func sessionLeaseTTL() time.Duration {
+	if servercfg.Config.Cluster != nil && servercfg.Config.Cluster.SessionLeaseSeconds > 0 {
+		return time.Duration(servercfg.Config.Cluster.SessionLeaseSeconds) * time.Second
+	}
+	return 3 * time.Minute
 }

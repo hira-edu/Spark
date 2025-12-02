@@ -4,6 +4,7 @@ import QualitySlider from './QualitySlider';
 import FPSSelector from './FPSSelector';
 import InputToggle from './InputToggle';
 import ActionButtons from './ActionButtons';
+import MonitorStatus from './MonitorStatus';
 import './Controls.css';
 
 // Icons for input toggles - Simple outline style to match Ant Design icons
@@ -86,6 +87,10 @@ const ControlBar = ({
       </div>
 
       <div className="control-bar-right">
+        <MonitorStatus
+          monitors={monitors}
+          selectedMonitor={selectedMonitor}
+        />
         <ActionButtons
           onScreenshot={onScreenshot}
           onClipboard={onClipboard}

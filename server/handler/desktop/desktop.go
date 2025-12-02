@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -9,8 +10,11 @@ import (
 	"time"
 
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
+	servercfg "Rocket/server/config"
 	"Rocket/server/handler/utility"
+	"Rocket/server/storage"
 	"Rocket/utils"
 	"Rocket/utils/melody"
 
@@ -33,6 +37,9 @@ const maxDesktopInputBatch = 32
 const (
 	maxSDPLength       = 1 << 15
 	maxCandidateLength = 4096
+	maxClipboardBytes  = 64 * 1024
+	maxFileDropEntries = 5
+	maxFileNameLength  = 255
 )
 
 func init() {
@@ -68,6 +75,12 @@ func InitDesktop(ctx *gin.Context) {
 		return
 	}
 
+	common.Info(ctx, `DESKTOP_HANDSHAKE`, `start`, ``, map[string]any{
+		`remote`: common.GetRemoteAddr(ctx),
+		`origin`: ctx.GetHeader(`Origin`),
+		`path`:   ctx.Request.URL.String(),
+	})
+
 	// Validate WebSocket origin to prevent CSWSH attacks
 	if !validateWebSocketOrigin(ctx) {
 		logAbort(http.StatusForbidden, `invalid websocket origin`, map[string]any{
@@ -93,6 +106,9 @@ func InitDesktop(ctx *gin.Context) {
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
 		logAbort(http.StatusBadRequest, `missing device`, nil)
+		return
+	}
+	if cluster.RedirectIfNeeded(ctx, device) {
 		return
 	}
 	if _, ok := common.CheckDevice(device, ``); !ok {
@@ -127,7 +143,30 @@ func InitDesktop(ctx *gin.Context) {
 // be called when device need to send a packet to browser
 func desktopEventWrapper(desktop *desktop) common.EventCallback {
 	return func(pack modules.Packet, device *melody.Session) {
+		common.Info(nil, `[SERVER_DESKTOP_EVENT]`, ``, `Device sent packet for desktop session`, map[string]any{
+			`act`:          pack.Act,
+			`desktop_uuid`: desktop.uuid[:8] + `...`,
+			`has_data`:     pack.Data != nil,
+		})
+
+		// Extend leases on any device→browser traffic (best effort)
+		if storage.IsMongoEnabled() {
+			go func(sessID, deviceID string) {
+				ctx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				if mgr := cluster.Current(); mgr != nil {
+					mgr.HeartbeatSession(ctx, sessID)
+				} else {
+					_ = storage.HeartbeatSession(ctx, sessID, sessionLeaseTTL())
+				}
+				_ = storage.UpsertDevice(ctx, deviceID, common.GetControllerID(), sessionLeaseTTL(), nil, "")
+			}(desktop.uuid, desktop.device)
+		}
+
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
+			common.Info(nil, `[SERVER_DESKTOP_RAW_DATA]`, ``, `Device sent raw desktop data`, map[string]any{
+				`desktop_uuid`: desktop.uuid[:8] + `...`,
+			})
 			data := *pack.Data[`data`].(*[]byte)
 			if data[5] == 00 || data[5] == 01 || data[5] == 02 {
 				desktop.srcConn.WriteBinary(data)
@@ -146,6 +185,12 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 
 		switch pack.Act {
 		case `DESKTOP_INIT`:
+			common.Info(nil, `[SERVER_DESKTOP_INIT_RESPONSE]`, ``, `Received DESKTOP_INIT response from device`, map[string]any{
+				`code`:         pack.Code,
+				`desktop_uuid`: desktop.uuid[:8] + `...`,
+				`has_data`:     pack.Data != nil,
+			})
+
 			if pack.Code != 0 {
 				msg := `${i18n|DESKTOP.CREATE_SESSION_FAILED}`
 				if len(pack.Msg) > 0 {
@@ -153,6 +198,10 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				} else {
 					msg += `${i18n|COMMON.UNKNOWN_ERROR}`
 				}
+				common.Warn(desktop.srcConn, `[SERVER_DESKTOP_INIT_FAILED]`, ``, `Device returned error for DESKTOP_INIT`, map[string]any{
+					`error`:        pack.Msg,
+					`desktop_uuid`: desktop.uuid[:8] + `...`,
+				})
 				sendPack(modules.Packet{Act: `QUIT`, Msg: msg}, desktop.srcConn)
 				common.RemoveEvent(desktop.uuid)
 				desktop.srcConn.Close()
@@ -160,9 +209,26 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 					`deviceConn`: desktop.deviceConn,
 				})
 			} else {
+				common.Info(desktop.srcConn, `[SERVER_DESKTOP_INIT_SUCCESS]`, ``, `Device initialized desktop successfully`, map[string]any{
+					`desktop_uuid`: desktop.uuid[:8] + `...`,
+					`display_data`: pack.Data,
+				})
 				common.Info(desktop.srcConn, `DESKTOP_INIT`, `success`, ``, map[string]any{
 					`deviceConn`: desktop.deviceConn,
 				})
+
+				// Persist session start (best effort)
+				if storage.IsMongoEnabled() {
+					go func(sessID, deviceID, controllerID string) {
+						ctx, cancel := storage.WithTimeout(context.Background())
+						defer cancel()
+						if mgr := cluster.Current(); mgr != nil {
+							mgr.StartSession(ctx, sessID, deviceID, "", "desktop")
+						} else {
+							_ = storage.StartSession(ctx, sessID, deviceID, "", "desktop", controllerID, sessionLeaseTTL())
+						}
+					}(desktop.uuid, desktop.device, common.GetControllerID())
+				}
 			}
 		case `DESKTOP_QUIT`:
 			msg := `${i18n|DESKTOP.SESSION_CLOSED}`
@@ -175,7 +241,27 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			common.Info(desktop.srcConn, `DESKTOP_QUIT`, `success`, ``, map[string]any{
 				`deviceConn`: desktop.deviceConn,
 			})
+
+			// Persist session closure (best effort)
+			if storage.IsMongoEnabled() {
+				go func(sessID string) {
+					ctx, cancel := storage.WithTimeout(context.Background())
+					defer cancel()
+					if mgr := cluster.Current(); mgr != nil {
+						mgr.CloseSession(ctx, sessID, `client_quit`)
+					} else {
+						_ = storage.CloseSession(ctx, sessID)
+					}
+				}(desktop.uuid)
+			}
 		case `DESKTOP_INPUT`:
+			if pack.Code != 0 {
+				sendPack(pack, desktop.srcConn)
+			}
+		case `CURSOR_UPDATE`:
+			// Relay cursor metadata to browser unchanged
+			sendPack(pack, desktop.srcConn)
+		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
 			if pack.Code != 0 {
 				sendPack(pack, desktop.srcConn)
 			}
@@ -191,16 +277,26 @@ func onDesktopConnect(session *melody.Session) {
 		clientIP = addr.(string)
 	}
 
+	common.Info(session, `[SERVER_DESKTOP_CONNECT_START]`, ``, `Browser connected to desktop WebSocket`, map[string]any{
+		`from`:         clientIP,
+		`session_uuid`: session.UUID[:8] + `...`,
+	})
+
 	device, ok := session.Get(`Device`)
 	if !ok {
 		common.Warn(session, `DESKTOP_CONN`, `fail`, `no device ID in session`, map[string]any{
 			`from`: clientIP,
 		})
+		common.Warn(session, `[SERVER_DESKTOP_NO_DEVICE]`, ``, `Device ID missing in session`, nil)
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|DESKTOP.CREATE_SESSION_FAILED}`}, session)
 		session.Close()
 		return
 	}
 	deviceID := device.(string)
+
+	common.Info(session, `[SERVER_DESKTOP_DEVICE_LOOKUP]`, ``, `Looking up device connection`, map[string]any{
+		`device_id`: deviceID[:16] + `...`,
+	})
 
 	connUUID, ok := common.CheckDevice(deviceID, ``)
 	if !ok {
@@ -208,10 +304,18 @@ func onDesktopConnect(session *melody.Session) {
 			`from`:     clientIP,
 			`deviceID`: deviceID[:16] + `...`,
 		})
+		common.Warn(session, `[SERVER_DESKTOP_DEVICE_NOT_FOUND]`, ``, `Device not in online devices map`, map[string]any{
+			`device_id`: deviceID[:16] + `...`,
+		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
 	}
+
+	common.Info(session, `[SERVER_DESKTOP_DEVICE_FOUND]`, ``, `Device found, getting WebSocket session`, map[string]any{
+		`conn_uuid`: connUUID[:8] + `...`,
+	})
+
 	deviceConn, ok := common.Melody.GetSessionByUUID(connUUID)
 	if !ok {
 		common.Warn(session, `DESKTOP_CONN`, `fail`, `device connection not found`, map[string]any{
@@ -219,10 +323,17 @@ func onDesktopConnect(session *melody.Session) {
 			`deviceID`: deviceID[:16] + `...`,
 			`connUUID`: connUUID[:8] + `...`,
 		})
+		common.Warn(session, `[SERVER_DESKTOP_WS_NOT_FOUND]`, ``, `Device WebSocket session not found in Melody`, map[string]any{
+			`conn_uuid`: connUUID[:8] + `...`,
+		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
 	}
+
+	common.Info(session, `[SERVER_DESKTOP_WS_FOUND]`, ``, `Device WebSocket session found`, map[string]any{
+		`conn_uuid`: connUUID[:8] + `...`,
+	})
 
 	desktopUUID := utils.GetStrUUID()
 	desktop := &desktop{
@@ -232,10 +343,41 @@ func onDesktopConnect(session *melody.Session) {
 		deviceConn: deviceConn,
 	}
 	session.Set(`Desktop`, desktop)
+
+	common.Info(session, `[SERVER_DESKTOP_SESSION_CREATED]`, ``, `Desktop session created`, map[string]any{
+		`desktop_uuid`: desktopUUID[:8] + `...`,
+		`device_id`:    deviceID[:16] + `...`,
+	})
+
 	common.AddEvent(desktopEventWrapper(desktop), connUUID, desktopUUID)
-	common.SendPack(modules.Packet{Act: `DESKTOP_INIT`, Data: gin.H{
+
+	common.Info(session, `[SERVER_DESKTOP_SENDING_INIT]`, ``, `Sending DESKTOP_INIT to device`, map[string]any{
+		`desktop_uuid`: desktopUUID[:8] + `...`,
+		`conn_uuid`:    connUUID[:8] + `...`,
+	})
+
+	if !common.SendPack(modules.Packet{Act: `DESKTOP_INIT`, Data: gin.H{
 		`desktop`: desktopUUID,
-	}, Event: desktopUUID}, deviceConn)
+	}, Event: desktopUUID}, deviceConn) {
+		common.Warn(session, `[SERVER_DESKTOP_INIT_SEND_FAILED]`, ``, `Failed to send DESKTOP_INIT to device`, map[string]any{
+			`desktop_uuid`: desktopUUID[:8] + `...`,
+		})
+	} else {
+		common.Info(session, `[SERVER_DESKTOP_INIT_SENT]`, ``, `DESKTOP_INIT sent to device successfully`, map[string]any{
+			`desktop_uuid`: desktopUUID[:8] + `...`,
+		})
+	}
+
+	// Persist device record with controller lease (best effort)
+	if storage.IsMongoEnabled() {
+		go func() {
+			ctx, cancel := storage.WithTimeout(context.Background())
+			defer cancel()
+			_ = storage.UpsertDevice(ctx, deviceID, common.GetControllerID(), sessionLeaseTTL(), map[string]any{
+				"clientIP": clientIP,
+			}, "")
+		}()
+	}
 
 	// Get device info for logging
 	deviceInfo := map[string]any{
@@ -254,13 +396,22 @@ func onDesktopConnect(session *melody.Session) {
 }
 
 func onDesktopMessage(session *melody.Session, data []byte) {
+	common.Info(session, `[SERVER_DESKTOP_MSG_FROM_BROWSER]`, ``, `Received message from browser`, map[string]any{
+		`data_len`: len(data),
+	})
+
 	var pack modules.Packet
 	val, ok := session.Get(`Desktop`)
 	if !ok {
 		common.Warn(session, `DESKTOP_MSG`, `fail`, `no desktop session`, nil)
+		common.Warn(session, `[SERVER_DESKTOP_NO_SESSION]`, ``, `Desktop session not found in Melody session`, nil)
 		return
 	}
 	desktop := val.(*desktop)
+
+	common.Info(session, `[SERVER_DESKTOP_CHECKING_PROTOCOL]`, ``, `Checking binary protocol`, map[string]any{
+		`data_len`: len(data),
+	})
 
 	service, op, isBinary := utils.CheckBinaryPack(data)
 	if !isBinary || service != 20 {
@@ -269,10 +420,20 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			`service`:  service,
 			`isBinary`: isBinary,
 		})
+		common.Warn(session, `[SERVER_DESKTOP_INVALID_PROTOCOL]`, ``, `Message not in expected binary format`, map[string]any{
+			`service`:   service,
+			`is_binary`: isBinary,
+			`data_len`:  len(data),
+		})
 		sendPack(modules.Packet{Code: -1}, session)
 		session.Close()
 		return
 	}
+
+	common.Info(session, `[SERVER_DESKTOP_PROTOCOL_VALID]`, ``, `Binary protocol validated`, map[string]interface{}{
+		`service`: service,
+		`op`:      op,
+	})
 	if op != 03 {
 		common.Warn(session, `DESKTOP_MSG`, `fail`, `invalid op code`, map[string]any{
 			`desktop`: desktop.uuid[:8] + `...`,
@@ -294,26 +455,48 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	}
 	session.Set(`LastPack`, utils.Unix)
 
+	common.Info(session, `[SERVER_DESKTOP_ACTION_DISPATCH]`, ``, `Dispatching desktop action to device`, map[string]any{
+		`act`:          pack.Act,
+		`desktop_uuid`: desktop.uuid[:8] + `...`,
+	})
+
 	switch pack.Act {
 	case `DESKTOP_PING`:
+		common.Info(session, `[SERVER_DESKTOP_PING]`, ``, `Relaying DESKTOP_PING to device`, nil)
 		common.SendPack(modules.Packet{Act: `DESKTOP_PING`, Data: gin.H{
 			`desktop`: desktop.uuid,
 		}, Event: desktop.uuid}, desktop.deviceConn)
+		if storage.IsMongoEnabled() {
+			go func(sessID string) {
+				ctx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				if mgr := cluster.Current(); mgr != nil {
+					mgr.HeartbeatSession(ctx, sessID)
+				} else {
+					_ = storage.HeartbeatSession(ctx, sessID, sessionLeaseTTL())
+				}
+			}(desktop.uuid)
+		}
 		return
 	case `DESKTOP_KILL`:
 		common.Info(desktop.srcConn, `DESKTOP_KILL`, `success`, ``, map[string]any{
 			`deviceConn`: desktop.deviceConn,
 		})
+		common.Info(session, `[SERVER_DESKTOP_KILL]`, ``, `Sending DESKTOP_KILL to device`, nil)
 		common.SendPack(modules.Packet{Act: `DESKTOP_KILL`, Data: gin.H{
 			`desktop`: desktop.uuid,
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	case `DESKTOP_SHOT`:
+		common.Info(session, `[SERVER_DESKTOP_SHOT]`, ``, `Requesting desktop screenshot from device`, nil)
 		common.SendPack(modules.Packet{Act: `DESKTOP_SHOT`, Data: gin.H{
 			`desktop`: desktop.uuid,
 		}, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	case `DESKTOP_INPUT`:
+		common.Info(session, `[SERVER_DESKTOP_INPUT]`, ``, `Relaying desktop input to device`, map[string]any{
+			`has_events`: pack.Data != nil && pack.Data[`events`] != nil,
+		})
 		events, ok := normalizeInputEvents(pack.Data)
 		if !ok {
 			common.Warn(desktop.srcConn, `DESKTOP_INPUT`, `fail`, `invalid events payload`, map[string]any{
@@ -333,6 +516,40 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			},
 			Event: desktop.uuid,
 		}, desktop.deviceConn)
+		return
+	case `DESKTOP_CONFIG`:
+		payload, ok := normalizeConfig(pack.Data)
+		if !ok {
+			sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+			return
+		}
+		payload[`desktop`] = desktop.uuid
+		common.Info(session, `[SERVER_DESKTOP_CONFIG]`, ``, `Relaying desktop configuration to device`, payload)
+		common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+		return
+	case `DESKTOP_CLIPBOARD`:
+		if payload, ok := normalizeClipboard(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+			return
+		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+	case `DESKTOP_FILE_DROP`:
+		if payload, ok := normalizeFileDrop(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+			return
+		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+	case `DESKTOP_AUDIO`:
+		if payload, ok := normalizeAudioControl(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
+			return
+		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
 		if payload, ok := normalizeSDP(pack.Data); ok {
@@ -355,20 +572,44 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 }
 
 func onDesktopDisconnect(session *melody.Session) {
+	common.Info(session, `[SERVER_DESKTOP_DISCONNECT]`, ``, `Browser disconnected from desktop session`, nil)
 	common.Info(session, `DESKTOP_CLOSE`, `success`, ``, nil)
+
 	val, ok := session.Get(`Desktop`)
 	if !ok {
+		common.Info(session, `[SERVER_DESKTOP_NO_SESSION_ON_DISCONNECT]`, ``, `No desktop session to clean up`, nil)
 		return
 	}
 	desktop, ok := val.(*desktop)
 	if !ok {
+		common.Warn(session, `[SERVER_DESKTOP_INVALID_SESSION_TYPE]`, ``, `Invalid desktop session type`, nil)
 		return
 	}
-	common.SendPack(modules.Packet{Act: `DESKTOP_KILL`, Data: gin.H{
+
+	common.Info(session, `[SERVER_DESKTOP_CLEANUP]`, ``, `Cleaning up desktop session`, map[string]any{
+		`desktop_uuid`: desktop.uuid[:8] + `...`,
+		`device_id`:    desktop.device[:16] + `...`,
+	})
+
+	if !common.SendPack(modules.Packet{Act: `DESKTOP_KILL`, Data: gin.H{
 		`desktop`: desktop.uuid,
-	}, Event: desktop.uuid}, desktop.deviceConn)
+	}, Event: desktop.uuid}, desktop.deviceConn) {
+		common.Warn(session, `[SERVER_DESKTOP_KILL_FAILED]`, ``, `Failed to send DESKTOP_KILL to device`, nil)
+	} else {
+		common.Info(session, `[SERVER_DESKTOP_KILL_SENT]`, ``, `DESKTOP_KILL sent to device`, nil)
+	}
+
 	common.RemoveEvent(desktop.uuid)
 	session.Set(`Desktop`, nil)
+
+	if storage.IsMongoEnabled() {
+		go func(deviceID string) {
+			ctx, cancel := storage.WithTimeout(context.Background())
+			defer cancel()
+			_ = storage.MarkDeviceOffline(ctx, deviceID)
+		}(desktop.device)
+	}
+
 	desktop = nil
 }
 
@@ -406,6 +647,13 @@ func CloseSessionsByDevice(deviceID string) {
 	for _, session := range queue {
 		session.Close()
 	}
+}
+
+func sessionLeaseTTL() time.Duration {
+	if servercfg.Config.Cluster != nil && servercfg.Config.Cluster.SessionLeaseSeconds > 0 {
+		return time.Duration(servercfg.Config.Cluster.SessionLeaseSeconds) * time.Second
+	}
+	return 3 * time.Minute
 }
 
 func normalizeInputEvents(data map[string]any) ([]any, bool) {
@@ -508,6 +756,140 @@ func isValidICECandidate(candidate string) bool {
 	// ICE candidates contain space-separated components and type info
 	return strings.Contains(candidate, " ") &&
 		(strings.HasPrefix(candidate, "candidate:") || strings.Contains(candidate, "typ "))
+}
+
+func normalizeClipboard(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	text, ok := data[`text`].(string)
+	if !ok || len(text) == 0 {
+		return nil, false
+	}
+	if len(text) > maxClipboardBytes {
+		text = text[:maxClipboardBytes]
+	}
+	payload := gin.H{`text`: text}
+	if mime, ok := data[`mime`].(string); ok && len(mime) > 0 {
+		payload[`mime`] = strings.ToLower(mime)
+	}
+	return payload, true
+}
+
+func normalizeFileDrop(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+	rawFiles, ok := data[`files`]
+	if !ok {
+		return nil, false
+	}
+	list, ok := rawFiles.([]any)
+	if !ok || len(list) == 0 {
+		return nil, false
+	}
+
+	files := make([]gin.H, 0, len(list))
+	for _, item := range list {
+		if len(files) >= maxFileDropEntries {
+			break
+		}
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m[`name`].(string)
+		if len(name) > maxFileNameLength {
+			name = name[:maxFileNameLength]
+		}
+		size := int64(0)
+		switch v := m[`size`].(type) {
+		case float64:
+			size = int64(v)
+		case int64:
+			size = v
+		case int:
+			size = int64(v)
+		}
+		if len(name) == 0 && size <= 0 {
+			continue
+		}
+		file := gin.H{`name`: name}
+		if size > 0 {
+			file[`size`] = size
+		}
+		if mime, ok := m[`type`].(string); ok && len(mime) > 0 {
+			file[`type`] = mime
+		}
+		files = append(files, file)
+	}
+	if len(files) == 0 {
+		return nil, false
+	}
+	return gin.H{`files`: files}, true
+}
+
+func normalizeAudioControl(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return gin.H{}, true
+	}
+	payload := gin.H{}
+	if muted, ok := data[`muted`].(bool); ok {
+		payload[`muted`] = muted
+	}
+	if op, ok := data[`op`].(string); ok && len(op) > 0 {
+		payload[`op`] = strings.ToLower(op)
+	}
+	if mode, ok := data[`mode`].(string); ok && len(mode) > 0 {
+		payload[`mode`] = strings.ToLower(mode)
+	}
+	return payload, true
+}
+
+func normalizeConfig(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return gin.H{}, true
+	}
+
+	payload := gin.H{}
+
+	if fps, ok := coerceNumber(data[`fps`]); ok {
+		payload[`fps`] = fps
+	}
+	if quality, ok := coerceNumber(data[`quality`]); ok {
+		payload[`quality`] = quality
+	}
+
+	// Accept both "monitor" and "display" keys; map to monitor for the device
+	if monitor, ok := coerceNumber(data[`monitor`]); ok {
+		payload[`monitor`] = monitor
+	} else if display, ok := coerceNumber(data[`display`]); ok {
+		payload[`monitor`] = display
+	}
+
+	if codec, ok := data[`codec`].(string); ok && len(codec) > 0 {
+		payload[`codec`] = strings.ToLower(strings.TrimSpace(codec))
+	}
+	if allow, ok := data[`allowControl`].(bool); ok {
+		payload[`allowControl`] = allow
+	}
+
+	// Allow empty payloads; the device will perform stricter validation
+	return payload, true
+}
+
+func coerceNumber(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // validateWebSocketOrigin checks the Origin header to prevent Cross-Site WebSocket Hijacking

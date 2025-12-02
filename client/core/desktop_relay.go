@@ -27,8 +27,9 @@ func initDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 			wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: err.Error()}, pack)
 			return
 		}
-		// Success response - frames will come via IPC
-		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 0}, pack)
+		// DO NOT send success response here - wait for Session 1's actual response via IPC
+		// The response will come through relay.handlePacket → sendDesktopPacket → WebSocket
+		// Sending premature response causes race condition and duplicate packets
 		return
 	}
 

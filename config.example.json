@@ -20,6 +20,21 @@
       "cache_dir": "./certs"
     }
   },
+  "mongodb": {
+    "enable": true,
+    "uri": "mongodb://localhost:27017",
+    "database": "rocket"
+  },
+  "cluster": {
+    "enable": true,
+    "public_url": "https://controller.example.com",
+    "controller_id_file": "./data/controller.id",
+    "lease_ttl_seconds": 120,
+    "session_lease_seconds": 180,
+    "stale_after_seconds": 90,
+    "cleanup_interval_seconds": 30,
+    "use_change_streams": true
+  },
   "webrtc": {
     "turn_servers": [],
     "stun_servers": [

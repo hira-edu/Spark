@@ -18,6 +18,7 @@ import SetupPage from "./pages/setup";
 import {translate} from "./utils/utils";
 
 axios.defaults.baseURL = '.';
+axios.defaults.withCredentials = true;
 axios.interceptors.response.use(async res => {
 	let data = res.data;
 	if (data.hasOwnProperty('code')) {
@@ -27,7 +28,7 @@ axios.interceptors.response.use(async res => {
 			const pathname = window.location.pathname;
 			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
 			if (!isAuthError || !isAuthPage) {
-				message.warn(translate(data.msg));
+				message.warning(translate(data.msg));
 			}
 		} else {
 			// The first request will ask user to provide user/pass.
@@ -52,7 +53,7 @@ axios.interceptors.response.use(async res => {
 			const pathname = window.location.pathname;
 			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
 			if (!isAuthError || !isAuthPage) {
-				message.warn(translate(data.msg));
+				message.warning(translate(data.msg));
 			}
 			return Promise.resolve(res);
 		}

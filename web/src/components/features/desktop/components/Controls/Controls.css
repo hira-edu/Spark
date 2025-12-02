@@ -148,3 +148,14 @@
   align-items: center;
   gap: var(--spacing-xs);
 }
+
+/* Monitor status */
+.monitor-status {
+  max-width: 100%;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}

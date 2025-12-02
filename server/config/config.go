@@ -17,6 +17,7 @@ type config struct {
 	WebRTC    *webrtc           `json:"webrtc"`
 	Transport *transport        `json:"transport"` // Transport configuration
 	MongoDB   *mongodb          `json:"mongodb"`   // MongoDB configuration
+	Cluster   *cluster          `json:"cluster"`   // Cluster/broker configuration
 	SaltBytes []byte            `json:"-"`
 }
 
@@ -74,6 +75,20 @@ type mongodb struct {
 	Enable   bool   `json:"enable"`   // Enable MongoDB for persistent storage
 	URI      string `json:"uri"`      // MongoDB connection URI
 	Database string `json:"database"` // Database name
+}
+
+type cluster struct {
+	Enable                 bool   `json:"enable"`                   // Enable clustered/brokered mode
+	ControllerID           string `json:"controller_id"`            // Optional static controller ID
+	PublicURL              string `json:"public_url"`               // External URL for this controller (used for redirects)
+	ControllerIDFile       string `json:"controller_id_file"`       // Where to persist controller ID
+	LeaseTTLSeconds        int    `json:"lease_ttl_seconds"`        // Lease duration for device ownership
+	SessionLeaseSeconds    int    `json:"session_lease_seconds"`    // Lease duration for user sessions
+	StaleAfterSeconds      int    `json:"stale_after_seconds"`      // Consider controller stale after this many seconds without heartbeat
+	CleanupIntervalSeconds int    `json:"cleanup_interval_seconds"` // How often to run cleanup/rebalance
+	UseChangeStreams       *bool  `json:"use_change_streams"`       // Prefer MongoDB change streams for propagation
+	PreferProxy            *bool  `json:"prefer_proxy"`             // Prefer proxying over redirects for remote controllers
+	ProxyTimeoutSeconds    int    `json:"proxy_timeout_seconds"`    // Dial/TLS timeout for proxy handoff
 }
 
 // Commit is hash of this commit, for auto upgrade.
@@ -216,6 +231,40 @@ func init() {
 			Listen: ":53",
 			Domain: "", // Must be configured by operator
 		}
+	}
+
+	// Initialize cluster defaults
+	if Config.Cluster == nil {
+		Config.Cluster = &cluster{}
+	}
+	if Config.MongoDB != nil && Config.MongoDB.Enable && !Config.Cluster.Enable {
+		Config.Cluster.Enable = true
+	}
+	if Config.Cluster.ControllerIDFile == "" {
+		Config.Cluster.ControllerIDFile = "./data/controller.id"
+	}
+	if Config.Cluster.LeaseTTLSeconds == 0 {
+		Config.Cluster.LeaseTTLSeconds = 120
+	}
+	if Config.Cluster.SessionLeaseSeconds == 0 {
+		Config.Cluster.SessionLeaseSeconds = 180
+	}
+	if Config.Cluster.StaleAfterSeconds == 0 {
+		Config.Cluster.StaleAfterSeconds = 90
+	}
+	if Config.Cluster.CleanupIntervalSeconds == 0 {
+		Config.Cluster.CleanupIntervalSeconds = 30
+	}
+	if Config.Cluster.UseChangeStreams == nil {
+		v := true
+		Config.Cluster.UseChangeStreams = &v
+	}
+	if Config.Cluster.PreferProxy == nil {
+		v := true
+		Config.Cluster.PreferProxy = &v
+	}
+	if Config.Cluster.ProxyTimeoutSeconds == 0 {
+		Config.Cluster.ProxyTimeoutSeconds = 10
 	}
 
 	golog.SetLevel(utils.If(len(Config.Log.Level) == 0, `info`, Config.Log.Level))

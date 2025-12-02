@@ -1,10 +1,13 @@
 package desktop
 
 import (
+	"Rocket/client/telemetry"
 	"errors"
 	"image"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -13,16 +16,38 @@ import (
 )
 
 const (
-	envICEList  = "SPARK_WEBRTC_ICE"
-	envStunList = "SPARK_WEBRTC_STUN"
-	envTurnList = "SPARK_WEBRTC_TURN"
-	envTurnUser = "SPARK_WEBRTC_TURN_USERNAME"
-	envTurnPass = "SPARK_WEBRTC_TURN_PASSWORD"
+	envICEList      = "SPARK_WEBRTC_ICE"
+	envStunList     = "SPARK_WEBRTC_STUN"
+	envTurnList     = "SPARK_WEBRTC_TURN"
+	envTurnUser     = "SPARK_WEBRTC_TURN_USERNAME"
+	envTurnPass     = "SPARK_WEBRTC_TURN_PASSWORD"
+	envICETransport = "SPARK_WEBRTC_ICE_TRANSPORT_POLICY" // "all", "relay" (force TURN)
+	envNATType      = "SPARK_WEBRTC_NAT_TYPE"             // "symmetric", "cone", "auto"
 )
 
+// Default STUN servers - using multiple providers for redundancy (2025 best practice)
 var defaultICEURLs = []string{
+	// Google STUN (primary, most reliable)
 	"stun:stun.l.google.com:19302",
+	"stun:stun1.l.google.com:19302",
+	// Cloudflare STUN (backup)
 	"stun:stun.cloudflare.com:3478",
+}
+
+// Default TURN servers with multiple transports for symmetric NAT
+// These should be configured via environment variables in production
+var defaultTURNServers = []struct {
+	urls []string
+	note string
+}{
+	{
+		urls: []string{
+			"turn:turn.example.com:3478?transport=udp", // UDP (standard, lowest latency)
+			"turn:turn.example.com:3478?transport=tcp", // TCP (for UDP-blocked networks)
+			"turns:turn.example.com:443?transport=tcp", // TLS (for restrictive firewalls)
+		},
+		note: "Production TURN servers should be configured via SPARK_WEBRTC_TURN",
+	},
 }
 
 // ErrVPXUnavailable is returned when the VPX encoder was not built into the binary.
@@ -31,12 +56,16 @@ var ErrVPXUnavailable = errors.New("vpx encoder not built (enable cgo, install l
 // DesktopWebRTC mirrors the JPEG cadence by emitting samples on a video track and
 // reuses the DESKTOP_INPUT data channel for input forwarding.
 type DesktopWebRTC struct {
-	peer        *webrtc.PeerConnection
-	videoTrack  *webrtc.TrackLocalStaticSample
-	inputDC     *webrtc.DataChannel
-	onState     func(webrtc.PeerConnectionState)
-	onICE       func(*webrtc.ICECandidate)
-	onInputData func([]byte)
+	peer              *webrtc.PeerConnection
+	videoTrack        *webrtc.TrackLocalStaticSample
+	inputDC           *webrtc.DataChannel
+	onState           func(webrtc.PeerConnectionState)
+	onICE             func(*webrtc.ICECandidate)
+	onInputData       func([]byte)
+	onICEStateChange  func(webrtc.ICEConnectionState)
+	onSignalingChange func(webrtc.SignalingState)
+	closed            atomic.Bool
+	mu                sync.RWMutex // Protects concurrent access to peer, track, and inputDC
 }
 
 type WebRTCConfig struct {
@@ -71,15 +100,31 @@ type VPXEncoder interface {
 func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 	cfg.Configuration = applyICEFromEnv(cfg.Configuration)
 
+	// Setup MediaEngine with VP8/VP9 codecs for video
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, err
 	}
+
+	// Setup Interceptor Registry for SRTP encryption and RTCP feedback
+	// This automatically configures:
+	// - SRTP (Secure RTP) with AES-128/256 encryption for media
+	// - SRTCP (Secure RTCP) for control packets
+	// - NACK (Negative Acknowledgment) for packet loss recovery
+	// - TWCC (Transport-Wide Congestion Control) for adaptive bitrate
 	i := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
 		return nil, err
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+
+	// Create API with MediaEngine and Interceptors
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		// SettingEngine can be added here for advanced configuration if needed
+	)
+
+	// Create PeerConnection with ICE servers and security settings
 	pc, err := api.NewPeerConnection(cfg.Configuration)
 	if err != nil {
 		return nil, err
@@ -91,8 +136,13 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		mimeType = webrtc.MimeTypeVP9
 	}
 
+	// Create video track with optimized RTP codec capability
+	codecCap := webrtc.RTPCodecCapability{
+		MimeType: mimeType,
+		// ClockRate and SDPFmtpLine are auto-configured by Pion for VP8/VP9
+	}
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: mimeType},
+		codecCap,
 		"screen",
 		"rocket-desktop",
 	)
@@ -105,11 +155,27 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		return nil, err
 	}
 
-	inputDC, err := pc.CreateDataChannel("desktop-input", nil)
+	// Create DataChannel for control and fallback communication (2025 best practices)
+	// DataChannels use SCTP over DTLS for:
+	// - Mouse/keyboard input events (reliable, ordered delivery)
+	// - Control messages (clipboard, file transfer signaling)
+	// - Fallback for video if RTP fails (can send JPEG frames over DC)
+	// - Statistics and telemetry reporting
+	ordered := true
+	inputDC, err := pc.CreateDataChannel("desktop-input", &webrtc.DataChannelInit{
+		Ordered: &ordered, // Guarantee in-order delivery for input events (critical)
+		// MaxRetransmits/MaxPacketLifeTime not set = reliable mode (SCTP will retry)
+		// This ensures no input events are lost, even if network is unstable
+	})
 	if err != nil {
 		pc.Close()
 		return nil, err
 	}
+
+	// Note: Additional DataChannels can be created for specific purposes:
+	// - "desktop-fallback" (unordered, low-latency) for video fallback
+	// - "desktop-stats" (unreliable) for non-critical telemetry
+	// These would be created on-demand based on network conditions
 
 	w := &DesktopWebRTC{
 		peer:        pc,
@@ -119,6 +185,7 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		onICE:       cfg.OnICE,
 		onInputData: cfg.OnInputData,
 	}
+	// ICE Candidate handler - fires when new candidates are discovered
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
@@ -127,100 +194,360 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 			cfg.OnICE(c)
 		}
 	})
+
+	// Connection State handler - monitors overall peer connection health
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		if cfg.OnState != nil {
 			cfg.OnState(state)
 		}
+		// Mark as closed when connection is closed or failed
+		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+			w.closed.Store(true)
+		}
+	})
+
+	// ICE Connection State handler - provides more granular ICE-specific state
+	// Critical for detecting network changes and triggering ICE restart
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		if w.onICEStateChange != nil {
+			w.onICEStateChange(state)
+		}
+		// After 30s of no network activity, state becomes Failed
+		// This is the trigger point for ICE restart
+		if state == webrtc.ICEConnectionStateFailed && cfg.OnState != nil {
+			cfg.OnState(webrtc.PeerConnectionStateFailed)
+		}
+	})
+
+	// Signaling State handler - tracks negotiation progress
+	pc.OnSignalingStateChange(func(state webrtc.SignalingState) {
+		if w.onSignalingChange != nil {
+			w.onSignalingChange(state)
+		}
+	})
+
+	// ICE Gathering State handler - monitors candidate collection
+	pc.OnICEGatheringStateChange(func(state webrtc.ICEGatheringState) {
+		// Can be used to show "gathering" status to user
+		// States: new, gathering, complete
 	})
 	inputDC.OnMessage(func(msg webrtc.DataChannelMessage) {
 		if cfg.OnInputData != nil {
 			cfg.OnInputData(msg.Data)
 		}
 	})
+	// Add error/close handlers per WebRTC best practices
+	inputDC.OnError(func(err error) {
+		// Data channel error - connection may be failing
+		if cfg.OnState != nil {
+			cfg.OnState(webrtc.PeerConnectionStateFailed)
+		}
+	})
+	inputDC.OnClose(func() {
+		// Data channel closed - trigger cleanup
+		if cfg.OnState != nil {
+			cfg.OnState(webrtc.PeerConnectionStateClosed)
+		}
+	})
 	return w, nil
 }
 
 func (w *DesktopWebRTC) CreateOffer() (*webrtc.SessionDescription, error) {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return nil, errors.New("webrtc not initialized")
 	}
-	offer, err := w.peer.CreateOffer(nil)
+	if w.closed.Load() {
+		return nil, errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	peer := w.peer
+	w.mu.RUnlock()
+	if peer == nil {
+		return nil, errors.New("peer connection not initialized")
+	}
+	// Wait for ICE gathering complete per WebRTC best practices
+	gatherComplete := webrtc.GatheringCompletePromise(peer)
+	offer, err := peer.CreateOffer(nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := w.peer.SetLocalDescription(offer); err != nil {
+	if err := peer.SetLocalDescription(offer); err != nil {
 		return nil, err
 	}
-	return &offer, nil
+	// Wait for all ICE candidates to be gathered before returning
+	<-gatherComplete
+	return peer.LocalDescription(), nil
 }
 
 func (w *DesktopWebRTC) CreateAnswer() (*webrtc.SessionDescription, error) {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return nil, errors.New("webrtc not initialized")
 	}
-	answer, err := w.peer.CreateAnswer(nil)
+	if w.closed.Load() {
+		return nil, errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	peer := w.peer
+	w.mu.RUnlock()
+	if peer == nil {
+		return nil, errors.New("peer connection not initialized")
+	}
+	// Wait for ICE gathering complete per WebRTC best practices
+	gatherComplete := webrtc.GatheringCompletePromise(peer)
+	answer, err := peer.CreateAnswer(nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := w.peer.SetLocalDescription(answer); err != nil {
+	if err := peer.SetLocalDescription(answer); err != nil {
 		return nil, err
 	}
-	return &answer, nil
+	// Wait for all ICE candidates to be gathered before returning
+	<-gatherComplete
+	return peer.LocalDescription(), nil
 }
 
 func (w *DesktopWebRTC) SetRemoteDescription(desc webrtc.SessionDescription) error {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.peer == nil {
+		return errors.New("peer connection not initialized")
 	}
 	return w.peer.SetRemoteDescription(desc)
 }
 
 func (w *DesktopWebRTC) AddICECandidate(candidate webrtc.ICECandidateInit) error {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.peer == nil {
+		return errors.New("peer connection not initialized")
 	}
 	return w.peer.AddICECandidate(candidate)
 }
 
 // SendFrame mirrors the JPEG cadence: duration should reflect the capture interval.
+// SendFrame sends a video frame over RTP with automatic MTU-aware packetization.
+// Pion WebRTC automatically fragments frames into RTP packets (max ~1200 bytes per RFC).
+// Large frames are split into multiple RTP packets by the RTP packetizer.
+// For best performance, keep encoded frames under 256KB to minimize packetization overhead.
 func (w *DesktopWebRTC) SendFrame(frame []byte, d time.Duration) error {
-	if w == nil || w.videoTrack == nil {
+	if w == nil {
 		return errors.New("webrtc not initialized")
 	}
+	if w.closed.Load() {
+		return errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.videoTrack == nil {
+		return errors.New("video track not initialized")
+	}
+
+	// MTU Awareness (2025 best practice):
+	// - Pion WebRTC automatically packetizes frames into ~1200 byte RTP packets
+	// - Each RTP packet includes: IP header (20 bytes) + UDP header (8 bytes) + RTP header (12 bytes)
+	// - Payload per packet: ~1200 - 12 = ~1188 bytes
+	// - Large frames (e.g., 100KB) = ~84 RTP packets
+	// - This avoids IP fragmentation which is unreliable on many networks
+	//
+	// For best performance:
+	// - Keep frames under 256KB (already enforced by adaptive quality manager)
+	// - Use VP8/VP9 temporal scalability for better packet loss recovery
+	// - Monitor packet loss via RTCP feedback (handled by interceptors)
+
+	// Warn if frame is excessively large (may cause burst congestion)
+	if len(frame) > 512*1024 {
+		// Log warning but don't fail - let RTP packetizer handle it
+		// In production, this should trigger quality reduction
+		telemetry.LogStructured("WARN", "webrtc: large frame may cause congestion", map[string]interface{}{
+			"frame_size_kb":        len(frame) / 1024,
+			"rtp_packets_estimate": (len(frame) + 1187) / 1188,
+		})
+	}
+
 	return w.videoTrack.WriteSample(media.Sample{Data: frame, Duration: d})
 }
 
 func (w *DesktopWebRTC) SendInput(payload []byte) error {
-	if w == nil || w.inputDC == nil {
+	if w == nil {
 		return errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.inputDC == nil {
+		return errors.New("input data channel not initialized")
 	}
 	if w.inputDC.ReadyState() != webrtc.DataChannelStateOpen {
 		return errors.New("input channel not open")
+	}
+	// Check backpressure before sending (WebRTC best practice)
+	// Drop input if buffer > 256KB to prevent memory explosion
+	const maxBufferedAmount = 256 * 1024
+	if w.inputDC.BufferedAmount() > maxBufferedAmount {
+		return errors.New("data channel congested, dropping input")
 	}
 	return w.inputDC.Send(payload)
 }
 
 // AddTrack allows callers to attach additional media tracks (webcam/audio).
 func (w *DesktopWebRTC) AddTrack(track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return nil, errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return nil, errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.peer == nil {
+		return nil, errors.New("peer connection not initialized")
 	}
 	return w.peer.AddTrack(track)
 }
 
 func (w *DesktopWebRTC) Close() error {
-	if w == nil || w.peer == nil {
+	if w == nil {
 		return nil
 	}
-	return w.peer.Close()
+	// Use CAS to ensure Close() is called exactly once
+	if !w.closed.CompareAndSwap(false, true) {
+		return nil // Already closed
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.peer != nil {
+		return w.peer.Close()
+	}
+	return nil
+}
+
+// RestartICE triggers ICE restart to recover from network changes
+// Call this when ICEConnectionState becomes "failed"
+// Note: In Pion, you must create a new offer with ICERestart option manually
+func (w *DesktopWebRTC) RestartICE() (*webrtc.SessionDescription, error) {
+	if w == nil {
+		return nil, errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return nil, errors.New("webrtc already closed")
+	}
+	w.mu.RLock()
+	peer := w.peer
+	w.mu.RUnlock()
+	if peer == nil {
+		return nil, errors.New("peer connection not initialized")
+	}
+	// Create new offer with ICERestart option
+	gatherComplete := webrtc.GatheringCompletePromise(peer)
+	offer, err := peer.CreateOffer(&webrtc.OfferOptions{
+		ICERestart: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := peer.SetLocalDescription(offer); err != nil {
+		return nil, err
+	}
+	<-gatherComplete
+	return peer.LocalDescription(), nil
+}
+
+// ConnectionState returns the current peer connection state
+func (w *DesktopWebRTC) ConnectionState() webrtc.PeerConnectionState {
+	if w == nil || w.closed.Load() {
+		return webrtc.PeerConnectionStateClosed
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.peer == nil {
+		return webrtc.PeerConnectionStateClosed
+	}
+	return w.peer.ConnectionState()
+}
+
+// ICEConnectionState returns the current ICE connection state
+func (w *DesktopWebRTC) ICEConnectionState() webrtc.ICEConnectionState {
+	if w == nil || w.closed.Load() {
+		return webrtc.ICEConnectionStateClosed
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.peer == nil {
+		return webrtc.ICEConnectionStateClosed
+	}
+	return w.peer.ICEConnectionState()
 }
 
 // applyICEFromEnv injects ICE servers from env vars when none are present.
+// Also applies ICE transport policy and NAT-aware settings (2025 best practices).
 func applyICEFromEnv(cfg webrtc.Configuration) webrtc.Configuration {
 	if len(cfg.ICEServers) == 0 {
 		cfg.ICEServers = loadICEServersFromEnv()
 	}
+
+	// Apply ICE transport policy for symmetric NAT handling
+	transportPolicy := strings.ToLower(strings.TrimSpace(os.Getenv(envICETransport)))
+	switch transportPolicy {
+	case "relay":
+		// Force TURN relay (bypass STUN for symmetric NAT)
+		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	case "all", "":
+		// Try all candidates (STUN + TURN) - default
+		cfg.ICETransportPolicy = webrtc.ICETransportPolicyAll
+	}
+
+	// Detect NAT type and adjust strategy
+	natType := strings.ToLower(strings.TrimSpace(os.Getenv(envNATType)))
+	if natType == "symmetric" || isSymmetricNATLikely(cfg.ICEServers) {
+		// For symmetric NAT: prefer TURN and, if not forced by env, switch to relay-only
+		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		cfg.ICEServers = preferTURNServers(cfg.ICEServers)
+	}
+
+	// Enable bundle policy (multiplex all media on single transport)
+	// Reduces ICE candidates and improves connection time
+	if cfg.BundlePolicy == 0 {
+		cfg.BundlePolicy = webrtc.BundlePolicyMaxBundle
+	}
+
+	// Enable RTCP multiplexing (best practice for bandwidth efficiency)
+	if cfg.RTCPMuxPolicy == 0 {
+		cfg.RTCPMuxPolicy = webrtc.RTCPMuxPolicyRequire
+	}
+
 	return cfg
+}
+
+// isSymmetricNATLikely heuristically detects if TURN servers are heavily configured
+// which often indicates symmetric NAT environment (corporate networks)
+func isSymmetricNATLikely(servers []webrtc.ICEServer) bool {
+	turnCount := 0
+	stunCount := 0
+	for _, server := range servers {
+		for _, url := range server.URLs {
+			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
+				turnCount++
+			} else if strings.HasPrefix(url, "stun:") {
+				stunCount++
+			}
+		}
+	}
+	// If TURN servers outnumber STUN, assume symmetric NAT environment
+	return turnCount > stunCount
 }
 
 // loadICEServersFromEnv reads SPARK_WEBRTC_ICE (url|user|pass), then
@@ -261,6 +588,31 @@ func loadICEServersFromEnv() []webrtc.ICEServer {
 		servers = append(servers, server)
 	}
 	return servers
+}
+
+// preferTURNServers moves TURN/TURNS URLs ahead of STUN entries to improve relay preference.
+func preferTURNServers(servers []webrtc.ICEServer) []webrtc.ICEServer {
+	if len(servers) == 0 {
+		return servers
+	}
+
+	turn := make([]webrtc.ICEServer, 0, len(servers))
+	stun := make([]webrtc.ICEServer, 0, len(servers))
+	for _, s := range servers {
+		isTurn := false
+		for _, url := range s.URLs {
+			if strings.HasPrefix(url, "turn:") || strings.HasPrefix(url, "turns:") {
+				isTurn = true
+				break
+			}
+		}
+		if isTurn {
+			turn = append(turn, s)
+		} else {
+			stun = append(stun, s)
+		}
+	}
+	return append(turn, stun...)
 }
 
 // parseICEOverride accepts comma/semicolon/whitespace separated entries in the

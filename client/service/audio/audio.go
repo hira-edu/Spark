@@ -1,5 +1,5 @@
-//go:build !stub
-// +build !stub
+//go:build cgo
+// +build cgo
 
 package audio
 
