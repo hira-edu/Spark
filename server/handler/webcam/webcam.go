@@ -140,7 +140,8 @@ func webcamEventWrapper(webcam *webcam) common.EventCallback {
 			if data[5] != 04 {
 				return
 			}
-			data = data[8:]
+			// Binary protocol header is 24 bytes: magic(4) + service(1) + op(1) + event(16) + length(2)
+			data = data[24:]
 			data = utility.SimpleDecrypt(data, device)
 			if utils.JSON.Unmarshal(data, &pack) != nil {
 				return

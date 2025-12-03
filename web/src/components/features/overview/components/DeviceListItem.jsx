@@ -42,12 +42,12 @@ const DeviceListItem = ({ device, onAction }) => {
     { key: 'desktop', label: i18n.t('OVERVIEW.DESKTOP') },
     { key: 'explorer', label: i18n.t('OVERVIEW.EXPLORER') },
     { key: 'procmgr', label: i18n.t('OVERVIEW.PROC_MANAGER') },
+    { key: 'share', label: i18n.t('OVERVIEW.SHARE') },
   ];
 
   const moreActions = [
     { key: 'execute', label: i18n.t('OVERVIEW.EXECUTE') },
     { key: 'screenshot', label: i18n.t('OVERVIEW.SCREENSHOT') },
-    { key: 'share', label: i18n.t('COMMON.SHARE') || 'Share' },
     { type: 'divider' },
     { key: 'lock', label: i18n.t('OVERVIEW.LOCK') },
     { key: 'logoff', label: i18n.t('OVERVIEW.LOGOFF') },

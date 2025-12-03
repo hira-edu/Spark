@@ -1,7 +1,7 @@
 /* Canvas Wrapper */
 .desktop-canvas-wrapper {
-  position: relative;
-  flex: 1;
+  position: absolute;
+  inset: 0; /* Fill the entire parent container */
   display: flex;
   align-items: center;
   justify-content: center;

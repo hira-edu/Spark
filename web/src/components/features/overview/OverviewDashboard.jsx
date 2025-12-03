@@ -192,8 +192,8 @@ const OverviewDashboard = () => {
       {ComponentMap.Share && (
         <ComponentMap.Share
           open={!!share}
-          onClose={() => setShare(false)}
-          devices={devices}
+          onCancel={() => setShare(false)}
+          device={share}
         />
       )}
       {ComponentMap.Audio && (

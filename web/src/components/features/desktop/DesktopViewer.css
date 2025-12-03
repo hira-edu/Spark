@@ -58,6 +58,7 @@
 .desktop-viewer-content {
   position: relative;
   flex: 1;
+  min-height: 0; /* Critical: allows flex child to shrink below content size */
   display: flex;
   align-items: center;
   justify-content: center;

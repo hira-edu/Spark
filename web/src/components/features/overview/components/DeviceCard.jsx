@@ -43,6 +43,7 @@ const DeviceCard = ({ device, onAction }) => {
     { key: 'desktop', label: i18n.t('OVERVIEW.DESKTOP'), primary: true },
     { key: 'explorer', label: i18n.t('OVERVIEW.EXPLORER'), primary: true },
     { key: 'procmgr', label: i18n.t('OVERVIEW.PROC_MANAGER'), primary: true },
+    { key: 'share', label: i18n.t('OVERVIEW.SHARE'), primary: true },
   ];
 
   const moreActions = [
@@ -50,7 +51,6 @@ const DeviceCard = ({ device, onAction }) => {
     { key: 'screenshot', label: i18n.t('OVERVIEW.SCREENSHOT') },
     { key: 'audio', label: i18n.t('OVERVIEW.AUDIO') },
     { key: 'webcam', label: i18n.t('OVERVIEW.WEBCAM') },
-    { key: 'share', label: i18n.t('COMMON.SHARE') || 'Share' },
     { type: 'divider' },
     { key: 'lock', label: i18n.t('OVERVIEW.LOCK') },
     { key: 'logoff', label: i18n.t('OVERVIEW.LOGOFF') },
