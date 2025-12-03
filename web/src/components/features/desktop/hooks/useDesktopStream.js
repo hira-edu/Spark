@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { message } from 'antd';
-import { genRandHex, getBaseURL, hex2ua, ua2hex, translate } from '../../../../utils/utils';
+import { genRandHex, getBaseURL, hex2ua, ua2hex, ua2str, translate } from '../../../../utils/utils';
 import i18n from '../../../../locale/locale';
 
 const MAGIC_PREFIX = [34, 22, 19, 17];
@@ -29,6 +29,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const [resolution, setResolution] = useState({ width: 0, height: 0 });
   const [monitors, setMonitors] = useState([]);
   const [cursor, setCursor] = useState({ x: 0, y: 0, hotX: 0, hotY: 0, width: 0, height: 0, visible: false, data: null, hash: 0, format: 'argb32' });
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   const log = useCallback((level, msg, extra = {}) => {
     const payload = { ...extra, device: device?.id || 'unknown' };
@@ -47,12 +48,22 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const tickerRef = useRef(null);
   const pingTimeRef = useRef(0);
   const controlChannelRef = useRef(controlChannel);
+  const reconnectTimeoutRef = useRef(null);
+  const reconnectAttemptRef = useRef(0);
+  const shouldReconnectRef = useRef(true);
+  const connectionStartTimeRef = useRef(0);
+  const MAX_RECONNECT_ATTEMPTS = 5;
+  const BASE_RECONNECT_DELAY = 1000; // 1 second
 
   // Cleanup resources (defined early to avoid TDZ)
-  const cleanup = useCallback(() => {
+  const cleanup = useCallback((clearReconnect = false) => {
     if (tickerRef.current) {
       clearInterval(tickerRef.current);
       tickerRef.current = null;
+    }
+    if (clearReconnect && reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
     const ws = wsRef.current;
     if (ws) {
@@ -384,10 +395,35 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     await sendData(payload);
   }, [sendData]);
 
-  // Connect to the device
-  const connect = useCallback(() => {
+  // Schedule a reconnection attempt
+  const scheduleReconnect = useCallback(() => {
+    if (!shouldReconnectRef.current) return;
+    if (reconnectAttemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      log('error', 'Max reconnect attempts reached', { attempts: MAX_RECONNECT_ATTEMPTS });
+      setStatus('error');
+      message.error(i18n.t('DESKTOP.CONNECTION_LOST'));
+      return;
+    }
+
+    const delay = BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttemptRef.current);
+    reconnectAttemptRef.current += 1;
+    setReconnectAttempt(reconnectAttemptRef.current);
+    log('info', 'Scheduling reconnect', { attempt: reconnectAttemptRef.current, delay });
+
+    setStatus('reconnecting');
+    reconnectTimeoutRef.current = setTimeout(() => {
+      log('info', 'Attempting reconnect', { attempt: reconnectAttemptRef.current });
+      connectInternal();
+    }, delay);
+  }, []);
+
+  // Internal connect function (used for initial connect and reconnects)
+  const connectInternal = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !device?.id) return;
+
+    // Clear any existing connection
+    cleanup(false);
 
     statsRef.current = { frames: 0, bytes: 0 };
     setFps(0);
@@ -396,14 +432,13 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     setMonitors([]);
     setResolution({ width: 0, height: 0 });
 
-    // No secret needed - encryption removed
-
     // Initialize canvas
     initCanvas();
 
     setStatus('connecting');
+    connectionStartTimeRef.current = Date.now();
 
-    // Build WebSocket URL (no secret needed)
+    // Build WebSocket URL
     const path = shareToken
       ? `api/share/desktop?token=${encodeURIComponent(shareToken)}`
       : `api/device/desktop?device=${device.id}`;
@@ -413,6 +448,9 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      // Reset reconnect counter on successful connection
+      reconnectAttemptRef.current = 0;
+      setReconnectAttempt(0);
       setStatus('connected');
       log('info', 'WS connected');
       // Request initial frame
@@ -423,17 +461,47 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       parseMessage(e.data);
     };
 
-    ws.onclose = () => {
-      setStatus('disconnected');
-      log('warn', 'WS closed');
-      cleanup();
+    ws.onclose = (event) => {
+      const connectionDuration = Date.now() - connectionStartTimeRef.current;
+      log('warn', 'WS closed', {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+        duration: connectionDuration
+      });
+
+      cleanup(false);
+
+      // Detect auth errors:
+      // - Code 1006 with very short connection = likely auth failure or server rejection
+      // - Code 4001 = explicit auth error (if server sends this)
+      const isAuthError = event.code === 4001 ||
+        (event.code === 1006 && connectionDuration < 1000);
+
+      if (isAuthError) {
+        log('error', 'Auth error detected, redirecting to login');
+        setStatus('error');
+        message.error(i18n.t('AUTH.SESSION_EXPIRED') || 'Session expired, please login again');
+        // Redirect to login after short delay
+        setTimeout(() => {
+          if (window.location.pathname !== '/login') {
+            window.location.href = '/login';
+          }
+        }, 1500);
+        return;
+      }
+
+      // For normal disconnections, attempt reconnect
+      if (shouldReconnectRef.current && !event.wasClean) {
+        scheduleReconnect();
+      } else {
+        setStatus('disconnected');
+      }
     };
 
     ws.onerror = (e) => {
       log('error', 'WS error', { error: e?.message });
-      setStatus('error');
-      cleanup();
-      message.warning(i18n.t('COMMON.CONNECTION_FAILED'));
+      // onerror is usually followed by onclose, so we don't set status here
     };
 
     // Start stats ticker
@@ -448,12 +516,23 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         sendControl({ act: 'DESKTOP_PING' });
       }
     }, 1000);
-  }, [device, shareToken, canvasRef, initCanvas, parseMessage, sendControl]);
+  }, [device, shareToken, canvasRef, initCanvas, parseMessage, sendControl, cleanup, scheduleReconnect]);
+
+  // Public connect function
+  const connect = useCallback(() => {
+    shouldReconnectRef.current = true;
+    reconnectAttemptRef.current = 0;
+    setReconnectAttempt(0);
+    connectInternal();
+  }, [connectInternal]);
 
   // Disconnect from the device
   const disconnect = useCallback(() => {
-    cleanup();
+    shouldReconnectRef.current = false;
+    cleanup(true); // clear reconnect timeout
     setStatus('disconnected');
+    setReconnectAttempt(0);
+    reconnectAttemptRef.current = 0;
   }, [cleanup]);
 
   // Send configuration updates
@@ -507,7 +586,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      cleanup();
+      shouldReconnectRef.current = false;
+      cleanup(true);
     };
   }, [cleanup]);
 
@@ -519,6 +599,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     resolution,
     monitors,
     cursor,
+    reconnectAttempt,
     connect,
     disconnect,
     sendConfig,

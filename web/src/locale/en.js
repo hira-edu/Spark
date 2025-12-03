@@ -246,6 +246,9 @@ export default {
 	"DESKTOP.INPUT_DISABLED": "Input disabled",
 	"DESKTOP.KEYBOARD_DISABLED": "Keyboard disabled",
 	"DESKTOP.MOUSE_DISABLED": "Mouse disabled",
+	"DESKTOP.CONNECTION_LOST": "Connection lost. Please try reconnecting.",
+	"DESKTOP.RECONNECTING": "Reconnecting...",
+	"DESKTOP.RECONNECT_ATTEMPT": "Reconnect attempt {0} of {1}",
 
 	"EXECUTE.TITLE": "Run",
 	"EXECUTE.EXECUTION_SUCCESS": "Execution success",

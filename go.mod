@@ -7,7 +7,6 @@ toolchain go1.24.10
 require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/blackjack/webcam v0.6.1
-	github.com/chai2010/webp v1.1.1
 	github.com/creack/pty v1.1.18
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/gin-gonic/gin v1.10.0

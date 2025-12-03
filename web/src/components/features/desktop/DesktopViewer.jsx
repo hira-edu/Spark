@@ -18,7 +18,7 @@ const DesktopViewer = ({
   onClose,
 }) => {
   // State
-  const [quality, setQuality] = useState(40);
+  const [quality, setQuality] = useState(30); // Lower default for better FPS
   const [targetFps, setTargetFps] = useState(30);
   const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
@@ -26,6 +26,7 @@ const DesktopViewer = ({
 
   // Refs
   const containerRef = useRef(null);
+  const contentRef = useRef(null);
   const canvasRef = useRef(null);
 
   // Desktop stream hook
@@ -182,10 +183,14 @@ const DesktopViewer = ({
 
   const isConnected = status === 'connected';
   const canvasRect = canvasRef.current?.getBoundingClientRect();
-  const scaleX = canvasRect && resolution.width ? canvasRect.width / resolution.width : 1;
-  const scaleY = canvasRect && resolution.height ? canvasRect.height / resolution.height : 1;
-  const cursorScaleBase = Number.isFinite(scaleX) && scaleX > 0 ? scaleX : 1;
-  const cursorScale = Number.isFinite(scaleY) && scaleY > 0 ? Math.min(cursorScaleBase, scaleY) : cursorScaleBase;
+  const contentRect = contentRef.current?.getBoundingClientRect();
+  // Calculate scale factors safely - avoid division by zero
+  const scaleX = canvasRect && resolution.width > 0 ? canvasRect.width / resolution.width : 1;
+  const scaleY = canvasRect && resolution.height > 0 ? canvasRect.height / resolution.height : 1;
+  // Use the minimum scale to preserve aspect ratio; validate both values
+  const validScaleX = Number.isFinite(scaleX) && scaleX > 0 ? scaleX : 1;
+  const validScaleY = Number.isFinite(scaleY) && scaleY > 0 ? scaleY : 1;
+  const cursorScale = Math.min(validScaleX, validScaleY);
 
   return (
     <div
@@ -204,7 +209,7 @@ const DesktopViewer = ({
       />
 
       {/* Canvas Container */}
-      <div className="desktop-viewer-content">
+      <div className="desktop-viewer-content" ref={contentRef}>
         <DesktopCanvas
           ref={canvasRef}
           pointerLocked={pointerLocked}
@@ -223,6 +228,7 @@ const DesktopViewer = ({
           <CursorOverlay
             cursor={cursor}
             canvasRect={canvasRect}
+            containerRect={contentRect}
             scale={cursorScale}
           />
         )}

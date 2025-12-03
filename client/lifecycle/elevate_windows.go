@@ -24,9 +24,10 @@ var (
 )
 
 const (
-	tokenQuery     = 0x0008
-	tokenElevation = 20
-	swHide         = 0
+	tokenQuery      = 0x0008
+	tokenElevation  = 20
+	swHide          = 0
+	swShowNormal    = 1  // SW_SHOWNORMAL - needed for UAC prompt to appear
 )
 
 // EnsureElevated relaunches the process with UAC if not running with
@@ -68,7 +69,7 @@ func EnsureElevated() {
 		uintptr(unsafe.Pointer(exePtr)),
 		uintptr(unsafe.Pointer(argsPtr)),
 		0,
-		swHide,
+		swShowNormal, // Use SW_SHOWNORMAL to ensure UAC prompt appears
 	)
 	if ret > 32 {
 		os.Exit(0)

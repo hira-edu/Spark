@@ -110,7 +110,9 @@ func (s *ScreenDXGI) Init(displayIndex uint, rect image.Rectangle) error {
 }
 func (s *ScreenDXGI) Capture() (*image.RGBA, error) {
 	img := image.NewRGBA(image.Rect(0, 0, s.rect.Dx(), s.rect.Dy()))
-	err := s.ddup.GetImage(img, 100)
+	// Reduced timeout from 100ms to 16ms for faster idle detection
+	// This allows the ticker to maintain proper cadence without blocking
+	err := s.ddup.GetImage(img, 16)
 	if err == outputduplication.ErrNoImageYet {
 		return nil, errNoImage
 	}

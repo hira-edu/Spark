@@ -420,7 +420,7 @@ func sendDesktopPacket(pack modules.Packet, rawEvent []byte) {
 			return
 		}
 
-		data = utils.XOR(data, common.WSConn.GetSecret())
+		// Send plaintext JSON (encryption removed to align with SendPack changes)
 		if err := common.WSConn.SendRawData(rawEvent, data, 20, opJSON); err != nil {
 			telemetry.LogStructured("ERROR", "desktop: failed to send control packet", map[string]interface{}{
 				"act":   pack.Act,

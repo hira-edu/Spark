@@ -349,15 +349,13 @@ The desktop remote control feature allows real-time screen viewing and input con
 
 ### Desktop WebSocket: `/device/desktop`
 
-**Query Parameters**: `device` (device ID) and `secret` (32-character hex string)
+**Query Parameters**: `device` (device ID)
 
 This is a WebSocket endpoint for real-time desktop streaming. The connection uses a binary protocol for efficiency.
 
 #### Connection Example
 ```javascript
-const secret = crypto.getRandomValues(new Uint8Array(16));
-const secretHex = Array.from(secret).map(b => b.toString(16).padStart(2, '0')).join('');
-const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}&secret=${secretHex}`);
+const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}`);
 ws.binaryType = 'arraybuffer';
 ```
 
@@ -371,17 +369,16 @@ All messages use a binary format with a 5-byte magic header: `[34, 22, 19, 17, 2
 | 0x00 | Server→Client | First part of a frame |
 | 0x01 | Server→Client | Rest parts of a frame |
 | 0x02 | Server→Client | Resolution information |
-| 0x03 | Both | JSON data (encrypted) |
+| 0x03 | Both | JSON data |
 
 **Sending Messages:**
 ```javascript
 function sendData(data) {
-    const json = JSON.stringify(data);
-    const encrypted = encrypt(json, secret); // XOR encryption
-    const buffer = new Uint8Array(encrypted.length + 8);
+    const body = new TextEncoder().encode(JSON.stringify(data));
+    const buffer = new Uint8Array(body.length + 8);
     buffer.set([34, 22, 19, 17, 20, 3], 0);
-    buffer.set([encrypted.length >> 8, encrypted.length & 0xFF], 6);
-    buffer.set(encrypted, 8);
+    buffer.set([body.length >> 8, body.length & 0xFF], 6);
+    buffer.set(body, 8);
     ws.send(buffer);
 }
 ```

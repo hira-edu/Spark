@@ -3,12 +3,13 @@ package auth
 import (
 	"Rocket/modules"
 	"Rocket/server/common"
+	"Rocket/server/config"
 	"Rocket/server/storage"
 	"Rocket/utils"
 	"context"
 	"fmt"
-	"Rocket/server/config"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,8 +17,10 @@ import (
 )
 
 var (
-	userRepo *storage.UserRepository
-	sessions = make(map[string]*Session) // token -> Session
+	userRepo        *storage.UserRepository
+	authSessionRepo *storage.AuthSessionRepository
+	sessions        = make(map[string]*Session) // token -> Session (in-memory cache)
+	sessionsMu      sync.RWMutex                // protects sessions map
 )
 
 // Session represents an authenticated session
@@ -37,6 +40,33 @@ func init() {
 // Init initializes the auth module (must be called after MongoDB is initialized)
 func Init() {
 	userRepo = storage.NewUserRepository()
+	authSessionRepo = storage.NewAuthSessionRepository()
+
+	// Load existing sessions from MongoDB on startup
+	if authSessionRepo != nil {
+		ctx, cancel := storage.WithTimeout(context.Background())
+		defer cancel()
+
+		loadedSessions, err := authSessionRepo.LoadAllValidSessions(ctx)
+		if err != nil {
+			golog.Warnf("Failed to load auth sessions from MongoDB: %v", err)
+		} else {
+			sessionsMu.Lock()
+			for _, dbSession := range loadedSessions {
+				sessions[dbSession.Token] = &Session{
+					Token:     dbSession.Token,
+					Username:  dbSession.Username,
+					Role:      dbSession.Role,
+					CreatedAt: dbSession.CreatedAt,
+					ExpiresAt: dbSession.ExpiresAt,
+					LastSeen:  dbSession.LastSeen,
+				}
+			}
+			sessionsMu.Unlock()
+			golog.Infof("Loaded %d auth sessions from MongoDB", len(loadedSessions))
+		}
+	}
+
 	golog.Info("Auth module initialized with MongoDB user repository")
 }
 
@@ -46,6 +76,8 @@ func cleanupSessions() {
 	for range ticker.C {
 		now := time.Now()
 		expired := []string{}
+
+		sessionsMu.Lock()
 		for token, session := range sessions {
 			if now.After(session.ExpiresAt) {
 				expired = append(expired, token)
@@ -54,8 +86,22 @@ func cleanupSessions() {
 		for _, token := range expired {
 			delete(sessions, token)
 		}
+		sessionsMu.Unlock()
+
+		// Also cleanup expired sessions from MongoDB (TTL index handles this too, but belt and suspenders)
+		if authSessionRepo != nil && len(expired) > 0 {
+			ctx, cancel := storage.WithTimeout(context.Background())
+			deletedCount, err := authSessionRepo.DeleteExpiredSessions(ctx)
+			cancel()
+			if err != nil {
+				golog.Warnf("Failed to cleanup MongoDB auth sessions: %v", err)
+			} else if deletedCount > 0 {
+				golog.Infof("Cleaned up %d expired auth sessions from MongoDB", deletedCount)
+			}
+		}
+
 		if len(expired) > 0 {
-			golog.Infof("Cleaned up %d expired sessions", len(expired))
+			golog.Infof("Cleaned up %d expired sessions from memory", len(expired))
 		}
 	}
 }
@@ -108,15 +154,42 @@ func Login(ctx *gin.Context) {
 
 	// Create session
 	token := utils.GetStrUUID()
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour)
 	session := &Session{
 		Token:     token,
 		Username:  user.Username,
 		Role:      user.Role,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(24 * time.Hour), // 24 hour session
-		LastSeen:  time.Now(),
+		CreatedAt: now,
+		ExpiresAt: expiresAt, // 24 hour session
+		LastSeen:  now,
 	}
+
+	// Store in memory cache
+	sessionsMu.Lock()
 	sessions[token] = session
+	sessionsMu.Unlock()
+
+	// Persist to MongoDB (non-blocking, best effort)
+	if authSessionRepo != nil {
+		go func() {
+			persistCtx, cancel := storage.WithTimeout(context.Background())
+			defer cancel()
+			dbSession := &storage.AuthSession{
+				Token:     token,
+				Username:  user.Username,
+				Role:      user.Role,
+				CreatedAt: now.UTC(),
+				ExpiresAt: expiresAt.UTC(),
+				LastSeen:  now.UTC(),
+				IP:        ctx.ClientIP(),
+				UserAgent: ctx.Request.UserAgent(),
+			}
+			if err := authSessionRepo.CreateSession(persistCtx, dbSession); err != nil {
+				golog.Warnf("Failed to persist auth session to MongoDB: %v", err)
+			}
+		}()
+	}
 
 	// Set cookie
 	ctx.SetCookie(
@@ -155,12 +228,25 @@ func Login(ctx *gin.Context) {
 func Logout(ctx *gin.Context) {
 	token, err := ctx.Cookie("Authorization")
 	if err == nil && token != "" {
+		sessionsMu.Lock()
 		if session, ok := sessions[token]; ok {
 			common.Info(ctx, "LOGOUT", "", "", map[string]any{
 				"user": session.Username,
 				"ip":   ctx.ClientIP(),
 			})
 			delete(sessions, token)
+		}
+		sessionsMu.Unlock()
+
+		// Delete from MongoDB (non-blocking)
+		if authSessionRepo != nil {
+			go func(t string) {
+				delCtx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				if err := authSessionRepo.DeleteSession(delCtx, t); err != nil {
+					golog.Warnf("Failed to delete auth session from MongoDB: %v", err)
+				}
+			}(token)
 		}
 	}
 
@@ -174,11 +260,11 @@ func Logout(ctx *gin.Context) {
 // CheckAuth is a middleware that verifies user authentication
 func CheckAuth() gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-	// Skip auth for public endpoints
-	if isPublicEndpoint(ctx.Request.URL.Path) {
-		ctx.Next()
-		return
-	}
+		// Skip auth for public endpoints
+		if isPublicEndpoint(ctx.Request.URL.Path) {
+			ctx.Next()
+			return
+		}
 
 		token, err := ctx.Cookie("Authorization")
 		if err != nil || token == "" {
@@ -187,7 +273,35 @@ func CheckAuth() gin.HandlerFunc {
 			return
 		}
 
+		// Try to find session in memory cache
+		sessionsMu.RLock()
 		session, ok := sessions[token]
+		sessionsMu.RUnlock()
+
+		// If not in memory, try to load from MongoDB
+		if !ok && authSessionRepo != nil {
+			loadCtx, cancel := storage.WithTimeout(context.Background())
+			dbSession, loadErr := authSessionRepo.GetSession(loadCtx, token)
+			cancel()
+
+			if loadErr == nil && dbSession != nil && time.Now().Before(dbSession.ExpiresAt) {
+				// Found valid session in MongoDB, add to memory cache
+				session = &Session{
+					Token:     dbSession.Token,
+					Username:  dbSession.Username,
+					Role:      dbSession.Role,
+					CreatedAt: dbSession.CreatedAt,
+					ExpiresAt: dbSession.ExpiresAt,
+					LastSeen:  dbSession.LastSeen,
+				}
+				sessionsMu.Lock()
+				sessions[token] = session
+				sessionsMu.Unlock()
+				ok = true
+				golog.Infof("Restored auth session from MongoDB for user: %s", dbSession.Username)
+			}
+		}
+
 		if !ok {
 			ctx.JSON(401, modules.Packet{Code: 1, Msg: "${i18n|AUTH.SESSION_EXPIRED}"})
 			ctx.Abort()
@@ -196,14 +310,33 @@ func CheckAuth() gin.HandlerFunc {
 
 		// Check if session expired
 		if time.Now().After(session.ExpiresAt) {
+			sessionsMu.Lock()
 			delete(sessions, token)
+			sessionsMu.Unlock()
+
+			// Also delete from MongoDB
+			if authSessionRepo != nil {
+				go func(t string) {
+					delCtx, cancel := storage.WithTimeout(context.Background())
+					defer cancel()
+					authSessionRepo.DeleteSession(delCtx, t)
+				}(token)
+			}
+
 			ctx.JSON(401, modules.Packet{Code: 1, Msg: "${i18n|AUTH.SESSION_EXPIRED}"})
 			ctx.Abort()
 			return
 		}
 
-		// Update last seen
+		// Update last seen (in memory immediately, MongoDB async)
 		session.LastSeen = time.Now()
+		if authSessionRepo != nil {
+			go func(t string) {
+				updateCtx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				authSessionRepo.UpdateLastSeen(updateCtx, t)
+			}(token)
+		}
 
 		// Set user context
 		ctx.Set("user", session.Username)

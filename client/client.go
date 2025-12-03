@@ -32,12 +32,14 @@ func init() {
 	rawBuffer, err := config.RawConfig()
 	if err != nil || len(rawBuffer) < 2 {
 		golog.Errorf("config trailer load failed: %v", err)
+		debugMsgBox("Rocket Client Error", "Config trailer load failed: "+err.Error()+"\n\nThis binary must be downloaded from the web UI.")
 		os.Exit(1)
 		return
 	}
 	dataLen := int(binary.BigEndian.Uint16(rawBuffer[:2]))
 	if dataLen <= 0 || dataLen > len(rawBuffer)-2 {
 		golog.Errorf("config trailer length invalid: %d", dataLen)
+		debugMsgBox("Rocket Client Error", "Config trailer length invalid. Please re-download from web UI.")
 		os.Exit(1)
 		return
 	}
@@ -45,12 +47,14 @@ func init() {
 	cfgBytes, err = decrypt(cfgBytes[16:], cfgBytes[:16])
 	if err != nil {
 		golog.Errorf("config decrypt failed: %v", err)
+		debugMsgBox("Rocket Client Error", "Config decrypt failed: "+err.Error())
 		os.Exit(1)
 		return
 	}
 	err = utils.JSON.Unmarshal(cfgBytes, &config.Config)
 	if err != nil {
 		golog.Errorf("config unmarshal failed: %v", err)
+		debugMsgBox("Rocket Client Error", "Config unmarshal failed: "+err.Error())
 		os.Exit(1)
 		return
 	}

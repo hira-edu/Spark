@@ -101,7 +101,7 @@ var codecStats struct {
 // Initialize active codec
 func init() {
 	// Start with JPEG codec (safe default) and attach adaptive quality manager if available.
-	jpeg := NewJPEGCodec(40)
+	jpeg := NewJPEGCodec(imageQuality) // Use imageQuality constant for consistency
 	if adaptiveQualityManager != nil {
 		jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
 	}

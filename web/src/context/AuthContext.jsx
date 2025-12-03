@@ -104,6 +104,22 @@ export const AuthProvider = ({ children }) => {
         }
     };
 
+    // Check if session is still valid (for reconnection scenarios)
+    const validateSession = async () => {
+        try {
+            const res = await axios.get('/api/auth/user');
+            if (res.data.code === 0) {
+                setUser(res.data.data.user);
+                return true;
+            }
+            setUser(null);
+            return false;
+        } catch (error) {
+            setUser(null);
+            return false;
+        }
+    };
+
     const value = {
         user,
         loading,
@@ -113,7 +129,8 @@ export const AuthProvider = ({ children }) => {
         logout,
         initialSetup,
         changePassword,
-        refreshAuth: checkAuth
+        refreshAuth: checkAuth,
+        validateSession,
     };
 
     return (

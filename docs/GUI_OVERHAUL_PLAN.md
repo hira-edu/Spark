@@ -770,7 +770,7 @@ export const DesktopViewer: React.FC<DesktopViewerProps> = ({ device, onClose })
 ```tsx
 // components/features/desktop/hooks/useDesktopStream.ts
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { encrypt, decrypt, genRandHex, hex2ua, ua2hex } from '@/utils/crypto';
+import { getBaseURL } from '@/utils/api';
 
 interface StreamState {
   status: 'disconnected' | 'connecting' | 'connected' | 'error';
@@ -795,7 +795,6 @@ export const useDesktopStream = (
   });
 
   const wsRef = useRef<WebSocket | null>(null);
-  const secretRef = useRef<Uint8Array>(hex2ua(genRandHex(32)));
   const statsRef = useRef({ frames: 0, bytes: 0 });
 
   const connect = useCallback(() => {
@@ -803,8 +802,7 @@ export const useDesktopStream = (
 
     setState(s => ({ ...s, status: 'connecting' }));
 
-    const secret = ua2hex(secretRef.current);
-    const url = `${getBaseURL(true)}api/device/desktop?device=${device.id}&secret=${secret}`;
+    const url = `${getBaseURL(true)}api/device/desktop?device=${device.id}`;
 
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
@@ -859,7 +857,7 @@ export const useDesktopStream = (
   const sendData = useCallback((data: any) => {
     if (wsRef.current?.readyState !== WebSocket.OPEN) return;
 
-    const body = encrypt(JSON.stringify(data), secretRef.current);
+    const body = new TextEncoder().encode(JSON.stringify(data));
     const buffer = new Uint8Array(body.length + 8);
     buffer.set([34, 22, 19, 17, 20, 3], 0);
     buffer.set([body.length >> 8, body.length & 0xff], 6);

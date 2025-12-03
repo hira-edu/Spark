@@ -1,15 +1,24 @@
 import React, { useEffect, useRef } from 'react';
 
+// Maximum cursor size to prevent memory issues with malformed data
+const MAX_CURSOR_SIZE = 256;
+
 /**
  * CursorOverlay - Renders the remote cursor as an overlay on the canvas
  * Displays the actual remote cursor appearance (arrow, hand, I-beam, etc.)
  */
-const CursorOverlay = ({ cursor, canvasRect, scale = 1 }) => {
+const CursorOverlay = ({ cursor, canvasRect, containerRect, scale = 1 }) => {
   const canvasRef = useRef(null);
 
   // Convert base64 RGBA data to canvas image
   useEffect(() => {
-    if (!cursor.visible || !cursor.data || cursor.width === 0 || cursor.height === 0) {
+    // Validate cursor dimensions
+    if (!cursor.visible || !cursor.data || cursor.width <= 0 || cursor.height <= 0) {
+      return;
+    }
+    // Reject oversized cursors to prevent memory exhaustion
+    if (cursor.width > MAX_CURSOR_SIZE || cursor.height > MAX_CURSOR_SIZE) {
+      console.warn('Cursor too large, ignoring:', cursor.width, 'x', cursor.height);
       return;
     }
 
@@ -37,21 +46,27 @@ const CursorOverlay = ({ cursor, canvasRect, scale = 1 }) => {
     }
   }, [cursor.data, cursor.width, cursor.height, cursor.hash, cursor.visible]);
 
-  // Don't render if cursor is not visible or no geometry
-  if (!cursor.visible || !cursor.data || !canvasRect) {
+  // Don't render if cursor is not visible, no geometry, or invalid dimensions
+  if (!cursor.visible || !cursor.data || !canvasRect ||
+      cursor.width <= 0 || cursor.height <= 0 ||
+      cursor.width > MAX_CURSOR_SIZE || cursor.height > MAX_CURSOR_SIZE) {
     return null;
   }
 
   // Calculate cursor position relative to canvas
   const renderScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
-  const x = (cursor.x - cursor.hotX) * renderScale + canvasRect.left;
-  const y = (cursor.y - cursor.hotY) * renderScale + canvasRect.top;
+  const containerLeft = containerRect ? containerRect.left : 0;
+  const containerTop = containerRect ? containerRect.top : 0;
+  const canvasOffsetX = canvasRect.left - containerLeft;
+  const canvasOffsetY = canvasRect.top - containerTop;
+  const x = (cursor.x - cursor.hotX) * renderScale + canvasOffsetX;
+  const y = (cursor.y - cursor.hotY) * renderScale + canvasOffsetY;
 
   return (
     <canvas
       ref={canvasRef}
       style={{
-        position: 'fixed',
+        position: 'absolute',
         left: `${x}px`,
         top: `${y}px`,
         width: `${cursor.width * renderScale}px`,

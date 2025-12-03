@@ -355,15 +355,13 @@ Hello World.
 
 ### 桌面 WebSocket：`/device/desktop`
 
-**GET参数**：`device`（设备ID）和 `secret`（32位十六进制字符串）
+**GET参数**：仅 `device`（设备ID）
 
 这是一个 WebSocket 端点，用于实时桌面流传输。连接使用二进制协议以提高效率。
 
 #### 连接示例
 ```javascript
-const secret = crypto.getRandomValues(new Uint8Array(16));
-const secretHex = Array.from(secret).map(b => b.toString(16).padStart(2, '0')).join('');
-const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}&secret=${secretHex}`);
+const ws = new WebSocket(`wss://your-server/api/device/desktop?device=${deviceId}`);
 ws.binaryType = 'arraybuffer';
 ```
 
@@ -377,17 +375,16 @@ ws.binaryType = 'arraybuffer';
 | 0x00 | 服务端→客户端 | 帧的第一部分 |
 | 0x01 | 服务端→客户端 | 帧的剩余部分 |
 | 0x02 | 服务端→客户端 | 分辨率信息 |
-| 0x03 | 双向 | JSON数据（加密） |
+| 0x03 | 双向 | JSON数据 |
 
 **发送消息：**
 ```javascript
 function sendData(data) {
-    const json = JSON.stringify(data);
-    const encrypted = encrypt(json, secret); // XOR加密
-    const buffer = new Uint8Array(encrypted.length + 8);
+    const body = new TextEncoder().encode(JSON.stringify(data));
+    const buffer = new Uint8Array(body.length + 8);
     buffer.set([34, 22, 19, 17, 20, 3], 0);
-    buffer.set([encrypted.length >> 8, encrypted.length & 0xFF], 6);
-    buffer.set(encrypted, 8);
+    buffer.set([body.length >> 8, body.length & 0xFF], 6);
+    buffer.set(body, 8);
     ws.send(buffer);
 }
 ```

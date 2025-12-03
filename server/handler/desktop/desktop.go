@@ -28,6 +28,7 @@ type desktop struct {
 	device     string
 	srcConn    *melody.Session
 	deviceConn *melody.Session
+	frameCount uint64 // diagnostic counter for frame relay monitoring
 }
 
 var desktopSessions = melody.New()
@@ -146,12 +147,26 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 		}
 
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
-			common.Info(nil, `[SERVER_DESKTOP_RAW_DATA]`, ``, `Device sent raw desktop data`, map[string]any{
-				`desktop_uuid`: desktop.uuid[:8] + `...`,
-			})
 			data := *pack.Data[`data`].(*[]byte)
 			if data[5] == 00 || data[5] == 01 || data[5] == 02 {
-				desktop.srcConn.WriteBinary(data)
+				// Frame data - track and forward to browser
+				desktop.frameCount++
+				if err := desktop.srcConn.WriteBinary(data); err != nil {
+					common.Warn(nil, `[FRAME_RELAY_ERROR]`, ``, `Failed to write frame to browser`, map[string]any{
+						`desktop_uuid`: desktop.uuid[:8] + `...`,
+						`error`:        err.Error(),
+						`frame_count`:  desktop.frameCount,
+						`data_size`:    len(data),
+					})
+				}
+				// Log every 100th frame for monitoring
+				if desktop.frameCount%100 == 0 {
+					common.Info(nil, `[FRAME_RELAY_STATS]`, ``, `Frame relay statistics`, map[string]any{
+						`desktop_uuid`: desktop.uuid[:8] + `...`,
+						`frame_count`:  desktop.frameCount,
+						`data_size`:    len(data),
+					})
+				}
 				return
 			}
 

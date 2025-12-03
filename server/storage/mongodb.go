@@ -221,6 +221,11 @@ func createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create client_logs indexes: %w", err)
 	}
 
+	// Auth sessions collection indexes (for persistent login sessions)
+	if err := CreateAuthSessionIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to create auth_sessions indexes: %w", err)
+	}
+
 	return nil
 }
 
