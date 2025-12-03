@@ -216,7 +216,7 @@ func (r *ShareRepository) AppendAccessLog(ctx context.Context, token string, ent
 
 // ListAll returns all shares (with pagination)
 func (r *ShareRepository) ListAll(ctx context.Context, limit, skip int) ([]*ShareEntry, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return nil, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -244,7 +244,7 @@ func (r *ShareRepository) ListAll(ctx context.Context, limit, skip int) ([]*Shar
 
 // ListByDevice returns all shares for a device
 func (r *ShareRepository) ListByDevice(ctx context.Context, deviceID string) ([]*ShareEntry, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return nil, fmt.Errorf("MongoDB not initialized")
 	}
 
@@ -343,7 +343,7 @@ func (r *ShareRepository) CountByDevice(ctx context.Context, deviceID string) (i
 
 // CountByCreator counts shares created by an admin
 func (r *ShareRepository) CountByCreator(ctx context.Context, creatorID string) (int64, error) {
-	if r.col == nil {
+	if r.ensureCollection() == nil {
 		return 0, fmt.Errorf("MongoDB not initialized")
 	}
 
