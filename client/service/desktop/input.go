@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"Rocket/client/ipc"
+	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"Rocket/utils"
 	"encoding/json"
@@ -60,10 +61,11 @@ func HandleInput(pack modules.Packet) error {
 	if !ok {
 		return errInputInvalid
 	}
+	desktopID := desktopIDVal.(string)
 	if pack.Data == nil {
 		return errInputInvalid
 	}
-	session, ok := sessions.Get(desktopIDVal.(string))
+	session, ok := sessions.Get(desktopID)
 	if !ok || session.escape.Load() {
 		return errInputSessionGone
 	}
@@ -102,12 +104,37 @@ func HandleInput(pack modules.Packet) error {
 		return nil
 	}
 
+	var (
+		firstErr     error
+		successCount int
+		failCount    int
+	)
 	for _, event := range events {
 		if err := applyInputEvent(event, bounds); err != nil {
-			return err
+			failCount++
+			if firstErr == nil {
+				firstErr = err
+			}
+			telemetry.LogStructured("WARN", "desktop input event failed", map[string]interface{}{
+				"desktop": desktopID,
+				"type":    event.Type,
+				"error":   err.Error(),
+			})
+			continue
 		}
+		successCount++
 	}
 	session.lastPack = utils.Unix
+	if failCount > 0 {
+		telemetry.LogStructured("WARN", "desktop input batch partially applied", map[string]interface{}{
+			"desktop":   desktopID,
+			"succeeded": successCount,
+			"failed":    failCount,
+		})
+	}
+	if successCount == 0 && firstErr != nil {
+		return firstErr
+	}
 	return nil
 }
 

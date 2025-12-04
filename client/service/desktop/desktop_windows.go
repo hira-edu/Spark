@@ -10,6 +10,7 @@ import (
 	winGDI "github.com/lxn/win"
 	"image"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -20,6 +21,27 @@ var (
 	funcGetMonitorInfo, _      = syscall.GetProcAddress(syscall.Handle(libUser32), "GetMonitorInfoW")
 	funcEnumDisplaySettings, _ = syscall.GetProcAddress(syscall.Handle(libUser32), "EnumDisplaySettingsW")
 )
+
+const (
+	minDXGICaptureTimeoutMS = 5
+	maxDXGICaptureTimeoutMS = 100
+)
+
+func dxgiCaptureTimeoutMillis() int {
+	fps := clampFPSValue(configFPS.Load())
+	if fps <= 0 {
+		fps = fpsDefault
+	}
+	frameDuration := time.Second / time.Duration(fps)
+	timeout := frameDuration / 2
+	if timeout < time.Duration(minDXGICaptureTimeoutMS)*time.Millisecond {
+		timeout = time.Duration(minDXGICaptureTimeoutMS) * time.Millisecond
+	}
+	if timeout > time.Duration(maxDXGICaptureTimeoutMS)*time.Millisecond {
+		timeout = time.Duration(maxDXGICaptureTimeoutMS) * time.Millisecond
+	}
+	return int(timeout / time.Millisecond)
+}
 
 type Screen struct {
 	screen ScreenCapture
@@ -100,19 +122,25 @@ func (s *ScreenDXGI) Init(displayIndex uint, rect image.Rectangle) error {
 	}
 
 	s.device, s.deviceCtx, err = d3d11.NewD3D11Device()
+	if err != nil {
+		s.Release()
+		return err
+	}
+
 	s.ddup, err = outputduplication.NewIDXGIOutputDuplication(s.device, s.deviceCtx, displayIndex)
 	if err != nil {
-		s.device.Release()
-		s.deviceCtx.Release()
+		s.Release()
 		return err
 	}
 	return nil
 }
 func (s *ScreenDXGI) Capture() (*image.RGBA, error) {
 	img := image.NewRGBA(image.Rect(0, 0, s.rect.Dx(), s.rect.Dy()))
-	// Reduced timeout from 100ms to 16ms for faster idle detection
-	// This allows the ticker to maintain proper cadence without blocking
-	err := s.ddup.GetImage(img, 16)
+	// Use an adaptive timeout derived from the current FPS target so DXGI can
+	// return quickly when no new frame is available while still respecting the
+	// configured frame cadence.
+	timeout := dxgiCaptureTimeoutMillis()
+	err := s.ddup.GetImage(img, uint(timeout))
 	if err == outputduplication.ErrNoImageYet {
 		return nil, errNoImage
 	}

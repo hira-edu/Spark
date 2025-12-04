@@ -3,7 +3,6 @@ package longpoll
 import (
 	"Rocket/modules"
 	"Rocket/server/common"
-	servercfg "Rocket/server/config"
 	"Rocket/server/handler/audio"
 	"Rocket/server/handler/utility"
 	"Rocket/utils"
@@ -490,7 +489,8 @@ func SendToLongPollClient(uuid string, packet *modules.Packet) bool {
 	return true
 }
 
-// validateCredentials verifies UUID/Key against server salt (same as WebSocket handshake)
+// validateCredentials verifies UUID/Key (encryption removed, TLS provides security)
+// Key should equal UUID. Supports both 16-byte (new) and 32-byte (legacy) keys.
 func validateCredentials(uuidHex, keyHex string) (string, error) {
 	uuidBytes, err := hex.DecodeString(uuidHex)
 	if err != nil || len(uuidBytes) != 16 {
@@ -498,16 +498,23 @@ func validateCredentials(uuidHex, keyHex string) (string, error) {
 	}
 
 	keyBytes, err := hex.DecodeString(keyHex)
-	if err != nil || len(keyBytes) != 32 {
+	if err != nil {
 		return "", errors.New("invalid key")
 	}
 
-	decrypted, err := common.DecAES(keyBytes, servercfg.Config.SaltBytes)
-	if err != nil {
-		return "", err
+	// Verify authentication - Key should equal UUID (no encryption)
+	var authValid bool
+	if len(keyBytes) == 16 {
+		// Standard format: 16-byte key should match UUID
+		authValid = bytes.Equal(keyBytes, uuidBytes)
+	} else if len(keyBytes) == 32 {
+		// Legacy format: compare first 16 bytes with UUID
+		authValid = bytes.Equal(keyBytes[:16], uuidBytes)
+	} else {
+		return "", errors.New("invalid key length")
 	}
 
-	if !bytes.Equal(decrypted, uuidBytes) {
+	if !authValid {
 		return "", errors.New("uuid/key mismatch")
 	}
 

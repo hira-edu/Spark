@@ -8,6 +8,8 @@ import (
 	"image/jpeg"
 	"sync"
 	"sync/atomic"
+
+	cpu "github.com/klauspost/cpuid/v2"
 )
 
 // Codec represents an image compression codec for desktop streaming.
@@ -187,7 +189,6 @@ func SelectOptimalCodec(config CodecConfig) Codec {
 		}
 		// WebP disabled, use JPEG
 		return NewJPEGCodec(config.Quality)
-		return NewJPEGCodec(config.Quality)
 
 	case NetworkTypeAuto:
 		// Auto-detect: default to JPEG (safe middle ground), prefer hardware H.264 if available
@@ -352,8 +353,8 @@ func (c *WebPCodec) Encode(img *image.RGBA) ([]byte, error) {
 	return jpegCodec.Encode(img)
 }
 
-func (c *WebPCodec) Name() string                { return CodecNameJPEG } // Fallback to JPEG
-func (c *WebPCodec) Type() int                   { return CodecTypeJPEG }
+func (c *WebPCodec) Name() string                { return CodecNameWebP }
+func (c *WebPCodec) Type() int                   { return CodecTypeWebP }
 func (c *WebPCodec) Quality() int                { return c.quality }
 func (c *WebPCodec) IsHardwareAccelerated() bool { return false }
 
@@ -435,8 +436,8 @@ func (c *ProxyCodec) EnableAdaptiveQuality(aqm *AdaptiveQualityManager) {
 	}
 }
 
-func (c *ProxyCodec) Name() string                { return c.name }
-func (c *ProxyCodec) Type() int                   { return c.codecType }
+func (c *ProxyCodec) Name() string { return c.name }
+func (c *ProxyCodec) Type() int    { return c.codecType }
 func (c *ProxyCodec) Quality() int {
 	if c.inner != nil {
 		return c.inner.Quality()
@@ -457,12 +458,20 @@ type HardwareCodecSupport struct {
 
 // DetectHardwareCodecs checks for hardware encoder availability
 func DetectHardwareCodecs() *HardwareCodecSupport {
-	support := &HardwareCodecSupport{}
+	support := platformHardwareProbe()
+	if support == nil {
+		support = &HardwareCodecSupport{}
+	}
 
-	// TODO: Implement hardware detection
-	// On Windows: Check for Media Foundation H.264/HEVC encoders
-	// On Linux: Check for VAAPI/NVENC support
-	// For now, return all false (software fallback)
+	// Fall back to CPU feature heuristics for VP8/VP9 support hints when the
+	// underlying platform probe cannot determine availability. Most CPUs that
+	// expose AVX/SSE4 perform well enough to at least advertise support.
+	if !support.VP8Available {
+		support.VP8Available = cpu.CPU.Supports(cpu.SSE4, cpu.AVX)
+	}
+	if !support.VP9Available {
+		support.VP9Available = cpu.CPU.Supports(cpu.AVX2) || cpu.CPU.Supports(cpu.AVX)
+	}
 
 	telemetry.LogStructured("INFO", "codec: hardware detection", map[string]interface{}{
 		"vp8":  support.VP8Available,

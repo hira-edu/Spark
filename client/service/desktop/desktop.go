@@ -39,6 +39,9 @@ type session struct {
 	framesDropped    atomic.Uint64 // Total frames dropped due to backpressure
 	framesDelivered  atomic.Uint64 // Total frames successfully delivered
 	channelHighWater atomic.Uint64 // Peak channel utilization
+
+	// Per-session cursor state (avoids global state conflicts)
+	cursorState *cursorSessionState
 }
 type message struct {
 	t     int

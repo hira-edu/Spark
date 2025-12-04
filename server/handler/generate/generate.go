@@ -249,28 +249,34 @@ func GenerateClient(ctx *gin.Context) {
 	ctx.Writer.Write(trailerFooter)
 }
 
+// genConfig generates the client configuration payload.
+// Encryption removed - TLS provides transport security.
+// Format: [2-byte length] + [16-byte key (unused)] + [JSON config] + [padding]
 func genConfig(cfg clientCfg) ([]byte, error) {
 	data, err := utils.JSON.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}
+
+	// Key is kept for format compatibility but unused (no encryption)
 	key := utils.GetUUID()
+	// EncAES now returns data unchanged - no encryption needed with TLS
 	data, err = common.EncAES(data, key)
 	if err != nil {
 		return nil, err
 	}
+
+	// Format: [16-byte key] + [JSON data]
 	final := append(key, data...)
 	if len(final) > clientcfg.ConfigBufferSize-2 {
 		return nil, ErrTooLargeEntity
 	}
 
-	// Get the length of encrypted buffer as a 2-byte big-endian integer.
-	// And append encrypted buffer to the end of the data length.
+	// Get the length as a 2-byte big-endian integer
 	dataLen := big.NewInt(int64(len(final))).Bytes()
 	dataLen = append(bytes.Repeat([]byte{'\x00'}, 2-len(dataLen)), dataLen...)
 
-	// If the length of encrypted buffer is less than ConfigBufferSize,
-	// append the remaining bytes with random bytes.
+	// Pad to ConfigBufferSize with random bytes
 	final = append(dataLen, final...)
 	for len(final) < clientcfg.ConfigBufferSize {
 		final = append(final, utils.GetUUID()...)

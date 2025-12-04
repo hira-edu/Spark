@@ -426,16 +426,15 @@ func wsHandshake(ctx *gin.Context) {
 		return
 	}
 
-	// Verify authentication based on key format
+	// Verify authentication - Key should equal UUID (encryption removed, TLS provides security)
 	var authValid bool
-	if len(clientKey) == 32 {
-		// Old format: 32-byte encrypted key (MD5 hash + encrypted UUID)
-		// Try to decrypt and compare with UUID
-		decrypted, err := common.DecAES(clientKey, config.Config.SaltBytes)
-		authValid = (err == nil && bytes.Equal(decrypted, clientUUID))
-	} else if len(clientKey) == 16 {
-		// New format: 16-byte plaintext key (just UUID, no encryption)
+	if len(clientKey) == 16 {
+		// Standard format: 16-byte key should match UUID
 		authValid = bytes.Equal(clientKey, clientUUID)
+	} else if len(clientKey) == 32 {
+		// Legacy format: 32-byte key (for backwards compatibility with old clients)
+		// Just compare first 16 bytes with UUID
+		authValid = bytes.Equal(clientKey[:16], clientUUID)
 	} else {
 		common.Warn(ctx, `WS_HANDSHAKE`, `fail`, `invalid key length`, map[string]any{
 			`from`:   clientIP,

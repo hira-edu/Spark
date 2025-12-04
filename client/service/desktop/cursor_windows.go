@@ -6,7 +6,9 @@ import (
 	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"encoding/base64"
+	"encoding/hex"
 	"hash/crc32"
+	"image"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -25,13 +27,22 @@ var (
 	procDeleteObject  = gdi32Dll.NewProc("DeleteObject")
 	procGetObject     = gdi32Dll.NewProc("GetObjectW")
 	procGetBitmapBits = gdi32Dll.NewProc("GetBitmapBits")
-
-	cursorCaptureActive atomic.Bool
-	lastCursorHash      uint32
-	lastCursorVisible   bool
-	lastCursorX         int32
-	lastCursorY         int32
 )
+
+// cursorSessionState holds per-session cursor capture state
+// This avoids global state conflicts when multiple sessions run concurrently
+type cursorSessionState struct {
+	active      atomic.Bool
+	lastHash    uint32
+	lastVisible bool
+	lastX       int32
+	lastY       int32
+}
+
+// newCursorSessionState creates a new cursor state for a session
+func newCursorSessionState() *cursorSessionState {
+	return &cursorSessionState{}
+}
 
 const (
 	CURSOR_SHOWING = 0x00000001
@@ -96,33 +107,69 @@ type CursorData struct {
 	Format  string `json:"format,omitempty"`
 }
 
-// StartCursorCapture starts the cursor capture loop (30Hz)
+// StartCursorCapture starts the cursor capture loop (30Hz) for a session
 func StartCursorCapture(rawEvent []byte) {
-	if !cursorCaptureActive.CompareAndSwap(false, true) {
+	// Get session to use its cursor state
+	eventHex := ""
+	if len(rawEvent) > 0 {
+		eventHex = hex.EncodeToString(rawEvent)
+	}
+	sess, ok := sessions.Get(eventHex)
+	if !ok {
+		// Fallback: find any active session
+		sessions.IterCb(func(key string, s *session) bool {
+			if !s.escape.Load() {
+				sess = s
+				return false
+			}
+			return true
+		})
+	}
+
+	if sess == nil {
+		telemetry.LogStructured("WARN", "cursor: no session found for capture", nil)
+		return
+	}
+
+	// Initialize cursor state if needed
+	if sess.cursorState == nil {
+		sess.cursorState = newCursorSessionState()
+	}
+
+	if !sess.cursorState.active.CompareAndSwap(false, true) {
 		return // Already running
 	}
 
 	// Reset cache so the first frame of a new session is always sent
-	lastCursorHash = 0
-	lastCursorVisible = false
-	lastCursorX = 0
-	lastCursorY = 0
+	sess.cursorState.lastHash = 0
+	sess.cursorState.lastVisible = false
+	sess.cursorState.lastX = 0
+	sess.cursorState.lastY = 0
 
-	go cursorCaptureLoop(rawEvent)
+	go cursorCaptureLoop(rawEvent, sess.cursorState)
 }
 
-// StopCursorCapture stops the cursor capture loop
+// StopCursorCapture stops the cursor capture loop for all sessions
 func StopCursorCapture() {
-	cursorCaptureActive.Store(false)
+	sessions.IterCb(func(key string, s *session) bool {
+		if s.cursorState != nil {
+			s.cursorState.active.Store(false)
+		}
+		return true
+	})
 }
 
-func cursorCaptureLoop(rawEvent []byte) {
+func cursorCaptureLoop(rawEvent []byte, state *cursorSessionState) {
+	if state == nil {
+		return
+	}
+
 	ticker := time.NewTicker(time.Second / 30) // 30 Hz
 	defer ticker.Stop()
 
 	telemetry.LogStructured("INFO", "cursor: capture loop started", nil)
 
-	for cursorCaptureActive.Load() {
+	for state.active.Load() {
 		<-ticker.C
 
 		cursor, err := captureCursor()
@@ -131,18 +178,18 @@ func cursorCaptureLoop(rawEvent []byte) {
 		}
 
 		// Check if cursor changed (position OR appearance)
-		if cursor.Hash == lastCursorHash &&
-			cursor.Visible == lastCursorVisible &&
-			cursor.X == lastCursorX &&
-			cursor.Y == lastCursorY {
+		if cursor.Hash == state.lastHash &&
+			cursor.Visible == state.lastVisible &&
+			cursor.X == state.lastX &&
+			cursor.Y == state.lastY {
 			continue // No change, skip
 		}
 
 		// Update cache
-		lastCursorHash = cursor.Hash
-		lastCursorVisible = cursor.Visible
-		lastCursorX = cursor.X
-		lastCursorY = cursor.Y
+		state.lastHash = cursor.Hash
+		state.lastVisible = cursor.Visible
+		state.lastX = cursor.X
+		state.lastY = cursor.Y
 
 		// Send cursor update
 		sendDesktopPacket(modules.Packet{
@@ -167,11 +214,22 @@ func cursorCaptureLoop(rawEvent []byte) {
 
 // captureCursor captures current cursor state
 func captureCursor() (*CursorData, error) {
-	// Get cursor position
+	// Get cursor position (in absolute screen coordinates)
 	var pt POINT
 	ret, _, _ := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	if ret == 0 {
 		return nil, syscall.GetLastError()
+	}
+
+	// Convert absolute screen coordinates to coordinates relative to captured display
+	// This is necessary because GetCursorPos returns virtual screen coordinates,
+	// but the frontend expects coordinates relative to the captured monitor area
+	boundsVal := displayBounds.Load()
+	var bounds image.Rectangle
+	if boundsVal != nil {
+		bounds = boundsVal.(image.Rectangle)
+		pt.X -= int32(bounds.Min.X)
+		pt.Y -= int32(bounds.Min.Y)
 	}
 
 	// Get cursor info (handle + visibility)
@@ -248,7 +306,7 @@ func captureCursor() (*CursorData, error) {
 		Visible: true,
 		Data:    encoded,
 		Hash:    hash,
-		Format:  "argb32",
+		Format:  "rgba",
 	}, nil
 }
 
@@ -304,10 +362,8 @@ func extractCursorBitmap(hbmColor, hbmMask uintptr, width, height, maskStride, m
 		}
 	}
 
-	// Convert BGRA to RGBA
-	for i := 0; i < len(rgba); i += 4 {
-		rgba[i], rgba[i+2] = rgba[i+2], rgba[i] // Swap B and R
-	}
+	// Convert BGRA to RGBA using batch uint32 operations (faster than byte swaps)
+	swapBGRAToRGBA(rgba)
 
 	return rgba, nil
 }
@@ -410,5 +466,24 @@ func convertMonochromeCursor(rgba, mask []byte, width, height, stride int32) {
 				rgba[pixelIdx+3] = 255   // A (opaque)
 			}
 		}
+	}
+}
+
+// swapBGRAToRGBA converts BGRA pixel data to RGBA in-place using batch operations.
+// Processes 4 bytes at a time as uint32 for better performance than byte-by-byte swaps.
+func swapBGRAToRGBA(data []byte) {
+	if len(data) < 4 {
+		return
+	}
+
+	// Process 4 pixels at a time for better cache locality
+	n := len(data) / 4
+	pixels := (*[1 << 28]uint32)(unsafe.Pointer(&data[0]))[:n:n]
+
+	for i := range pixels {
+		// BGRA in memory (little-endian): 0xAARRGGBB
+		// Swap B and R: ((pixel & 0xFF) << 16) | ((pixel >> 16) & 0xFF) | (pixel & 0xFF00FF00)
+		p := pixels[i]
+		pixels[i] = (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF)
 	}
 }

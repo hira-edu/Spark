@@ -2,8 +2,6 @@ package utils
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -112,63 +110,8 @@ func Decrypt(data []byte, key []byte) ([]byte, error) {
 	return append([]byte(nil), data...), nil
 }
 
-// decryptV2 handles new SHA-256 based encryption
-func decryptV2(data []byte, key []byte) ([]byte, error) {
-	// Format: [Version(1)] [IV(16)] [Checksum(16)] [Encrypted]
-	dataLen := len(data)
-	if dataLen <= 33+64 {
-		return nil, ErrEntityInvalid
-	}
-
-	iv := data[1:17]
-	expectedChecksum := data[17:33]
-	encrypted := data[33:]
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	stream := cipher.NewCTR(block, iv)
-	decBuffer := make([]byte, len(encrypted))
-	stream.XORKeyStream(decBuffer, encrypted)
-
-	// Verify checksum
-	actualChecksum, _ := GetSHA256(decBuffer)
-	if !bytes.Equal(actualChecksum, expectedChecksum) {
-		return nil, ErrFailedVerification
-	}
-
-	// Remove nonce (last 64 bytes)
-	return decBuffer[:len(decBuffer)-64], nil
-}
-
-// decryptV1 handles legacy MD5-based encryption for backwards compatibility
-func decryptV1(data []byte, key []byte) ([]byte, error) {
-	// MD5[16 bytes] + Data[n bytes] + Nonce[64 bytes]
-	dataLen := len(data)
-	if dataLen <= 16+64 {
-		return nil, ErrEntityInvalid
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	stream := cipher.NewCTR(block, data[:16])
-	decBuffer := make([]byte, dataLen-16)
-	stream.XORKeyStream(decBuffer, data[16:])
-
-	hash, _ := GetMD5(decBuffer)
-	if !bytes.Equal(hash, data[:16]) {
-		data = nil
-		decBuffer = nil
-		return nil, ErrFailedVerification
-	}
-	data = nil
-	decBuffer = decBuffer[:dataLen-16-64]
-
-	return decBuffer, nil
-}
+// NOTE: decryptV1 and decryptV2 functions have been removed.
+// They were unused dead code after encryption was removed in favor of TLS.
 
 func FormatSize(size int64) string {
 	sizes := []string{`B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB`, `ZB`, `YB`}

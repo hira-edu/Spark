@@ -40,6 +40,10 @@ const (
 	maxClipboardBytes  = 64 * 1024
 	maxFileDropEntries = 5
 	maxFileNameLength  = 255
+	// Cursor validation limits
+	maxCursorWidth    = 256
+	maxCursorHeight   = 256
+	maxCursorDataSize = maxCursorWidth * maxCursorHeight * 4 * 4 / 3 // base64 overhead ~1.33x
 )
 
 func init() {
@@ -148,7 +152,7 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
 			data := *pack.Data[`data`].(*[]byte)
-			if data[5] == 00 || data[5] == 01 || data[5] == 02 {
+			if utility.IsFrameOp(data[5]) {
 				// Frame data - track and forward to browser
 				desktop.frameCount++
 				if err := desktop.srcConn.WriteBinary(data); err != nil {
@@ -170,7 +174,7 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				return
 			}
 
-			if data[5] != 03 {
+			if data[5] != utility.BinaryOpDesktopControl {
 				return
 			}
 			// Binary protocol header is 24 bytes: magic(4) + service(1) + op(1) + event(16) + length(2)
@@ -257,8 +261,10 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				sendPack(pack, desktop.srcConn)
 			}
 		case `CURSOR_UPDATE`:
-			// Relay cursor metadata to browser unchanged
-			sendPack(pack, desktop.srcConn)
+			// Validate and relay cursor metadata to browser
+			if validated, ok := normalizeCursor(pack.Data); ok {
+				sendPack(modules.Packet{Act: `CURSOR_UPDATE`, Data: validated}, desktop.srcConn)
+			}
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
 			if pack.Code != 0 {
 				sendPack(pack, desktop.srcConn)
@@ -825,6 +831,66 @@ func normalizeFileDrop(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	return gin.H{`files`: files}, true
+}
+
+// normalizeCursor validates and sanitizes cursor update data.
+// Enforces maximum dimensions and data size to prevent memory abuse.
+func normalizeCursor(data map[string]any) (gin.H, bool) {
+	if data == nil {
+		return nil, false
+	}
+
+	// Validate dimensions
+	width, wOk := coerceNumber(data[`width`])
+	height, hOk := coerceNumber(data[`height`])
+	if !wOk || !hOk || width <= 0 || height <= 0 {
+		return nil, false
+	}
+	if width > maxCursorWidth || height > maxCursorHeight {
+		return nil, false
+	}
+
+	// Validate base64 data size
+	dataStr, ok := data[`data`].(string)
+	if ok && len(dataStr) > maxCursorDataSize {
+		return nil, false
+	}
+
+	// Build validated payload
+	payload := gin.H{
+		`width`:  width,
+		`height`: height,
+	}
+
+	// Copy safe numeric fields
+	if x, ok := coerceNumber(data[`x`]); ok {
+		payload[`x`] = x
+	}
+	if y, ok := coerceNumber(data[`y`]); ok {
+		payload[`y`] = y
+	}
+	if hotX, ok := coerceNumber(data[`hotX`]); ok {
+		payload[`hotX`] = hotX
+	}
+	if hotY, ok := coerceNumber(data[`hotY`]); ok {
+		payload[`hotY`] = hotY
+	}
+	if hash, ok := coerceNumber(data[`hash`]); ok {
+		payload[`hash`] = hash
+	}
+
+	// Copy boolean/string fields
+	if visible, ok := data[`visible`].(bool); ok {
+		payload[`visible`] = visible
+	}
+	if format, ok := data[`format`].(string); ok && len(format) > 0 && len(format) < 32 {
+		payload[`format`] = format
+	}
+	if len(dataStr) > 0 {
+		payload[`data`] = dataStr
+	}
+
+	return payload, true
 }
 
 func normalizeAudioControl(data map[string]any) (gin.H, bool) {

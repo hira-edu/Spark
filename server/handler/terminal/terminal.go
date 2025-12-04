@@ -121,12 +121,12 @@ func terminalEventWrapper(terminal *terminal) common.EventCallback {
 				`dataLen`: len(data),
 				`op`:      data[5],
 			})
-			if data[5] == 00 {
+			if data[5] == utility.BinaryOpTerminalStream {
 				terminal.session.WriteBinary(data)
 				return
 			}
 
-			if data[5] != 01 {
+			if data[5] != utility.BinaryOpTerminalJSON {
 				common.Warn(nil, `TERMINAL_RAW_DATA`, ``, `unexpected op code`, map[string]any{
 					`op`: data[5],
 				})

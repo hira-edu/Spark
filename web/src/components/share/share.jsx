@@ -16,22 +16,23 @@ function Share(props) {
 
 	useEffect(() => {
 		if (open) {
-			form.setFieldsValue({
-				device: device?.id ?? '',
-				desktop: device?.desktop ?? '',
-				ttlSeconds: 3600,
-				viewOnly: true,
-				singleUse: false,
-				turnOnly: false,
-			});
+			// Use setTimeout to ensure form is mounted after destroyOnClose recreation
+			setTimeout(() => {
+				form.setFieldsValue({
+					device: device?.id ?? '',
+					ttlSeconds: 3600,
+					viewOnly: true,
+					singleUse: false,
+					turnOnly: false,
+				});
+			}, 0);
 			loadShares();
 		}
-	}, [open, device]);
+	}, [open, device, form]);
 
 	const columns = [
 		{title: 'ID', dataIndex: 'id', key: 'id', ellipsis: true},
 		{title: i18n.t('COMMON.DEVICE'), dataIndex: 'device', key: 'device', ellipsis: true},
-		{title: 'Desktop', dataIndex: 'desktop', key: 'desktop', ellipsis: true},
 		{
 			title: 'Access',
 			key: 'access',
@@ -122,7 +123,6 @@ function Share(props) {
 		setCreating(true);
 		axios.post('/api/share/create', {
 			device: values.device,
-			desktop: values.desktop,
 			ttlSeconds: values.ttlSeconds,
 			viewOnly: !!values.viewOnly,
 			singleUse: !!values.singleUse,
@@ -162,10 +162,7 @@ function Share(props) {
 				>
 					<Input placeholder='device id' style={{width: 180}} />
 				</Form.Item>
-			<Form.Item label='Desktop' name='desktop'>
-				<Input placeholder='desktop id (optional)' style={{width: 160}} />
-			</Form.Item>
-			<Form.Item
+				<Form.Item
 				label={i18n.t('COMMON.READ_ONLY') || 'View-only'}
 				name='viewOnly'
 				valuePropName='checked'

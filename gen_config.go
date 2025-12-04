@@ -9,9 +9,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -61,11 +58,6 @@ type clientCfg struct {
 	EnableMimicry  bool   `json:"enable_mimicry"`
 }
 
-func getMD5(data []byte) []byte {
-	hash := md5.Sum(data)
-	return hash[:]
-}
-
 func getUUID() []byte {
 	uuid := make([]byte, 16)
 	if _, err := rand.Read(uuid); err != nil {
@@ -84,15 +76,21 @@ func deriveSaltBytes(salt string) []byte {
 	return saltBytes[:24]
 }
 
-// Config encryption removed - returns plaintext
+// encAES - Encryption removed; TLS provides transport security.
+// Returns data unchanged. The key and keyLen parameters are kept for API compatibility.
 func encAES(data []byte, key []byte, keyLen int) ([]byte, error) {
-	// Just return the data as-is (no encryption, no MD5 hash)
-	return data, nil
+	_, _ = key, keyLen // Unused - kept for API compatibility
+	// Return a copy for safety (no encryption needed - TLS handles security)
+	return append([]byte(nil), data...), nil
 }
 
-// generateClientKey creates auth key by encrypting UUID with salt (uses AES-192)
+// generateClientKey creates auth key from UUID.
+// Encryption removed - key is now just the UUID itself (TLS provides security).
+// Server will compare Key == UUID for authentication.
 func generateClientKey(uuid []byte, saltBytes []byte) ([]byte, error) {
-	return encAES(uuid, saltBytes, 24) // Server expects 24-byte key for auth
+	_ = saltBytes // Unused - kept for API compatibility
+	// Return a copy of UUID as the key (no encryption needed)
+	return append([]byte(nil), uuid...), nil
 }
 
 func genConfig(cfg clientCfg) ([]byte, error) {

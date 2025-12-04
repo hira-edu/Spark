@@ -780,11 +780,11 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 	return func(pack modules.Packet, device *melody.Session) {
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
 			data := *pack.Data[`data`].(*[]byte)
-			if data[5] == 00 || data[5] == 01 || data[5] == 02 {
+			if utility.IsFrameOp(data[5]) {
 				guest.srcConn.WriteBinary(data)
 				return
 			}
-			if data[5] != 03 {
+			if data[5] != utility.BinaryOpShareControl {
 				return
 			}
 			// Binary protocol header is 24 bytes: magic(4) + service(1) + op(1) + event(16) + length(2)
@@ -818,6 +818,8 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 			if pack.Code != 0 {
 				sendGuestPack(pack, guest.srcConn)
 			}
+		case `CURSOR_UPDATE`:
+			sendGuestPack(pack, guest.srcConn)
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
 			if pack.Code != 0 {
 				sendGuestPack(pack, guest.srcConn)

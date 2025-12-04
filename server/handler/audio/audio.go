@@ -132,12 +132,12 @@ func audioEventWrapper(audio *audio) common.EventCallback {
 	return func(pack modules.Packet, device *melody.Session) {
 		if pack.Act == `RAW_DATA_ARRIVE` && pack.Data != nil {
 			data := *pack.Data[`data`].(*[]byte)
-			if data[5] == 00 || data[5] == 01 || data[5] == 02 {
+			if utility.IsFrameOp(data[5]) {
 				audio.srcConn.WriteBinary(data)
 				return
 			}
 
-			if data[5] != 05 {
+			if data[5] != utility.BinaryOpAudioControl {
 				return
 			}
 			// Binary protocol header is 24 bytes: magic(4) + service(1) + op(1) + event(16) + length(2)
