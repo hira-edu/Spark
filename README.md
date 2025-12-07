@@ -46,6 +46,25 @@ If you find security vulnerabilities, **do not open an issue**. Contact me immed
 
 ---
 
+## 📚 Documentation
+
+Comprehensive documentation is available in the [`docs/`](./docs/) directory:
+
+| Document | Description |
+|----------|-------------|
+| **[Architecture](./docs/ARCHITECTURE.md)** | System overview, components, binary protocol, data flow diagrams |
+| **[Deployment](./docs/DEPLOYMENT.md)** | Production deployment with Caddy, systemd, MongoDB, TLS setup |
+| **[Configuration](./docs/CONFIGURATION.md)** | Complete `config.json` reference with all options |
+| **[Build Guide](./docs/BUILD.md)** | Building from source: frontend, statik embedding, server, clients |
+| **[Client Generation](./docs/CLIENT_GENERATION.md)** | Trailer embedding system, binary naming conventions |
+
+### Additional Resources
+
+- [Observability](./docs/observability.md) — Metrics, tracing (OTLP), and logging setup
+- [Logging](./docs/logging.md) — Detailed logging configuration
+
+---
+
 ## ⚙️ Configuration
 
 The configuration file `config.json` should be in the same directory as the executable.
@@ -224,58 +243,36 @@ git clone https://github.com/XZB-1248/Rocket
 cd ./Rocket
 
 # Build the front-end
-cd ./web
-npm install
-npm run build-prod
+cd ./web && npm install && NODE_ENV=production npm run build-prod && cd ..
 
-# Embed static resources
-cd ..
-go install github.com/rakyll/statik
-statik -m -src="./web/dist" -f -dest="./server/embed" -p web -ns web
-
-# Build the client
-mkdir ./built
-go mod tidy
-go mod download
-./scripts/build.client.sh
+# Embed static resources (CRITICAL: use -ns web for namespace)
+go install github.com/rakyll/statik@latest
+~/go/bin/statik -src=./web/dist -dest=./server/embed -p web -ns web -f
 
 # Build the server
-mkdir ./releases
-./scripts/build.server.sh
+go build -o rocket-server ./server
+
+# Build client binaries (optional)
+./scripts/build.client.sh
 ```
+
+> **Important:** The `-ns web` flag is required for statik. See [BUILD.md](./docs/BUILD.md) for detailed instructions including cross-compilation and troubleshooting.
 
 ### Client Configuration Trailer
 
-Rocket uses a **binary trailer approach** (Sliver-style) for embedding client configuration into executables. This design works identically across Windows, Linux, and macOS, providing a robust and maintainable solution.
+Rocket uses a **binary trailer approach** for embedding configuration into client executables at download time:
 
-**Key Benefits:**
-- **Platform-Independent**: Works with PE, ELF, and Mach-O formats using identical code
-- **Immutable Templates**: Base binaries remain unchanged and can be code-signed
-- **Simple & Reliable**: No complex binary patching or compiler-dependent placeholders
-- **Single-File Distribution**: Self-contained executables with embedded config
-
-**Format Overview:**
 ```
-[Original Binary] → [384-byte Encrypted Config Payload] → [20-byte Footer]
+[Template Binary] + [384-byte Encrypted Config] + [20-byte Footer] → [Configured Client]
 ```
 
-The footer contains:
-- Magic: `SPARKCFG` (8 bytes) - Identifier
-- Version: `1` (uint16) - Format version
-- Reserved: `0` (uint16) - Future use
-- Length: `384` (uint32) - Payload size
-- CRC32: Checksum (uint32) - Integrity verification
+**Key Points:**
+- Template binaries in `./built/` remain unchanged (can be code-signed)
+- Server expects binaries **without** `.exe` extension (e.g., `windows_amd64` not `windows_amd64.exe`)
+- Footer contains magic `SPARKCFG`, version, length, and CRC32 checksum
+- Each download generates unique AES-encrypted credentials
 
-Each client binary receives a unique AES-encrypted configuration with randomly generated credentials. The client reads this trailer at runtime to discover its server, port, and authentication keys.
-
-**For detailed technical documentation**, see [TRAILER_FORMAT.md](./TRAILER_FORMAT.md) which covers:
-- Complete binary format specification
-- Encryption and security details
-- Generation and reading workflows
-- Cross-platform compatibility
-- Comparison with alternative approaches
-
-**Important:** Clean templates in `releases/built` must remain trailer-free. Configuration is appended only during client generation or updates.
+> **See [CLIENT_GENERATION.md](./docs/CLIENT_GENERATION.md)** for complete technical documentation including binary format specification, build scripts, and troubleshooting.
 
 ## Custom Features
 
