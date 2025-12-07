@@ -193,30 +193,72 @@ func (s *rocketApp) Run(ctx context.Context) error {
 	return core.StartWithContext(ctx)
 }
 
+// update handles runtime binary updates triggered by the server.
+// This is distinct from lifecycle.performUpdate() which handles installer-time updates.
+// Flow: Server sends new binary -> saved as .tmp -> --update mode copies to final location -> --clean removes .tmp
 func update() {
 	selfPath, err := os.Executable()
 	if err != nil {
+		golog.Warnf("update: failed to get executable path: %v", err)
 		selfPath = os.Args[0]
 	}
+
 	if len(os.Args) > 1 && os.Args[1] == `--update` {
+		golog.Info("update: running in --update mode")
 		if len(selfPath) <= 4 {
+			golog.Warn("update: path too short, cannot determine destination")
 			return
 		}
+
+		// Remove .tmp extension to get destination path
 		destPath := selfPath[:len(selfPath)-4]
+		golog.Infof("update: copying from %s to %s", selfPath, destPath)
+
+		// Read the new binary
 		thisFile, err := os.ReadFile(selfPath)
 		if err != nil {
+			golog.Errorf("update: failed to read update binary: %v", err)
 			return
 		}
-		os.WriteFile(destPath, thisFile, 0755)
+
+		// Write with retry in case of file locks
+		var writeErr error
+		for i := 0; i < 3; i++ {
+			if i > 0 {
+				time.Sleep(1 * time.Second)
+			}
+			writeErr = os.WriteFile(destPath, thisFile, 0755)
+			if writeErr == nil {
+				break
+			}
+			golog.Warnf("update: write attempt %d failed: %v", i+1, writeErr)
+		}
+		if writeErr != nil {
+			golog.Errorf("update: failed to write update after 3 attempts: %v", writeErr)
+			return
+		}
+		golog.Info("update: binary copied successfully")
+
+		// Start the new binary with --clean flag to remove the .tmp file
 		cmd := exec.Command(destPath, `--clean`)
-		if cmd.Start() == nil {
-			os.Exit(0)
+		if err := cmd.Start(); err != nil {
+			golog.Errorf("update: failed to start updated binary: %v", err)
 			return
 		}
+		golog.Info("update: started new binary, exiting")
+		os.Exit(0)
+		return
 	}
+
 	if len(os.Args) > 1 && os.Args[1] == `--clean` {
+		golog.Info("update: running in --clean mode")
 		<-time.After(3 * time.Second)
-		os.Remove(selfPath + `.tmp`)
+		tmpPath := selfPath + `.tmp`
+		if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+			golog.Warnf("update: failed to remove temp file %s: %v", tmpPath, err)
+		} else {
+			golog.Infof("update: removed temp file %s", tmpPath)
+		}
 	}
 }
 

@@ -12,6 +12,10 @@ func RunAsService(app Application) error {
 // NoopServiceController is a no-op implementation for non-Windows platforms
 type NoopServiceController struct{}
 
+// WindowsServiceController is an alias for NoopServiceController on non-Windows platforms
+// This allows runner.go type assertions to work (they'll just fail gracefully)
+type WindowsServiceController = NoopServiceController
+
 // NewServiceController creates a no-op service controller for non-Windows
 func NewServiceController(execPath string) *NoopServiceController {
 	return &NoopServiceController{}

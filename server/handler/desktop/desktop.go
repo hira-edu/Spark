@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -86,7 +85,7 @@ func InitDesktop(ctx *gin.Context) {
 	})
 
 	// Validate WebSocket origin to prevent CSWSH attacks
-	if !validateWebSocketOrigin(ctx) {
+	if !utility.ValidateWebSocketOrigin(ctx, false) {
 		logAbort(http.StatusForbidden, `invalid websocket origin`, map[string]any{
 			`origin`: ctx.GetHeader(`Origin`),
 		})
@@ -954,45 +953,4 @@ func coerceNumber(v any) (int64, bool) {
 		return int64(n), true
 	}
 	return 0, false
-}
-
-// validateWebSocketOrigin checks the Origin header to prevent Cross-Site WebSocket Hijacking
-func validateWebSocketOrigin(ctx *gin.Context) bool {
-	origin := ctx.GetHeader("Origin")
-	if origin == "" {
-		// No Origin header - allow (non-browser clients)
-		return true
-	}
-
-	originURL, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-
-	requestHost := ctx.Request.Host
-	// Strip port from both for comparison
-	requestHostWithoutPort := strings.Split(requestHost, ":")[0]
-	originHostWithoutPort := strings.Split(originURL.Host, ":")[0]
-
-	// Same host is always allowed
-	if originHostWithoutPort == requestHostWithoutPort {
-		return true
-	}
-
-	// Allow localhost variants to connect to each other
-	if isLocalhost(originHostWithoutPort) && isLocalhost(requestHostWithoutPort) {
-		return true
-	}
-
-	return false
-}
-
-// isLocalhost checks if a host is a localhost variant
-func isLocalhost(host string) bool {
-	switch host {
-	case "localhost", "127.0.0.1", "::1", "[::1]":
-		return true
-	default:
-		return false
-	}
 }

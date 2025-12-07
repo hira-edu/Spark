@@ -8,7 +8,7 @@ import './desktop.modal.css';
  * Maintains compatibility with the existing API
  */
 function DesktopModal(props) {
-  const { open, device, onCancel, shareToken, allowControl = true } = props;
+  const { open, device, onCancel, shareToken, shareSecret, allowControl = true } = props;
 
   if (!open || !device) {
     return null;
@@ -32,6 +32,7 @@ function DesktopModal(props) {
         <DesktopViewer
           device={device}
           shareToken={shareToken}
+          shareSecret={shareSecret}
           allowControl={allowControl}
           onClose={onCancel}
         />

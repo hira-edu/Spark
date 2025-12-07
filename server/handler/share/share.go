@@ -12,7 +12,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -35,7 +34,7 @@ var (
 )
 
 const (
-	defaultTTLSeconds = 3600  // 1 hour
+	defaultTTLSeconds = 14400 // 4 hours
 	maxTTLSeconds     = 86400 // 24 hours
 )
 
@@ -140,7 +139,7 @@ func ValidateShareToken(ctx *gin.Context) {
 	logAccess(token, ctx, true, "")
 	desktopID := ensureDesktop(entry)
 
-	// Return sanitized entry (without internal fields)
+	// Return entry with secret for WebSocket authentication
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{
 		`share`: gin.H{
 			`id`:        entry.ID,
@@ -151,25 +150,30 @@ func ValidateShareToken(ctx *gin.Context) {
 			`turnOnly`:  entry.TurnOnly,
 			`singleUse`: entry.SingleUse,
 			`used`:      entry.Used,
+			`secret`:    entry.Secret,
 		},
 	}})
 }
 
 // InitGuestDesktop handles guest desktop WebSocket connections
 func InitGuestDesktop(ctx *gin.Context) {
+	golog.Infof("InitGuestDesktop called: isWebsocket=%v", ctx.IsWebsocket())
 	if !ctx.IsWebsocket() {
+		golog.Warnf("InitGuestDesktop: not a websocket request")
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
 	// Validate origin for CSWSH protection
-	if !validateGuestOrigin(ctx) {
+	if !utility.ValidateWebSocketOrigin(ctx, true) {
+		golog.Warnf("InitGuestDesktop: origin validation failed, origin=%s host=%s", ctx.GetHeader("Origin"), ctx.Request.Host)
 		ctx.AbortWithStatus(http.StatusForbidden)
 		return
 	}
 
 	token := ctx.Query(`token`)
 	if token == "" {
+		golog.Warnf("InitGuestDesktop: empty token")
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
@@ -177,13 +181,16 @@ func InitGuestDesktop(ctx *gin.Context) {
 	dbCtx := context.Background()
 	entry, err := repo.GetByToken(dbCtx, token)
 	if err != nil || entry == nil || isExpired(entry, time.Now()) {
+		golog.Warnf("InitGuestDesktop: token not found or expired, token=%s err=%v entry=%v", token[:8]+"...", err, entry != nil)
 		logAccess(token, ctx, false, "token not found")
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 
 	secretStr, ok := ctx.GetQuery(`secret`)
+	golog.Infof("InitGuestDesktop: token valid, checking secret: provided=%v len=%d expected_len=%d", ok, len(secretStr), len(entry.Secret))
 	if !ok || len(secretStr) != len(entry.Secret) || strings.ToLower(secretStr) != strings.ToLower(entry.Secret) {
+		golog.Warnf("InitGuestDesktop: secret mismatch, provided=%s expected=%s", secretStr, entry.Secret)
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
@@ -297,7 +304,7 @@ func CreateShare(ctx *gin.Context) {
 	}
 
 	ttl := body.TTL
-	if ttl < 0 {
+	if ttl <= 0 {
 		ttl = defaultTTLSeconds
 	}
 	if ttl > maxTTLSeconds {
@@ -528,6 +535,32 @@ func isShareActive(id string) bool {
 	return true
 }
 
+// isShareValidForSession checks if a share is still valid for an existing session.
+// Unlike isShareActive, this does NOT check the single-use Used flag because:
+// - Single-use shares are marked as Used at connection time (before WebSocket upgrade)
+// - An existing session already passed validation at connection time
+// - The session should remain valid until expiration or revocation (deletion)
+// This prevents the race condition where single-use shares were immediately terminated
+// after their first message because isShareActive returned false.
+func isShareValidForSession(id string) bool {
+	if id == "" {
+		return false
+	}
+	dbCtx := context.Background()
+	s, err := repo.GetByID(dbCtx, id)
+	// Share deleted (revoked) or not found - close session
+	if err != nil || s == nil {
+		return false
+	}
+	// Share expired - close session
+	if isExpired(s, time.Now()) {
+		return false
+	}
+	// Don't check SingleUse && Used for existing sessions
+	// They were already validated at connection time
+	return true
+}
+
 func logAccess(token string, ctx *gin.Context, success bool, reason string) {
 	dbCtx := context.Background()
 	entry := storage.AccessLogEntry{
@@ -553,7 +586,8 @@ func expiredSession(session *melody.Session, shareID string) bool {
 			return true
 		}
 	}
-	if shareID == "" || isShareActive(shareID) {
+	// Use isShareValidForSession for existing sessions (doesn't check single-use Used flag)
+	if shareID == "" || isShareValidForSession(shareID) {
 		return false
 	}
 	sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
@@ -564,8 +598,10 @@ func expiredSession(session *melody.Session, shareID string) bool {
 // Guest WebSocket handlers
 
 func onGuestConnect(session *melody.Session) {
+	golog.Infof("Guest onConnect starting")
 	shareID, ok := session.Get(`ShareID`)
 	if !ok {
+		golog.Warnf("Guest connect failed: no ShareID")
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|SHARE.INVALID_TOKEN}`}, session)
 		session.Close()
 		return
@@ -576,7 +612,9 @@ func onGuestConnect(session *melody.Session) {
 	viewOnly, _ := session.Get(`ViewOnly`)
 	desktopVal, _ := session.Get(`Desktop`)
 	desktopUUID, _ := desktopVal.(string)
+	golog.Infof("Guest connect: shareID=%s device=%v connUUID=%v desktop=%s", shareID, device, connUUID, desktopUUID)
 	if desktopUUID == "" {
+		golog.Warnf("Guest connect failed: empty desktopUUID")
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		session.Close()
 		return
@@ -584,6 +622,7 @@ func onGuestConnect(session *melody.Session) {
 
 	deviceConn, ok := common.Melody.GetSessionByUUID(connUUID.(string))
 	if !ok {
+		golog.Warnf("Guest connect failed: device session not found for connUUID=%v", connUUID)
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
@@ -622,8 +661,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 	}
 
-	// Enforce single-use mid-session: if share marked used and single-use, close
-	if guest.shareID != "" && !isShareActive(guest.shareID) {
+	// Check if share is still valid for this existing session (expired or revoked)
+	// Uses isShareValidForSession which does NOT check single-use Used flag
+	// since that was already validated at connection time
+	if guest.shareID != "" && !isShareValidForSession(guest.shareID) {
 		sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
 		session.Close()
 		return
@@ -667,6 +708,14 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		common.SendPack(modules.Packet{Act: `DESKTOP_SHOT`, Data: gin.H{
 			`desktop`: desktopUUID,
 		}, Event: desktopUUID.(string)}, guest.deviceConn)
+		return
+
+	case `DESKTOP_CONFIG`:
+		// Forward config (quality, fps, display) to device
+		if pack.Data != nil {
+			pack.Data[`desktop`] = desktopUUID
+			common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: pack.Data, Event: desktopUUID.(string)}, guest.deviceConn)
+		}
 		return
 
 	case `DESKTOP_INPUT`:
@@ -842,39 +891,6 @@ func sendGuestPack(pack modules.Packet, session *melody.Session) bool {
 	err = session.WriteBinary(append([]byte{34, 22, 19, 17, 20, 03}, data...))
 	return err == nil
 }
-
-func validateGuestOrigin(ctx *gin.Context) bool {
-	origin := ctx.GetHeader("Origin")
-	if origin == "" {
-		// Enforce non-empty Origin for CSWSH protection
-		return false
-	}
-	originURL, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	requestHost := ctx.Request.Host
-	requestHostWithoutPort := strings.Split(requestHost, ":")[0]
-	originHostWithoutPort := strings.Split(originURL.Host, ":")[0]
-	if originHostWithoutPort == requestHostWithoutPort {
-		return true
-	}
-	if isLocalhost(originHostWithoutPort) && isLocalhost(requestHostWithoutPort) {
-		return true
-	}
-	return false
-}
-
-func isLocalhost(host string) bool {
-	switch host {
-	case "localhost", "127.0.0.1", "::1", "[::1]":
-		return true
-	default:
-		return false
-	}
-}
-
-// Helper functions for validation (same as desktop handler)
 
 const (
 	maxGuestInputBatch = 32

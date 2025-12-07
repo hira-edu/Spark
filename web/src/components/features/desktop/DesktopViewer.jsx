@@ -14,6 +14,7 @@ import './DesktopViewer.css';
 const DesktopViewer = ({
   device,
   shareToken = null,
+  shareSecret = null,
   allowControl = true,
   onClose,
 }) => {
@@ -45,7 +46,7 @@ const DesktopViewer = ({
     sendClipboard,
     sendFileDrop,
     requestShot,
-  } = useDesktopStream(device, canvasRef, { shareToken, allowControl });
+  } = useDesktopStream(device, canvasRef, { shareToken, shareSecret, allowControl });
 
   // Input capture hook
   const {

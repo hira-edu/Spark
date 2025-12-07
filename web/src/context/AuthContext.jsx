@@ -15,6 +15,7 @@ export const AuthProvider = ({ children }) => {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
     const [needsSetup, setNeedsSetup] = useState(false);
+    const isGuestShareRoute = typeof window !== 'undefined' && window.location.pathname.startsWith('/share');
 
     // Check if initial setup is needed
     const checkSetup = async () => {
@@ -46,11 +47,16 @@ export const AuthProvider = ({ children }) => {
 
     useEffect(() => {
         const initAuth = async () => {
+            if (isGuestShareRoute) {
+                // Skip auth probing for public guest links
+                setLoading(false);
+                return;
+            }
             await checkSetup();
             await checkAuth();
         };
         initAuth();
-    }, []);
+    }, [isGuestShareRoute]);
 
     const login = async (username, password) => {
         const res = await axios.post('/api/auth/login', {

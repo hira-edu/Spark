@@ -23,11 +23,11 @@ axios.interceptors.response.use(async res => {
 	let data = res.data;
 	if (data.hasOwnProperty('code')) {
 		if (data.code !== 0){
-			// Don't show auth errors on initial load or login/setup pages
+			// Don't show auth errors on initial load or public pages
 			const isAuthError = data.msg && (data.msg.includes('AUTH.') || data.msg.includes('SESSION'));
 			const pathname = window.location.pathname;
-			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
-			if (!isAuthError || !isAuthPage) {
+			const isPublicPage = pathname === '/login' || pathname === '/setup' || pathname === '/' || pathname === '/share';
+			if (!isAuthError || !isPublicPage) {
 				message.warning(translate(data.msg));
 			}
 		} else {
@@ -48,18 +48,19 @@ axios.interceptors.response.use(async res => {
 	let data = res?.data ?? {};
 	if (data.hasOwnProperty('code') && data.hasOwnProperty('msg')) {
 		if (data.code !== 0){
-			// Don't show auth errors on initial load or login/setup pages
+			// Don't show auth errors on initial load or public pages
 			const isAuthError = data.msg && (data.msg.includes('AUTH.') || data.msg.includes('SESSION'));
 			const pathname = window.location.pathname;
-			const isAuthPage = pathname === '/login' || pathname === '/setup' || pathname === '/';
-			if (!isAuthError || !isAuthPage) {
+			const isPublicPage = pathname === '/login' || pathname === '/setup' || pathname === '/' || pathname === '/share';
+			if (!isAuthError || !isPublicPage) {
 				message.warning(translate(data.msg));
 			}
 			return Promise.resolve(res);
 		}
 	}
-	// Handle 401 Unauthorized - redirect to login
-	if (res?.status === 401 && window.location.pathname !== '/login' && window.location.pathname !== '/setup') {
+	// Handle 401 Unauthorized - redirect to login (except for public pages)
+	const publicPaths = ['/login', '/setup', '/share'];
+	if (res?.status === 401 && !publicPaths.includes(window.location.pathname)) {
 		window.location.href = '/login';
 	}
 	return Promise.reject(err);

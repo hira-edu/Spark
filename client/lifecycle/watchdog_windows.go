@@ -25,8 +25,7 @@ const taskName = "WinUpdateSvcWatchdog"
 
 var (
 	// Update mutex prevents overlapping binary replacements
-	updateMutex     sync.Mutex
-	updateMutexName = "Global\\RocketClientUpdateMutex"
+	updateMutex sync.Mutex
 
 	// Pinned install path for security
 	allowedInstallPaths = []string{
@@ -176,15 +175,22 @@ func ensureScheduledTask(exePath string) {
 		return
 	}
 	// Create a SYSTEM task that runs every minute to start the service if stopped.
+	// Use proper quoting: schtasks requires the entire /TR argument in one quoted string.
+	// For cmd.exe scripts, we can call the script directly with quotes around the path.
+	// This handles paths with spaces correctly.
+	trArg := fmt.Sprintf(`cmd.exe /C "%s"`, startScript)
+
 	args := []string{
 		"/Create", "/F",
 		"/SC", "MINUTE", "/MO", "1",
 		"/RU", "SYSTEM",
 		"/RL", "HIGHEST",
 		"/TN", taskName,
-		"/TR", `"cmd.exe /C ""` + startScript + `"""`,
+		"/TR", trArg,
 	}
-	_ = exec.Command("schtasks.exe", args...).Run()
+	if err := exec.Command("schtasks.exe", args...).Run(); err != nil {
+		golog.Warnf("watchdog: failed to create scheduled task: %v", err)
+	}
 }
 
 func removeScheduledTask() {

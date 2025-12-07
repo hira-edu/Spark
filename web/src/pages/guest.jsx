@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {Alert, Button, Card, Space, Spin, Tag, message} from 'antd';
 import {ReloadOutlined, VideoCameraOutlined} from '@ant-design/icons';
-import {decrypt, encrypt, genRandHex, getBaseURL, hex2ua, str2ua, ua2hex, translate} from "../utils/utils";
+import {decrypt, encrypt, getBaseURL, hex2ua, str2ua, translate} from "../utils/utils";
 import i18n from "../locale/locale";
 
 const defaultIceServers = [
@@ -124,17 +124,23 @@ function Guest() {
 	function startSession() {
 		const canvas = canvasRef.current;
 		if (!canvas || !share) return;
+		const secretHex = typeof share.secret === 'string' ? share.secret.trim() : '';
+		const secretBytes = secretHex ? hex2ua(secretHex) : null;
+		if (!secretHex || !secretBytes || secretBytes.length === 0) {
+			setError('Share secret missing. Please regenerate the link.');
+			setStatus('error');
+			return;
+		}
 		setResolution('0x0');
 		stopInput();
 		stopWebRTC();
 		if (wsRef.current) {
 			wsRef.current.close();
 		}
-		const secret = hex2ua(genRandHex(32));
-		secretRef.current = secret;
+		secretRef.current = secretBytes;
 		const ctx = canvas.getContext('2d', {alpha: false});
 		ctx.imageSmoothingEnabled = false;
-		const ws = new WebSocket(getBaseURL(true, `api/share/desktop?token=${encodeURIComponent(token)}&secret=${ua2hex(secret)}`));
+		const ws = new WebSocket(getBaseURL(true, `api/share/desktop?token=${encodeURIComponent(token)}&secret=${encodeURIComponent(secretHex.toLowerCase())}`));
 		ws.binaryType = 'arraybuffer';
 		wsRef.current = ws;
 		ws.onopen = () => {

@@ -44,9 +44,26 @@ type windowsService struct {
 }
 
 var (
+	serviceInstallPathMu    sync.RWMutex
 	serviceInstallPath      string
 	errNoInteractiveSession = errors.New("no interactive user sessions available")
 )
+
+// getServiceInstallPath returns the service install path in a thread-safe manner
+func getServiceInstallPath() string {
+	serviceInstallPathMu.RLock()
+	defer serviceInstallPathMu.RUnlock()
+	return serviceInstallPath
+}
+
+// setServiceInstallPath sets the service install path if not already set (thread-safe)
+func setServiceInstallPath(path string) {
+	serviceInstallPathMu.Lock()
+	defer serviceInstallPathMu.Unlock()
+	if serviceInstallPath == "" {
+		serviceInstallPath = path
+	}
+}
 
 // resilientService runs the SCM control loop with event-driven session management
 type resilientService struct {
@@ -108,7 +125,7 @@ func (ws *windowsService) Start(s service.Service) error {
 // Stop is called when the service is stopped
 func (ws *windowsService) Stop(s service.Service) error {
 	golog.Info("service: Stop requested")
-	if persistenceAllowed(serviceInstallPath) {
+	if persistenceAllowed(getServiceInstallPath()) {
 		golog.Info("service: stop ignored due to persistence configuration")
 		return nil
 	}
@@ -125,7 +142,7 @@ func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, c
 	defer cancel()
 
 	telemetry.LogSessionEvent("service started", 0, map[string]interface{}{
-		"install_path": serviceInstallPath,
+		"install_path": getServiceInstallPath(),
 	})
 
 	// Enable Session 0 mode for desktop relay
@@ -166,7 +183,7 @@ func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, c
 			changes <- c.CurrentStatus
 
 		case svc.Stop, svc.Shutdown:
-			if !persistenceAllowed(serviceInstallPath) {
+			if !persistenceAllowed(getServiceInstallPath()) {
 				telemetry.LogSessionEvent("service stopping", 0, map[string]interface{}{
 					"reason": "stop request",
 				})
@@ -529,7 +546,7 @@ func launchUIInSession(sessionID uint32) {
 
 	telemetry.LogSessionEvent("launching UI", sessionID, map[string]interface{}{
 		"attempt":      state.launchAttempts,
-		"install_path": serviceInstallPath,
+		"install_path": getServiceInstallPath(),
 	})
 
 	// Get user token for session with retry logic (handles race conditions)
@@ -597,7 +614,7 @@ func launchUIInSession(sessionID uint32) {
 	}
 
 	// Build command line
-	exePath := serviceInstallPath
+	exePath := getServiceInstallPath()
 	if exePath == "" {
 		exePath, _ = os.Executable()
 	}
@@ -892,10 +909,8 @@ func sessionEventName(eventType uint32) string {
 
 // RunAsService runs the application as a Windows service
 func RunAsService(app Application) error {
-	if serviceInstallPath == "" {
-		if exe, err := os.Executable(); err == nil {
-			serviceInstallPath = exe
-		}
+	if exe, err := os.Executable(); err == nil {
+		setServiceInstallPath(exe)
 	}
 	isService, err := svc.IsWindowsService()
 	if err != nil {
@@ -916,9 +931,7 @@ type WindowsServiceController struct {
 
 // NewServiceController creates a new Windows service controller
 func NewServiceController(execPath string) *WindowsServiceController {
-	if serviceInstallPath == "" {
-		serviceInstallPath = execPath
-	}
+	setServiceInstallPath(execPath)
 	return &WindowsServiceController{execPath: execPath}
 }
 
@@ -969,7 +982,7 @@ func (w *WindowsServiceController) Start() error {
 
 // Stop stops the service
 func (w *WindowsServiceController) Stop() error {
-	if persistenceAllowed(serviceInstallPath) {
+	if persistenceAllowed(getServiceInstallPath()) {
 		return nil
 	}
 	cfg := &service.Config{Name: ServiceName}

@@ -20,7 +20,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const CLIPBOARD_CHAR_LIMIT = 64 * 1024; // Bound clipboard payload to ~64KB
   const FILE_DROP_LIMIT = 5;
 
-  const { shareToken = null, onStatusChange, allowControl = true, controlChannel = null } = options;
+  const { shareToken = null, shareSecret = null, onStatusChange, allowControl = true, controlChannel = null } = options;
 
   const [status, setStatus] = useState('disconnected');
   const [latency, setLatency] = useState(0);
@@ -440,7 +440,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
     // Build WebSocket URL
     const path = shareToken
-      ? `api/share/desktop?token=${encodeURIComponent(shareToken)}`
+      ? `api/share/desktop?token=${encodeURIComponent(shareToken)}&secret=${encodeURIComponent(shareSecret || '')}`
       : `api/device/desktop?device=${device.id}`;
 
     const ws = new WebSocket(getBaseURL(true, path));
@@ -472,26 +472,35 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
       cleanup(false);
 
-      // Detect auth errors:
-      // - Code 1006 with very short connection = likely auth failure or server rejection
-      // - Code 4001 = explicit auth error (if server sends this)
-      const isAuthError = event.code === 4001 ||
-        (event.code === 1006 && connectionDuration < 1000);
-
-      if (isAuthError) {
-        log('error', 'Auth error detected, redirecting to login');
+      // Only treat explicit auth error code (4001) as auth failure
+      // Code 1006 is "Abnormal Closure" and happens for many reasons:
+      // device offline, not found, network issues, origin validation, etc.
+      // We should NOT redirect to login based on 1006 heuristics.
+      if (event.code === 4001) {
+        log('error', 'Explicit auth error (4001)');
         setStatus('error');
-        message.error(i18n.t('AUTH.SESSION_EXPIRED') || 'Session expired, please login again');
-        // Redirect to login after short delay
-        setTimeout(() => {
-          if (window.location.pathname !== '/login') {
-            window.location.href = '/login';
-          }
-        }, 1500);
+        if (shareToken) {
+          message.error(i18n.t('SHARE.CONNECTION_FAILED') || 'Failed to connect to shared desktop');
+        } else {
+          message.error(i18n.t('AUTH.SESSION_EXPIRED') || 'Session expired, please login again');
+          setTimeout(() => {
+            if (window.location.pathname !== '/login') {
+              window.location.href = '/login';
+            }
+          }, 1500);
+        }
         return;
       }
 
-      // For normal disconnections, attempt reconnect
+      // For share pages with quick connection failure, show specific error (no redirect)
+      if (shareToken && event.code === 1006 && connectionDuration < 500) {
+        log('warn', 'Share connection failed quickly', { duration: connectionDuration });
+        setStatus('error');
+        message.error(i18n.t('SHARE.CONNECTION_FAILED') || 'Failed to connect to shared desktop');
+        return;
+      }
+
+      // For normal disconnections (including quick 1006), attempt reconnect
       if (shouldReconnectRef.current && !event.wasClean) {
         scheduleReconnect();
       } else {
@@ -516,7 +525,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         sendControl({ act: 'DESKTOP_PING' });
       }
     }, 1000);
-  }, [device, shareToken, canvasRef, initCanvas, parseMessage, sendControl, cleanup, scheduleReconnect]);
+  }, [device, shareToken, shareSecret, canvasRef, initCanvas, parseMessage, sendControl, cleanup, scheduleReconnect]);
 
   // Public connect function
   const connect = useCallback(() => {

@@ -4,13 +4,14 @@ package terminal
 
 import (
 	"Rocket/client/common"
+	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"Rocket/utils"
 	"Rocket/utils/cmap"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"reflect"
 	"runtime"
@@ -21,6 +22,41 @@ import (
 
 	windows "golang.org/x/sys/windows"
 )
+
+// handleIO wraps a Windows handle for direct ReadFile/WriteFile operations.
+// This is required because os.NewFile() doesn't work correctly with Windows
+// anonymous pipe handles - it causes Read() to block indefinitely.
+// Based on: https://github.com/UserExistsError/conpty
+type handleIO struct {
+	handle windows.Handle
+}
+
+func (h *handleIO) Read(p []byte) (int, error) {
+	if h.handle == 0 || h.handle == windows.InvalidHandle {
+		return 0, errors.New("invalid handle")
+	}
+	var numRead uint32 = 0
+	err := windows.ReadFile(h.handle, p, &numRead, nil)
+	return int(numRead), err
+}
+
+func (h *handleIO) Write(p []byte) (int, error) {
+	if h.handle == 0 || h.handle == windows.InvalidHandle {
+		return 0, errors.New("invalid handle")
+	}
+	var numWritten uint32 = 0
+	err := windows.WriteFile(h.handle, p, &numWritten, nil)
+	return int(numWritten), err
+}
+
+func (h *handleIO) Close() error {
+	if h.handle != 0 && h.handle != windows.InvalidHandle {
+		err := windows.CloseHandle(h.handle)
+		h.handle = windows.InvalidHandle
+		return err
+	}
+	return nil
+}
 
 var (
 	kernel32                          = syscall.NewLazyDLL("kernel32.dll")
@@ -49,9 +85,9 @@ type terminal struct {
 	event      string
 	cmd        *exec.Cmd
 	procHandle windows.Handle
-	hPC        uintptr // Pseudo Console handle
-	ptyIn      *os.File
-	ptyOut     *os.File
+	hPC        uintptr    // Pseudo Console handle
+	ptyIn      *handleIO  // For writing to ConPTY (uses windows.WriteFile)
+	ptyOut     *handleIO  // For reading from ConPTY (uses windows.ReadFile)
 	stdin      io.WriteCloser
 	stdout     io.ReadCloser
 	useLegacy  bool // fallback to pipes if ConPTY not available
@@ -76,23 +112,30 @@ func init() {
 	go healthCheck()
 }
 
-func createPseudoConsole(cols, rows int16) (hPC uintptr, ptyIn, ptyOut *os.File, err error) {
-	// Create pipes for PTY
-	var hPipeInRead, hPipeInWrite syscall.Handle
-	var hPipeOutRead, hPipeOutWrite syscall.Handle
+func createPseudoConsole(cols, rows int16) (hPC uintptr, ptyIn, ptyOut *handleIO, err error) {
+	// Create pipes for PTY using Windows API
+	// Based on: https://github.com/UserExistsError/conpty
+	var hPipeInRead, hPipeInWrite windows.Handle
+	var hPipeOutRead, hPipeOutWrite windows.Handle
 
-	if err := syscall.CreatePipe(&hPipeInRead, &hPipeInWrite, nil, 0); err != nil {
-		return 0, nil, nil, err
-	}
-	if err := syscall.CreatePipe(&hPipeOutRead, &hPipeOutWrite, nil, 0); err != nil {
-		syscall.CloseHandle(hPipeInRead)
-		syscall.CloseHandle(hPipeInWrite)
+	// First pipe: for input to the pseudo console
+	// ptyIn (write end) -> hPipeInRead (ConPTY reads from here)
+	if err := windows.CreatePipe(&hPipeInRead, &hPipeInWrite, nil, 0); err != nil {
 		return 0, nil, nil, err
 	}
 
-	// Create pseudo console
+	// Second pipe: for output from the pseudo console
+	// hPipeOutWrite (ConPTY writes here) -> ptyOut (read end)
+	if err := windows.CreatePipe(&hPipeOutRead, &hPipeOutWrite, nil, 0); err != nil {
+		windows.CloseHandle(hPipeInRead)
+		windows.CloseHandle(hPipeInWrite)
+		return 0, nil, nil, err
+	}
+
+	// Create pseudo console with the pipe handles
+	// ConPTY will read input from hPipeInRead and write output to hPipeOutWrite
 	size := COORD{X: cols, Y: rows}
-	ret, _, err := procCreatePseudoConsole.Call(
+	ret, _, _ := procCreatePseudoConsole.Call(
 		uintptr(*(*int32)(unsafe.Pointer(&size))),
 		uintptr(hPipeInRead),
 		uintptr(hPipeOutWrite),
@@ -100,19 +143,22 @@ func createPseudoConsole(cols, rows int16) (hPC uintptr, ptyIn, ptyOut *os.File,
 		uintptr(unsafe.Pointer(&hPC)),
 	)
 	if ret != 0 {
-		syscall.CloseHandle(hPipeInRead)
-		syscall.CloseHandle(hPipeInWrite)
-		syscall.CloseHandle(hPipeOutRead)
-		syscall.CloseHandle(hPipeOutWrite)
+		windows.CloseHandle(hPipeInRead)
+		windows.CloseHandle(hPipeInWrite)
+		windows.CloseHandle(hPipeOutRead)
+		windows.CloseHandle(hPipeOutWrite)
 		return 0, nil, nil, errors.New("failed to create pseudo console")
 	}
 
 	// Close the handles that are now owned by the pseudo console
-	syscall.CloseHandle(hPipeInRead)
-	syscall.CloseHandle(hPipeOutWrite)
+	// ConPTY duplicates these internally, so we close our copies
+	windows.CloseHandle(hPipeInRead)
+	windows.CloseHandle(hPipeOutWrite)
 
-	ptyIn = os.NewFile(uintptr(hPipeInWrite), "ptyIn")
-	ptyOut = os.NewFile(uintptr(hPipeOutRead), "ptyOut")
+	// Return handleIO wrappers that use direct Windows ReadFile/WriteFile
+	// This is the key fix - os.NewFile() doesn't work correctly for pipe handles
+	ptyIn = &handleIO{handle: hPipeInWrite}
+	ptyOut = &handleIO{handle: hPipeOutRead}
 
 	return hPC, ptyIn, ptyOut, nil
 }
@@ -148,7 +194,28 @@ func startConPTYShell(session *terminal) error {
 }
 
 func InitTerminal(pack modules.Packet) error {
-	rawEvent, _ := hex.DecodeString(pack.Event)
+	telemetry.LogStructured("INFO", "[TERMINAL_INIT] Starting terminal initialization", map[string]interface{}{
+		"event":           pack.Event,
+		"conPTYSupported": conPTYSupported,
+	})
+
+	// Validate and decode event UUID
+	rawEvent, err := hex.DecodeString(pack.Event)
+	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Failed to decode event UUID", map[string]interface{}{
+			"event": pack.Event,
+			"error": err.Error(),
+		})
+		return fmt.Errorf("invalid event UUID: %w", err)
+	}
+	if len(rawEvent) != 16 {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Invalid event UUID length", map[string]interface{}{
+			"event":  pack.Event,
+			"length": len(rawEvent),
+		})
+		return errors.New("event UUID must be 16 bytes")
+	}
+
 	session := &terminal{
 		event:    pack.Event,
 		escape:   false,
@@ -158,6 +225,7 @@ func InitTerminal(pack modules.Packet) error {
 
 	// Try ConPTY first (Windows 10 1809+)
 	if conPTYSupported {
+		telemetry.LogStructured("INFO", "[TERMINAL_INIT] Attempting ConPTY initialization", nil)
 		hPC, ptyIn, ptyOut, err := createPseudoConsole(120, 30) // Default size
 		if err == nil {
 			session.hPC = hPC
@@ -165,7 +233,15 @@ func InitTerminal(pack modules.Packet) error {
 			session.ptyOut = ptyOut
 			session.useLegacy = false
 
+			shellCmd := getTerminal()
+			telemetry.LogStructured("INFO", "[TERMINAL_INIT] Starting shell process", map[string]interface{}{
+				"shell": shellCmd,
+			})
+
 			if err := startConPTYShell(session); err != nil {
+				telemetry.LogStructured("WARN", "[TERMINAL_INIT] ConPTY shell start failed, falling back to legacy", map[string]interface{}{
+					"error": err.Error(),
+				})
 				procClosePseudoConsole.Call(hPC)
 				ptyIn.Close()
 				ptyOut.Close()
@@ -173,30 +249,50 @@ func InitTerminal(pack modules.Packet) error {
 				session.ptyIn = nil
 				session.ptyOut = nil
 			} else {
-				terminals.Set(pack.Data[`terminal`].(string), session)
+				terminalUUID := pack.Data[`terminal`].(string)
+				terminals.Set(terminalUUID, session)
+				telemetry.LogStructured("INFO", "[TERMINAL_INIT] ConPTY initialized successfully, starting reader goroutine", map[string]interface{}{
+					"terminalUUID": terminalUUID,
+					"procHandle":   fmt.Sprintf("0x%x", session.procHandle),
+				})
 				go readConPTY(session)
 				return nil
 			}
+		} else {
+			telemetry.LogStructured("WARN", "[TERMINAL_INIT] ConPTY creation failed, falling back to legacy", map[string]interface{}{
+				"error": err.Error(),
+			})
 		}
 	}
 
 	// Fallback to legacy pipe mode
+	telemetry.LogStructured("INFO", "[TERMINAL_INIT] Using legacy pipe mode", nil)
 	session.useLegacy = true
-	cmd := exec.Command(getTerminal())
+	shellCmd := getTerminal()
+	cmd := exec.Command(shellCmd)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: true,
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Failed to create stdout pipe", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Failed to create stderr pipe", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return err
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Failed to create stdin pipe", map[string]interface{}{
+			"error": err.Error(),
+		})
 		return err
 	}
 
@@ -204,28 +300,52 @@ func InitTerminal(pack modules.Packet) error {
 	session.stdin = stdin
 	session.stdout = stdout
 
-	readSender := func(rc io.ReadCloser) {
+	readSender := func(rc io.ReadCloser, name string) {
+		telemetry.LogStructured("INFO", "[TERMINAL_READ_LEGACY] Reader goroutine started", map[string]interface{}{
+			"event":  session.event,
+			"stream": name,
+		})
 		bufSize := 1024
+		totalBytesRead := 0
 		for !session.escape {
 			buffer := make([]byte, bufSize)
-			n, err := rc.Read(buffer)
-			buffer = buffer[:n]
+			n, readErr := rc.Read(buffer)
 
-			if n > 1024 {
-				if bufSize < 32768 {
-					bufSize *= 2
+			if n > 0 {
+				totalBytesRead += n
+				buffer = buffer[:n]
+				session.lastPack = utils.Unix
+
+				var sendErr error
+				if n > 1024 {
+					if bufSize < 32768 {
+						bufSize *= 2
+					}
+					sendErr = common.WSConn.SendRawData(session.rawEvent, buffer, 21, 00)
+				} else {
+					bufSize = 1024
+					jsonData, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
+						`output`: hex.EncodeToString(buffer),
+					}})
+					sendErr = common.WSConn.SendRawData(session.rawEvent, jsonData, 21, 01)
 				}
-				common.WSConn.SendRawData(session.rawEvent, buffer, 21, 00)
-			} else {
-				bufSize = 1024
-				buffer, _ = utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
-					`output`: hex.EncodeToString(buffer),
-				}})
-				common.WSConn.SendRawData(session.rawEvent, buffer, 21, 01)
+
+				if sendErr != nil {
+					telemetry.LogStructured("ERROR", "[TERMINAL_READ_LEGACY] Failed to send output", map[string]interface{}{
+						"event":  session.event,
+						"stream": name,
+						"error":  sendErr.Error(),
+					})
+				}
 			}
 
-			session.lastPack = utils.Unix
-			if err != nil {
+			if readErr != nil {
+				telemetry.LogStructured("INFO", "[TERMINAL_READ_LEGACY] Stream closed", map[string]interface{}{
+					"event":          session.event,
+					"stream":         name,
+					"totalBytesRead": totalBytesRead,
+					"error":          readErr.Error(),
+				})
 				if !session.escape {
 					session.escape = true
 					doKillTerminal(session)
@@ -236,49 +356,122 @@ func InitTerminal(pack modules.Packet) error {
 			}
 		}
 	}
-	go readSender(stdout)
-	go readSender(stderr)
+	go readSender(stdout, "stdout")
+	go readSender(stderr, "stderr")
 
 	err = cmd.Start()
 	if err != nil {
+		telemetry.LogStructured("ERROR", "[TERMINAL_INIT] Failed to start shell", map[string]interface{}{
+			"shell": shellCmd,
+			"error": err.Error(),
+		})
 		session.escape = true
 		return err
 	}
-	terminals.Set(pack.Data[`terminal`].(string), session)
+
+	terminalUUID := pack.Data[`terminal`].(string)
+	terminals.Set(terminalUUID, session)
+	telemetry.LogStructured("INFO", "[TERMINAL_INIT] Legacy mode initialized successfully", map[string]interface{}{
+		"terminalUUID": terminalUUID,
+		"shell":        shellCmd,
+		"pid":          cmd.Process.Pid,
+	})
 	return nil
 }
 
 func readConPTY(session *terminal) {
+	telemetry.LogStructured("INFO", "[TERMINAL_READ] Reader goroutine started", map[string]interface{}{
+		"event": session.event,
+	})
+
 	bufSize := 1024
+	totalBytesRead := 0
+	readCount := 0
+
 	for !session.escape {
 		buffer := make([]byte, bufSize)
 		n, err := session.ptyOut.Read(buffer)
-		buffer = buffer[:n]
+		readCount++
 
-		if n > 1024 {
-			if bufSize < 32768 {
-				bufSize *= 2
-			}
-			common.WSConn.SendRawData(session.rawEvent, buffer, 21, 00)
-		} else {
-			bufSize = 1024
-			buffer, _ = utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
-				`output`: hex.EncodeToString(buffer),
-			}})
-			common.WSConn.SendRawData(session.rawEvent, buffer, 21, 01)
-		}
-
-		session.lastPack = utils.Unix
+		// Handle read errors first
 		if err != nil {
+			telemetry.LogStructured("WARN", "[TERMINAL_READ] Read error, terminating session", map[string]interface{}{
+				"event":          session.event,
+				"error":          err.Error(),
+				"totalBytesRead": totalBytesRead,
+				"readCount":      readCount,
+			})
 			if !session.escape {
 				session.escape = true
 				doKillTerminal(session)
 			}
 			data, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_QUIT`})
-			common.WSConn.SendRawData(session.rawEvent, data, 21, 01)
+			if sendErr := common.WSConn.SendRawData(session.rawEvent, data, 21, 01); sendErr != nil {
+				telemetry.LogStructured("ERROR", "[TERMINAL_READ] Failed to send QUIT packet", map[string]interface{}{
+					"error": sendErr.Error(),
+				})
+			}
 			break
 		}
+
+		// Skip if no data was read
+		if n == 0 {
+			continue
+		}
+
+		totalBytesRead += n
+		buffer = buffer[:n]
+		session.lastPack = utils.Unix
+
+		// Log first successful read (helps debugging)
+		if readCount == 1 || (readCount <= 5 && totalBytesRead < 1000) {
+			telemetry.LogStructured("INFO", "[TERMINAL_READ] Data received from ConPTY", map[string]interface{}{
+				"event":     session.event,
+				"bytes":     n,
+				"readCount": readCount,
+				"preview":   truncateForLog(buffer, 50),
+			})
+		}
+
+		// Send output to server
+		var sendErr error
+		if n > 1024 {
+			// Large output: send as raw binary stream
+			if bufSize < 32768 {
+				bufSize *= 2
+			}
+			sendErr = common.WSConn.SendRawData(session.rawEvent, buffer, 21, 00)
+		} else {
+			// Normal output: send as JSON
+			bufSize = 1024
+			jsonData, _ := utils.JSON.Marshal(modules.Packet{Act: `TERMINAL_OUTPUT`, Data: map[string]any{
+				`output`: hex.EncodeToString(buffer),
+			}})
+			sendErr = common.WSConn.SendRawData(session.rawEvent, jsonData, 21, 01)
+		}
+
+		if sendErr != nil {
+			telemetry.LogStructured("ERROR", "[TERMINAL_READ] Failed to send terminal output", map[string]interface{}{
+				"event": session.event,
+				"error": sendErr.Error(),
+				"bytes": n,
+			})
+		}
 	}
+
+	telemetry.LogStructured("INFO", "[TERMINAL_READ] Reader goroutine exiting", map[string]interface{}{
+		"event":          session.event,
+		"totalBytesRead": totalBytesRead,
+		"readCount":      readCount,
+	})
+}
+
+// truncateForLog truncates a byte slice for logging purposes
+func truncateForLog(data []byte, maxLen int) string {
+	if len(data) <= maxLen {
+		return string(data)
+	}
+	return string(data[:maxLen]) + "..."
 }
 
 func InputRawTerminal(input []byte, uuid string) {
@@ -300,25 +493,30 @@ func InputTerminal(pack modules.Packet) {
 	var err error
 	var uuid string
 	var input []byte
-	var session *terminal
 
-	if val, ok := pack.GetData(`input`, reflect.String); !ok {
+	// Get and decode input
+	inputVal, ok := pack.GetData(`input`, reflect.String)
+	if !ok {
 		return
-	} else {
-		if input, err = hex.DecodeString(val.(string)); err != nil {
-			return
-		}
 	}
-	if val, ok := pack.GetData(`terminal`, reflect.String); !ok {
+	if input, err = hex.DecodeString(inputVal.(string)); err != nil {
 		return
-	} else {
-		uuid = val.(string)
-		if val, ok = terminals.Get(uuid); ok {
-			session = val.(*terminal)
-		} else {
-			return
-		}
 	}
+
+	// Get terminal UUID
+	uuidVal, ok := pack.GetData(`terminal`, reflect.String)
+	if !ok {
+		return
+	}
+	uuid = uuidVal.(string)
+
+	// Look up session (cmap.Get returns (*terminal, bool) directly)
+	session, ok := terminals.Get(uuid)
+	if !ok {
+		return
+	}
+
+	// Write input to terminal
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	if session.useLegacy {
@@ -330,29 +528,31 @@ func InputTerminal(pack modules.Packet) {
 }
 
 func ResizeTerminal(pack modules.Packet) error {
-	var uuid string
-	var cols, rows uint16
-	var session *terminal
-
-	if val, ok := pack.GetData(`cols`, reflect.Float64); !ok {
+	// Get cols
+	colsVal, ok := pack.GetData(`cols`, reflect.Float64)
+	if !ok {
 		return errors.New("missing cols parameter")
-	} else {
-		cols = uint16(val.(float64))
 	}
-	if val, ok := pack.GetData(`rows`, reflect.Float64); !ok {
+	cols := uint16(colsVal.(float64))
+
+	// Get rows
+	rowsVal, ok := pack.GetData(`rows`, reflect.Float64)
+	if !ok {
 		return errors.New("missing rows parameter")
-	} else {
-		rows = uint16(val.(float64))
 	}
-	if val, ok := pack.GetData(`terminal`, reflect.String); !ok {
+	rows := uint16(rowsVal.(float64))
+
+	// Get terminal UUID
+	uuidVal, ok := pack.GetData(`terminal`, reflect.String)
+	if !ok {
 		return errors.New("missing terminal parameter")
-	} else {
-		uuid = val.(string)
-		if val, ok = terminals.Get(uuid); ok {
-			session = val.(*terminal)
-		} else {
-			return errors.New("terminal session not found")
-		}
+	}
+	uuid := uuidVal.(string)
+
+	// Look up session
+	session, ok := terminals.Get(uuid)
+	if !ok {
+		return errors.New("terminal session not found")
 	}
 
 	session.mu.Lock()

@@ -13,6 +13,18 @@ function SharePage() {
 	const [share, setShare] = useState(null);
 	const [error, setError] = useState('');
 
+	const t = (key, fallback) => {
+		const value = i18n.t(key);
+		if (value && value !== key) {
+			return value;
+		}
+		if (fallback !== undefined) {
+			return fallback;
+		}
+		const parts = key.split('.');
+		return parts[parts.length - 1] || key;
+	};
+
 	useEffect(() => {
 		const params = new URLSearchParams(location.search);
 		const t = params.get('token') || '';
@@ -51,8 +63,8 @@ function SharePage() {
 		return (
 			<Result
 				status='warning'
-				title={i18n.t('SHARE.NO_TOKEN')}
-				extra={<Button type='primary' onClick={() => validateToken(token)}>{i18n.t('COMMON.RETRY')}</Button>}
+				title={t('SHARE.NO_TOKEN', 'No share token provided')}
+				extra={<Button type='primary' onClick={() => validateToken(token)}>{t('COMMON.RETRY', 'Retry')}</Button>}
 			/>
 		);
 	}
@@ -61,30 +73,30 @@ function SharePage() {
 		return (
 			<Result
 				status='error'
-				title={error || i18n.t('SHARE.INVALID_OR_EXPIRED')}
-				extra={<Button type='primary' onClick={() => validateToken(token)}>{i18n.t('COMMON.RETRY')}</Button>}
+				title={error || t('SHARE.INVALID_OR_EXPIRED', 'Invalid or expired share link')}
+				extra={<Button type='primary' onClick={() => validateToken(token)}>{t('COMMON.RETRY', 'Retry')}</Button>}
 			/>
 		);
 	}
 
 	if (status === 'validating') {
-		return <Spin style={{marginTop: 120}} tip={i18n.t('SHARE.VALIDATING')} />;
+		return <Spin style={{marginTop: 120}} tip={t('SHARE.VALIDATING', 'Validating share link...')} />;
 	}
 
 	return (
 		<div style={{padding: 24}}>
-			<Card title={i18n.t('COMMON.SHARE') + ' / ' + (share?.id || '')} style={{marginBottom: 16}}>
+			<Card title={`${t('COMMON.SHARE', 'Share')} / ${(share?.id || '')}`} style={{marginBottom: 16}}>
 				<Paragraph>
-					<Text strong>{i18n.t('COMMON.DEVICE')}:</Text> {share?.device}
+					<Text strong>{t('COMMON.DEVICE', 'Device')}:</Text> {share?.device}
 				</Paragraph>
 				<Paragraph>
 					<Text strong>Desktop:</Text> {share?.desktop || '-'}
 				</Paragraph>
 				<Paragraph>
-					<Text strong>{i18n.t('COMMON.EXPIRES_AT')}:</Text> {(() => {
+					<Text strong>{t('COMMON.EXPIRES_AT', 'Expires At')}:</Text> {(() => {
 						const exp = share?.expiresAt ? new Date(share.expiresAt) : null;
 						if (!exp || Number.isNaN(exp.getTime()) || exp.getFullYear() <= 1) {
-							return i18n.t('SHARE.NEVER') || 'Never';
+							return t('SHARE.NEVER', 'Never');
 						}
 						return exp.toLocaleString();
 					})()}
@@ -95,8 +107,8 @@ function SharePage() {
 				<Alert
 					showIcon
 					type={share?.viewOnly === false ? 'success' : 'info'}
-					message={share?.viewOnly === false ? (i18n.t('COMMON.CONTROL') || 'Control enabled') : (i18n.t('COMMON.READ_ONLY') || 'Read-only view')}
-					description={share?.viewOnly === false ? i18n.t('SHARE.ACCESS_GRANTED') || 'You can control this desktop.' : i18n.t('SHARE.VALIDATION_FAILED') || 'Input is disabled for guests.'}
+					message={share?.viewOnly === false ? t('COMMON.CONTROL', 'Control enabled') : t('COMMON.READ_ONLY', 'Read-only view')}
+					description={share?.viewOnly === false ? t('SHARE.ACCESS_GRANTED', 'You can control this desktop.') : t('SHARE.VALIDATION_FAILED', 'Input is disabled for guests.')}
 				/>
 			</Card>
 			<Desktop
@@ -105,6 +117,7 @@ function SharePage() {
 				onCancel={() => {}}
 				allowControl={share?.viewOnly === false}
 				shareToken={token}
+				shareSecret={share?.secret}
 			/>
 		</div>
 	);
