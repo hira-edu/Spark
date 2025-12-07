@@ -5,9 +5,13 @@ import i18n from '../../../../locale/locale';
 
 const MAGIC_PREFIX = [34, 22, 19, 17];
 const SERVICE_IDS = [20, 21];
-const BASE_HEADER_LENGTH = MAGIC_PREFIX.length + 2; // magic + service + op
+const SERVICE_OP_LENGTH = 2; // service + op bytes
+const LENGTH_FIELD_LENGTH = 2; // uint16 payload length (only for JSON packets)
+const JSON_BODY_OFFSET = MAGIC_PREFIX.length + SERVICE_OP_LENGTH + LENGTH_FIELD_LENGTH; // 8 bytes - for op=3 JSON
 const EVENT_ID_LENGTH = 16;
-const FRAME_HEADER_LENGTH = BASE_HEADER_LENGTH + EVENT_ID_LENGTH;
+// Binary frame header: magic(4) + service(1) + op(1) + eventID(16) = 22 bytes
+// Note: LENGTH_FIELD_LENGTH is NOT included in binary packets - only JSON (op=3) uses it
+const FRAME_HEADER_LENGTH = MAGIC_PREFIX.length + SERVICE_OP_LENGTH + EVENT_ID_LENGTH; // 22 bytes
 
 /**
  * useDesktopStream - Hook for managing WebSocket connection to remote desktop
@@ -45,6 +49,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const wsRef = useRef(null);
   const ctxRef = useRef(null);
   const statsRef = useRef({ frames: 0, bytes: 0 });
+  const frameSeqRef = useRef(0);
   const tickerRef = useRef(null);
   const pingTimeRef = useRef(0);
   const controlChannelRef = useRef(controlChannel);
@@ -77,6 +82,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       }
     }
     statsRef.current = { frames: 0, bytes: 0 };
+    frameSeqRef.current = 0;
     pingTimeRef.current = 0;
     setFps(0);
     setBandwidth(0);
@@ -118,11 +124,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   }, [canvasRef]);
 
   // Render a single image block (raw RGBA or compressed)
-  const updateImage = useCallback((ab, it, dx, dy, bw, bh, ctx) => {
+  const updateImage = useCallback((ab, it, dx, dy, bw, bh, ctx, frameSeq) => {
     if (!ctx || bw === 0 || bh === 0) return;
 
     if (it === 0) { // Raw RGBA
       try {
+        if (frameSeq < frameSeqRef.current) {
+          return;
+        }
         ctx.putImageData(
           new ImageData(new Uint8ClampedArray(ab), bw, bh),
           dx, dy, 0, 0, bw, bh
@@ -138,9 +147,18 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       premultiplyAlpha: 'none',
       colorSpaceConversion: 'none'
     }).then((ib) => {
+      if (frameSeq < frameSeqRef.current) {
+        if (typeof ib.close === 'function') {
+          ib.close();
+        }
+        return;
+      }
       ctx.drawImage(ib, 0, 0, bw, bh, dx, dy, bw, bh);
+      if (typeof ib.close === 'function') {
+        ib.close();
+      }
     }).catch(() => {});
-  }, []);
+  }, [log]);
 
   const handleResolution = useCallback((view, payloadOffset) => {
     const canvas = canvasRef.current;
@@ -163,7 +181,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     setResolution({ width, height });
   }, [canvasRef]);
 
-  const renderBlocks = useCallback((buffer, payloadOffset) => {
+  const renderBlocks = useCallback((buffer, payloadOffset, frameSeq) => {
     const canvas = canvasRef.current;
     const ctx = ctxRef.current;
     if (!canvas || !ctx) return;
@@ -186,7 +204,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         break;
       }
 
-      updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, ctx);
+      updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, ctx, frameSeq);
       offset = dataEnd;
     }
   }, [canvasRef, updateImage]);
@@ -214,6 +232,33 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       if (pingTimeRef.current > 0) {
         setLatency(Date.now() - pingTimeRef.current);
         pingTimeRef.current = 0;
+      }
+      return;
+    }
+
+    // Handle initial desktop setup - CRITICAL: resize canvas before first frame arrives
+    if (data?.act === 'DESKTOP_INIT') {
+      const canvas = canvasRef.current;
+      const ctx = ctxRef.current;
+      const initData = data.data || {};
+      const width = initData.width || 0;
+      const height = initData.height || 0;
+
+      log('info', 'DESKTOP_INIT received', { width, height, monitors: initData.monitors?.length || 0 });
+
+      if (canvas && ctx && width > 0 && height > 0) {
+        if (canvas.width !== width || canvas.height !== height) {
+          canvas.width = width;
+          canvas.height = height;
+          ctx.imageSmoothingEnabled = false;
+          log('info', 'canvas resized from DESKTOP_INIT', { width, height });
+        }
+        setResolution({ width, height });
+      }
+
+      // Also update monitors if provided
+      if (initData.monitors && Array.isArray(initData.monitors)) {
+        setMonitors(initData.monitors);
       }
       return;
     }
@@ -268,7 +313,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     if (!buffer) return;
 
     const bytes = new Uint8Array(buffer);
-    if (bytes.length < BASE_HEADER_LENGTH) return;
+    if (bytes.length < JSON_BODY_OFFSET) return;
 
     // Validate magic prefix
     for (let i = 0; i < MAGIC_PREFIX.length; i++) {
@@ -278,12 +323,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     if (!SERVICE_IDS.includes(service)) return;
 
     const op = bytes[5];
-    const header = bytes.slice(0, BASE_HEADER_LENGTH);
-
     // Handle JSON packets (no event id prefix)
     if (op === 3) {
       statsRef.current.bytes += bytes.byteLength;
-      handleJSON(bytes.slice(BASE_HEADER_LENGTH));
+      handleJSON(bytes.slice(JSON_BODY_OFFSET));
       return;
     }
 
@@ -304,13 +347,16 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     }
 
     // Frame data: op 0 = first chunk, op 1 = continuation
+    let frameSeq = frameSeqRef.current;
     if (op === 0) {
+      frameSeqRef.current += 1;
+      frameSeq = frameSeqRef.current;
       statsRef.current.frames += 1;
     }
     statsRef.current.bytes += bytes.byteLength;
-    log('debug', 'frame received', { op, size: bytes.byteLength });
-    renderBlocks(bytes.buffer, payloadOffset);
-  }, [BASE_HEADER_LENGTH, FRAME_HEADER_LENGTH, MAGIC_PREFIX, SERVICE_IDS, handleJSON, handleResolution, renderBlocks]);
+    log('debug', 'frame received', { op, size: bytes.byteLength, frameSeq });
+    renderBlocks(bytes.buffer, payloadOffset, frameSeq);
+  }, [JSON_BODY_OFFSET, FRAME_HEADER_LENGTH, MAGIC_PREFIX, SERVICE_IDS, handleJSON, handleResolution, renderBlocks]);
 
   // Normalize a single input event to match the protocol schema
   const normalizeInputEvent = useCallback((event) => {
