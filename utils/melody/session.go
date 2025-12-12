@@ -22,15 +22,33 @@ type Session struct {
 }
 
 func (s *Session) writeMessage(message *envelope) {
-	if s.closed() {
+	// Hold a read lock while interacting with the output channel so we can't race
+	// with close() (which closes the channel under a write lock).
+	s.rwmutex.RLock()
+	if !s.open {
+		s.rwmutex.RUnlock()
 		s.melody.errorHandler(s, errors.New("tried to write to closed a session"))
 		return
 	}
 
 	select {
 	case s.output <- message:
+		s.rwmutex.RUnlock()
 	default:
-		s.melody.errorHandler(s, errors.New("session message buffer is full"))
+		// Backpressure: preserve the newest message by dropping one queued message.
+		// This is preferable for real-time streams (desktop/audio/webcam) where the
+		// latest state matters more than perfect delivery of older frames.
+		select {
+		case <-s.output:
+		default:
+		}
+		select {
+		case s.output <- message:
+			s.rwmutex.RUnlock()
+		default:
+			s.rwmutex.RUnlock()
+			s.melody.errorHandler(s, errors.New("session message buffer is full"))
+		}
 	}
 }
 

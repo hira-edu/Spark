@@ -93,6 +93,16 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Ref to hold sendControl function for use in deferred callbacks
   const sendControlRef = useRef(null);
   const lastShotRequestAtRef = useRef(0);
+  // Track approximate keyframe coverage after a DESKTOP_SHOT request.
+  // Some agents (or lossy transport) can deliver incomplete tiles; this enables
+  // bounded retries to recover a full screen.
+  const keyframeCoverageRef = useRef({
+    active: false,
+    requestedAt: 0,
+    attempt: 0,
+    seenArea: 0,
+    seenKeys: new Set(),
+  });
   const tickerRef = useRef(null);
   const pingTimersRef = useRef({ server: 0, device: 0 }); // Track server vs device RTT
   const controlChannelRef = useRef(controlChannel);
@@ -142,6 +152,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     pendingFramesRef.current = [];
     // Clear event-to-frame mapping to prevent stale data on reconnect
     eventFrameMapRef.current.clear();
+    keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, seenKeys: new Set() };
     // Reset message processing chain to avoid holding old closures/data
     messageQueueRef.current = Promise.resolve();
     setFps(0);
@@ -185,6 +196,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
   const requestFullFrame = useCallback((reason = '') => {
     if (!sendControlRef.current) return;
+    const now = Date.now();
+    const prev = keyframeCoverageRef.current || { requestedAt: 0, attempt: 0 };
+    const nextAttempt = prev.requestedAt > 0 && now - prev.requestedAt < 15000 ? (prev.attempt || 0) + 1 : 1;
+    keyframeCoverageRef.current = { active: true, requestedAt: now, attempt: nextAttempt, seenArea: 0, seenKeys: new Set() };
     incrementShotCounter(reason);
     sendControlRef.current({ act: 'DESKTOP_SHOT' });
   }, [incrementShotCounter]);
@@ -318,7 +333,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
       // Update version and render
       blockVersionRef.current.set(posKey, capturedSeq);
-      ctx.drawImage(ib, dx, dy);
+      // Always scale to the declared block size; some agents may encode blocks at
+      // a different intrinsic size (e.g., adaptive downscale) while keeping the
+      // destination rect in the header.
+      ctx.drawImage(ib, 0, 0, ib.width || bw, ib.height || bh, dx, dy, bw, bh);
       blockStatsRef.current.rendered++;
 
       if (typeof ib.close === 'function') {
@@ -349,6 +367,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     let offset = payloadOffset;
     let blockCount = 0;
     let parseErrors = 0;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = 0;
+    let maxY = 0;
 
     while (offset + 12 <= view.byteLength) {
       const bl = view.getUint16(offset + 0, false); // body length
@@ -377,10 +399,41 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         });
       }
 
+      if (dx < minX) minX = dx;
+      if (dy < minY) minY = dy;
+      if (dx + bw > maxX) maxX = dx + bw;
+      if (dy + bh > maxY) maxY = dy + bh;
+
+      // Track best-effort coverage after an explicit screenshot request.
+      const coverage = keyframeCoverageRef.current;
+      if (coverage?.active) {
+        const key = `${dx},${dy},${bw},${bh}`;
+        if (!coverage.seenKeys.has(key)) {
+          coverage.seenKeys.add(key);
+          coverage.seenArea += bw * bh;
+        }
+      }
+
       // Pass chunk frame sequence for versioned block tracking
       updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, ctx, frameSeq);
       offset = dataEnd;
       blockCount++;
+    }
+
+    const canvasArea = canvas.width * canvas.height;
+    const coverage = keyframeCoverageRef.current;
+    const coverageRatio = coverage?.active && canvasArea > 0 ? Math.min(1, coverage.seenArea / canvasArea) : null;
+
+    if (coverage?.active && coverageRatio !== null) {
+      const now = Date.now();
+      const elapsed = now - (coverage.requestedAt || now);
+      // If a shot doesn't fill most of the screen quickly, retry a few times.
+      if (elapsed > 3000 && coverageRatio < 0.5 && (coverage.attempt || 0) < 3) {
+        log('warn', 'low keyframe coverage; retrying DESKTOP_SHOT', { coverageRatio, elapsedMs: elapsed, attempt: coverage.attempt });
+        requestFullFrame('coverage_retry');
+      } else if (coverageRatio >= 0.95) {
+        keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, seenKeys: new Set() };
+      }
     }
 
     // Log block counts periodically for first frame diagnostics
@@ -391,10 +444,15 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         frameSeq,
         canvasW: canvas.width,
         canvasH: canvas.height,
+        minX: Number.isFinite(minX) ? minX : null,
+        minY: Number.isFinite(minY) ? minY : null,
+        maxX,
+        maxY,
+        coverageRatio,
         version: STREAM_VERSION
       });
     }
-  }, [canvasRef, updateImage, log]);
+  }, [canvasRef, updateImage, log, requestFullFrame]);
 
   // Replay any frames that arrived before we knew the resolution.
   const flushPendingFrames = useCallback(() => {
@@ -661,7 +719,57 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       return;
     }
 
-    const headerLen = wireHeaderLengthRef.current || FRAME_HEADER_LENGTH;
+    const hasPlausibleV2Meta = () => {
+      if (bytes.length < FRAME_HEADER_LENGTH) return false;
+      const chunkIndex = view.getUint16(LEGACY_FRAME_HEADER_LENGTH + 4, false);
+      const chunkTotal = view.getUint16(LEGACY_FRAME_HEADER_LENGTH + 6, false);
+      if (chunkTotal === 0 || chunkTotal > 4096) return false;
+      if (chunkIndex >= chunkTotal) return false;
+      return true;
+    };
+
+    const isPlausibleBlockHeader = (candidateOffset) => {
+      if (bytes.length < candidateOffset + 12) return false;
+      const bodyLen = view.getUint16(candidateOffset, false);
+      const imageType = view.getUint16(candidateOffset + 2, false);
+      const dx = view.getUint16(candidateOffset + 4, false);
+      const dy = view.getUint16(candidateOffset + 6, false);
+      const bw = view.getUint16(candidateOffset + 8, false);
+      const bh = view.getUint16(candidateOffset + 10, false);
+
+      if (bodyLen < 10) return false;
+      if (candidateOffset + 2 + bodyLen > bytes.length) return false;
+      // Current browser decoder supports image codecs (raw/jpeg/webp/avif/png); reject obviously invalid values.
+      if (imageType > 16) return false;
+      if (bw === 0 || bh === 0) return false;
+      if (bw > 8192 || bh > 8192) return false;
+      if (dx > 32768 || dy > 32768) return false;
+      return true;
+    };
+
+    let headerLen = wireHeaderLengthRef.current || FRAME_HEADER_LENGTH;
+
+    // Detect header length from frame chunks too; older agents may never emit op=2.
+    // This prevents misaligned block parsing (black screen / partial tiles).
+    if (op === 0 || op === 1) {
+      const v2Candidate = bytes.length >= FRAME_HEADER_LENGTH && hasPlausibleV2Meta() && isPlausibleBlockHeader(FRAME_HEADER_LENGTH);
+      const legacyCandidate = isPlausibleBlockHeader(LEGACY_FRAME_HEADER_LENGTH);
+
+      if (v2Candidate && !legacyCandidate) {
+        headerLen = FRAME_HEADER_LENGTH;
+      } else if (legacyCandidate && !v2Candidate) {
+        headerLen = LEGACY_FRAME_HEADER_LENGTH;
+      } else if (v2Candidate) {
+        headerLen = FRAME_HEADER_LENGTH;
+      } else if (legacyCandidate) {
+        headerLen = LEGACY_FRAME_HEADER_LENGTH;
+      }
+
+      if (wireHeaderLengthRef.current !== headerLen) {
+        wireHeaderLengthRef.current = headerLen;
+        log('info', 'desktop protocol header detected (frame)', { headerLen });
+      }
+    }
     if (bytes.length < headerLen) return;
 
     // Parse frames directly (no encryption)
