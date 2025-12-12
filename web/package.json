@@ -34,6 +34,7 @@
 		"xterm-addon-web-links": "^0.7.0"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.40.0",
 		"antd-dayjs-webpack-plugin": "^1.0.6",
 		"clean-webpack-plugin": "^4.0.0",
 		"compression-webpack-plugin": "^10.0.0",

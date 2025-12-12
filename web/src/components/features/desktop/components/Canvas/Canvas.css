@@ -12,9 +12,20 @@
 
 /* Canvas */
 .desktop-canvas {
+  /* NOTE: object-fit does NOT work on canvas elements!
+   * Canvas scaling is handled by CSS max-width/max-height constraints.
+   * The browser will scale the canvas drawing buffer to fit these constraints.
+   * Input coordinate translation accounts for this scaling in useInputCapture.
+   */
   max-width: 100%;
   max-height: 100%;
-  object-fit: contain;
+  /* Ensure the canvas maintains its aspect ratio by not stretching in flexbox */
+  flex-shrink: 0;
+  /* Use nearest-neighbor for crisp pixels when upscaling (especially for text) */
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
   cursor: none !important; /* Hide local cursor - remote cursor will be rendered as overlay */
   outline: none;
 }

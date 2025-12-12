@@ -1,10 +1,14 @@
-import React, { useEffect, useRef, forwardRef, useImperativeHandle } from 'react';
+import React, { useEffect, useRef, forwardRef, useImperativeHandle, useCallback } from 'react';
 import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import { WebLinksAddon } from 'xterm-addon-web-links';
 import debounce from 'lodash/debounce';
 import 'xterm/css/xterm.css';
 import './Terminal.css';
+
+// Write chunk size tuned to keep the xterm.js WriteBuffer below its 50MB safety watermark.
+// This enforces application-level flow control instead of letting writes accumulate unbounded.
+const WRITE_CHUNK_SIZE = 16 * 1024; // 16KB chunks balance throughput and GC pressure
 
 // Theme definitions
 const THEMES = {
@@ -138,15 +142,58 @@ const XTermWrapper = forwardRef(({
   const termRef = useRef(null);
   const fitAddonRef = useRef(null);
   const dataListenerRef = useRef(null);
+  const writeQueueRef = useRef([]);
+  const isWritingRef = useRef(false);
+  const pendingBytesRef = useRef(0);
+
+  const flushWriteQueue = useCallback(() => {
+    const term = termRef.current;
+    if (!term || isWritingRef.current) {
+      return;
+    }
+    const chunk = writeQueueRef.current.shift();
+    if (typeof chunk !== 'string' || chunk.length === 0) {
+      return;
+    }
+
+    isWritingRef.current = true;
+    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - chunk.length);
+    term.write(chunk, () => {
+      isWritingRef.current = false;
+      flushWriteQueue();
+    });
+  }, []);
+
+  const enqueueWrite = useCallback((data) => {
+    if (!data) {
+      return;
+    }
+    const normalized = typeof data === 'string' ? data : String(data);
+    for (let offset = 0; offset < normalized.length; offset += WRITE_CHUNK_SIZE) {
+      const chunk = normalized.slice(offset, offset + WRITE_CHUNK_SIZE);
+      if (chunk.length > 0) {
+        writeQueueRef.current.push(chunk);
+        pendingBytesRef.current += chunk.length;
+      }
+    }
+    if (!isWritingRef.current) {
+      flushWriteQueue();
+    }
+  }, [flushWriteQueue]);
 
   // Expose terminal methods to parent
   useImperativeHandle(ref, () => ({
-    write: (data) => termRef.current?.write(data),
-    clear: () => termRef.current?.clear(),
+    write: (data) => enqueueWrite(data),
+    clear: () => {
+      writeQueueRef.current = [];
+      pendingBytesRef.current = 0;
+      isWritingRef.current = false;
+      termRef.current?.clear();
+    },
     focus: () => termRef.current?.focus(),
     fit: () => fitAddonRef.current?.fit(),
     getTerminal: () => termRef.current,
-  }));
+  }), [enqueueWrite]);
 
   // Initialize terminal
   useEffect(() => {
@@ -208,6 +255,9 @@ const XTermWrapper = forwardRef(({
       webLinksAddon.dispose();
       fitAddon.dispose();
       term.dispose();
+      writeQueueRef.current = [];
+      pendingBytesRef.current = 0;
+      isWritingRef.current = false;
       termRef.current = null;
       fitAddonRef.current = null;
     };

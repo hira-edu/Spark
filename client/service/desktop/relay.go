@@ -388,7 +388,15 @@ func (r *Relay) sendHelloLocked() {
 		"role":         "service",
 		"ts":           time.Now().Unix(),
 	})
-	_ = r.client.Send(&ipc.Message{Type: ipc.MsgTypeHello, Payload: payload})
+	if err := r.client.Send(&ipc.Message{Type: ipc.MsgTypeHello, Payload: payload}); err != nil {
+		telemetry.LogStructured("WARN", "Relay failed to send HELLO", map[string]interface{}{
+			"session_id": r.sessionID,
+			"error":      err.Error(),
+		})
+		// Mark connection as potentially degraded
+		r.connected = false
+		return
+	}
 	r.helloSent = true
 }
 
@@ -401,7 +409,14 @@ func (r *Relay) sendStateLocked(wsConnected bool) {
 		"ws_connected": wsConnected,
 		"ts":           time.Now().Unix(),
 	})
-	_ = r.client.Send(&ipc.Message{Type: ipc.MsgTypeState, Payload: payload})
+	if err := r.client.Send(&ipc.Message{Type: ipc.MsgTypeState, Payload: payload}); err != nil {
+		telemetry.LogStructured("WARN", "Relay failed to send state update", map[string]interface{}{
+			"session_id":   r.sessionID,
+			"ws_connected": wsConnected,
+			"error":        err.Error(),
+		})
+		// Don't mark as disconnected for state updates - they're less critical
+	}
 }
 
 // Close closes the relay connection

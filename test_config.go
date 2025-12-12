@@ -18,7 +18,7 @@ import (
 const (
 	TrailerMagic      = "SPARKCFG"
 	TrailerFooterSize = 20
-	ConfigBufferSize  = 384
+	ConfigBufferSize  = 2048
 )
 
 type trailerFooter struct {

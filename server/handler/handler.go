@@ -9,12 +9,14 @@ import (
 	"Rocket/server/handler/generate"
 	"Rocket/server/handler/longpoll"
 	"Rocket/server/handler/process"
+	"Rocket/server/handler/rendezvous"
 	"Rocket/server/handler/screenshot"
 	"Rocket/server/handler/share"
 	"Rocket/server/handler/terminal"
 	"Rocket/server/handler/utility"
 	"Rocket/server/handler/webcam"
 	"Rocket/server/handler/webrtc"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -30,13 +32,17 @@ func InitRouter(ctx *gin.RouterGroup) {
 
 	ctx.Any(`/bridge/push`, bridge.BridgePush)
 	ctx.Any(`/bridge/pull`, bridge.BridgePull)
-	ctx.Any(`/client/update`, utility.CheckUpdate) // Client, for update.
+	ctx.Any(`/client/update`, utility.CheckUpdate)    // Client, for update.
 	ctx.POST(`/client/logs/upload`, UploadClientLogs) // Client log streaming (uses secret auth)
 
 	// Public guest access endpoints (no auth required)
 	ctx.GET(`/share/validate`, share.ValidateShareToken)
 	ctx.GET(`/share/ice`, share.GetGuestICEConfig)
 	ctx.Any(`/share/desktop`, share.InitGuestDesktop)
+
+	// Device-authenticated rendezvous routes
+	deviceGroup := ctx.Group(`/`, rendezvous.DeviceAuthMiddleware())
+	rendezvous.RegisterDeviceRoutes(deviceGroup)
 
 	group := ctx.Group(`/`, AuthHandler)
 	{
@@ -67,6 +73,7 @@ func InitRouter(ctx *gin.RouterGroup) {
 		group.POST(`/device/webrtc/answer`, webrtc.Answer)
 		group.POST(`/device/webrtc/ice`, webrtc.ICE)
 		group.GET(`/device/webrtc/config`, webrtc.Config)
+		group.GET(`/device/desktop/metrics`, desktop.GetDesktopMetrics)
 
 		// Share management endpoints (auth required)
 		group.POST(`/share/create`, share.CreateShare)
@@ -79,6 +86,9 @@ func InitRouter(ctx *gin.RouterGroup) {
 
 		// Client logs endpoints (auth required)
 		group.GET(`/client/logs`, GetClientLogs)
+
+		// Rendezvous (P2P) admin endpoints
+		rendezvous.RegisterAdminRoutes(group)
 	}
 }
 

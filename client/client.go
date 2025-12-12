@@ -4,6 +4,7 @@ import (
 	"Rocket/client/config"
 	"Rocket/client/core"
 	"Rocket/client/lifecycle"
+	"Rocket/client/service/desktop"
 	"Rocket/client/telemetry"
 	"Rocket/utils"
 	"context"
@@ -64,6 +65,10 @@ func init() {
 		config.Config.Path = config.Config.Path[:len(config.Config.Path)-1]
 	}
 	golog.Infof("config loaded host=%s port=%d secure=%v path=%s", config.Config.Host, config.Config.Port, config.Config.Secure, config.Config.Path)
+
+	// Apply capture defaults (mode/fallback order/pre-DWM flag) before the desktop
+	// service spins up so telemetry + runtime overrides start from the right state.
+	desktop.ApplyCaptureConfig(config.Config.Capture)
 }
 
 func main() {

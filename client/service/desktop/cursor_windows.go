@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"hash/crc32"
 	"image"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -164,10 +165,15 @@ func cursorCaptureLoop(rawEvent []byte, state *cursorSessionState) {
 		return
 	}
 
+	// Lock OS thread for Win32 API thread safety (same pattern as main worker)
+	// Some GDI/User32 calls have thread affinity requirements
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	ticker := time.NewTicker(time.Second / 30) // 30 Hz
 	defer ticker.Stop()
 
-	telemetry.LogStructured("INFO", "cursor: capture loop started", nil)
+	telemetry.LogStructured("INFO", "cursor: capture loop started (thread locked)", nil)
 
 	for state.active.Load() {
 		<-ticker.C

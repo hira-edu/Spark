@@ -24,14 +24,17 @@ import (
 )
 
 type session struct {
-	lastPack  int64 // atomic
-	rawEvent  []byte
-	event     string
-	escape    atomic.Bool
-	channel   chan message
-	closeOnce sync.Once
-	lock      *sync.Mutex
-	rtc       *rtcSession
+	lastPack         int64 // atomic
+	rawEvent         []byte
+	event            string
+	escape           atomic.Bool
+	channel          chan message
+	closeOnce        sync.Once
+	metricsStartOnce sync.Once
+	metricsStopOnce  sync.Once
+	metricsStop      chan struct{}
+	lock             *sync.Mutex
+	rtc              *rtcSession
 	// Per-session control flag (view-only support)
 	allowControl atomic.Bool
 
@@ -44,9 +47,11 @@ type session struct {
 	cursorState *cursorSessionState
 }
 type message struct {
-	t     int
-	info  string
-	frame *[]*[]byte
+	t        int
+	info     string
+	frame    *[]*[]byte
+	keyframe bool
+	frameSeq uint32
 }
 
 // frame packet format:
@@ -77,10 +82,11 @@ const (
 
 // Screen capture settings
 const (
-	fpsDefault   = 30 // Default frames per second (increased from 24 for smoother experience)
-	blockSize    = 96 // Pixel block size for delta encoding
-	frameBuffer  = 3  // Max queued frames before dropping
-	imageQuality = 30 // JPEG quality (0-100) - lower for faster encoding & smaller frames
+	fpsDefault             = 30               // Default frames per second (increased from 24 for smoother experience)
+	blockSize              = 64               // Pixel block size for delta encoding (64x64 matches noVNC/industry standard)
+	frameBuffer            = 3                // Max queued frames before dropping
+	imageQuality           = 50               // JPEG quality (0-100) - balanced quality and performance
+	sessionMetricsInterval = 15 * time.Second // Interval for per-session telemetry snapshots
 )
 
 // Magic bytes for binary protocol
@@ -107,6 +113,8 @@ var errNoImage = errors.New(`DESKTOP.NO_IMAGE_YET`)
 var errNoActiveSession = errors.New(`DESKTOP.NO_ACTIVE_SESSION`)
 var adaptiveQualityManager = NewAdaptiveQualityManager() // Global adaptive quality controller
 var lastRTTMs atomic.Int64                               // Optional RTT estimator for adaptive quality
+var globalChannelHighWater atomic.Uint64                 // Tracks highest queue depth across sessions
+var globalFrameSeq atomic.Uint32                         // Monotonic capture frame sequence (shared across sessions)
 
 // UpdateRTT ingests RTT measurements (milliseconds) for adaptive quality tuning.
 func UpdateRTT(rttMs int64) {
@@ -195,7 +203,7 @@ func enumerateDisplays() []map[string]int {
 var (
 	// Block buffer pool: reusable byte slices for block extraction
 	// Pool key: buffer size (width * height * 4)
-	// Max block size: 96*96*4 = 36,864 bytes
+	// Max block size: 64*64*4 = 16,384 bytes (reduced from 96x96 for finer granularity)
 	blockBufferPool = sync.Pool{
 		New: func() interface{} {
 			// Allocate max block size buffer
@@ -260,8 +268,45 @@ var (
 )
 
 // Backpressure management for frame sending
-var pendingFrameBytes atomic.Int64       // Tracks approximate pending data
-const maxPendingFrameBytes = 1024 * 1024 // 1MB threshold
+var pendingFrameBytes atomic.Int64 // Tracks approximate pending data
+const (
+	// maxPendingFrameBytes bounds the amount of desktop frame data that can be queued
+	// for async WS writes before we start dropping entire frames.
+	//
+	// Remote desktop uses a tiled/chunked protocol (65KB WS messages). A *single* full
+	// frame at 1080p/1440p can exceed 1MB depending on scene complexity and codec
+	// quality. Keeping this too low causes initial "keyframes" (DESKTOP_INIT/SHOT)
+	// to be dropped, which manifests as black/uninitialized regions until the cursor
+	// moves and those tiles are re-sent as deltas.
+	//
+	// 16MB keeps memory bounded while allowing full-frame sync for common resolutions.
+	maxPendingFrameBytes       = 16 * 1024 * 1024
+	backpressureReportInterval = 5 * time.Second
+)
+
+// reserveFrameBytes atomically reserves bandwidth for an entire frame.
+// Returns true if reservation succeeded, false if backpressure would block.
+// This prevents partial frame drops where some chunks are sent but others are dropped.
+func reserveFrameBytes(totalBytes int64) bool {
+	for {
+		current := pendingFrameBytes.Load()
+		newTotal := current + totalBytes
+		if newTotal > maxPendingFrameBytes {
+			// Would exceed budget - don't reserve
+			return false
+		}
+		// Atomically reserve the bytes
+		if pendingFrameBytes.CompareAndSwap(current, newTotal) {
+			return true
+		}
+		// CAS failed, retry
+	}
+}
+
+// releaseFrameBytes releases previously reserved bandwidth.
+func releaseFrameBytes(totalBytes int64) {
+	pendingFrameBytes.Add(-totalBytes)
+}
 
 // sendDesktopData writes desktop binary data either to the WebSocket (Session 0) or over IPC (user session bridge).
 // Implements backpressure by tracking pending writes per VNC/RDP best practices.
@@ -280,79 +325,59 @@ func sendDesktopData(buf []byte) {
 		}
 
 		if queueBytes > maxPendingFrameBytes {
-			// Drop this frame - video streaming is lossy anyway
-			telemetry.LogStructured("WARN", "desktop: dropping frame due to backpressure", map[string]interface{}{
+			// Resolution/control packets are small but critical; don't drop them.
+			// Log the pressure so operators can tune capture/codec settings.
+			telemetry.LogStructured("WARN", "desktop: high backpressure while sending desktop data", map[string]interface{}{
 				"pending_bytes": pending,
 				"queued_bytes":  queueBytes,
 				"frame_size":    len(buf),
 			})
-			return
-		}
-
-		// MTU/MaxMessageSize awareness for WebSocket (2025 best practice):
-		// - WebSocket is TCP-based, so no UDP MTU limits apply
-		// - However, servers often set MaxMessageSize (default 1MB in many implementations)
-		// - Large frames should be chunked to respect server limits
-		// - Chunking also improves latency (don't wait for huge frame to encode/send)
-		//
-		// Chunking strategy:
-		// - Frames < 256KB: send as single message (most common case)
-		// - Frames >= 256KB: split into 256KB chunks with fragment headers
-		// - Server reassembles fragments using fragment ID and sequence numbers
-		const wsMaxChunkSize = MaxWSChunkSize // 256 KB from mtu_fragmentation.go
-
-		if len(buf) > wsMaxChunkSize {
-			// Fragment large frame
-			fragments, err := FragmentFrame(buf, wsMaxChunkSize)
-			if err != nil {
-				telemetry.LogStructured("ERROR", "desktop: frame fragmentation failed", map[string]interface{}{
-					"error":      err.Error(),
-					"frame_size": len(buf),
-				})
-				return
-			}
-
-			// Track pending data for all fragments
-			pendingFrameBytes.Add(int64(len(buf)))
-
-			// Send fragments asynchronously
-			go func(frags [][]byte, totalSize int) {
-				defer pendingFrameBytes.Add(-int64(totalSize))
-				for i, frag := range frags {
-					if err := common.WSConn.SendData(frag); err != nil {
-						telemetry.LogStructured("ERROR", "desktop: failed to send frame fragment", map[string]interface{}{
-							"error":           err.Error(),
-							"fragment":        i + 1,
-							"total_fragments": len(frags),
-						})
-						return // Stop sending remaining fragments on error
-					}
-				}
-			}(fragments, len(buf))
-			return
 		}
 
 		// Small frame - send directly without fragmentation
 		// Track pending data
 		pendingFrameBytes.Add(int64(len(buf)))
 
-		// Send asynchronously to not block capture thread
-		go func(data []byte) {
-			defer pendingFrameBytes.Add(-int64(len(data)))
-			if err := common.WSConn.SendData(data); err != nil {
-				telemetry.LogStructured("ERROR", "desktop: failed to send frame over WS", map[string]interface{}{
-					"error": err.Error(),
-					"size":  len(data),
-				})
-			}
-			telemetry.LogStructured("DEBUG", "desktop: sent frame over WS", map[string]interface{}{
-				"size": len(data),
+		// Send synchronously from the per-session writer goroutine to preserve ordering
+		// (resolution must precede the first frame for correct canvas sizing).
+		if err := common.WSConn.SendData(buf); err != nil {
+			telemetry.LogStructured("ERROR", "desktop: failed to send frame over WS", map[string]interface{}{
+				"error": err.Error(),
+				"size":  len(buf),
 			})
-		}(buf)
+		}
+		pendingFrameBytes.Add(-int64(len(buf)))
 		return
 	}
 	if ok := SendFrameViaIPC(buf); !ok {
 		telemetry.LogStructured("WARN", "desktop: IPC frame send failed", map[string]interface{}{
+			"bridge_mode": IsBridgeMode(),
+		})
+	}
+}
+
+// sendReservedChunk sends a chunk that's part of a pre-reserved frame.
+// Backpressure is handled at the frame level by the caller (packFrameIntoChunks).
+// This prevents mid-frame drops where some chunks are sent but others are dropped.
+func sendReservedChunk(buf []byte, chunkBytes int64) {
+	if common.WSConn != nil {
+		// Send synchronously from the per-session desktop writer goroutine.
+		// This preserves opFirstFrame/opRestFrame ordering and avoids chunk interleaving
+		// across frames which can produce stale/blank regions in the browser renderer.
+		// Bytes are reserved at the frame level; release per-chunk once the write completes.
+		defer releaseFrameBytes(chunkBytes)
+		if err := common.WSConn.SendData(buf); err != nil {
+			telemetry.LogStructured("ERROR", "desktop: failed to send chunk over WS", map[string]interface{}{
+				"error": err.Error(),
+				"size":  len(buf),
+			})
+		}
+		return
+	}
+	// IPC path - release bytes immediately since IPC is synchronous
+	defer releaseFrameBytes(chunkBytes)
+	if ok := SendFrameViaIPC(buf); !ok {
+		telemetry.LogStructured("WARN", "desktop: IPC chunk send failed", map[string]interface{}{
 			"bridge_mode": IsBridgeMode(),
 		})
 	}
@@ -496,7 +521,21 @@ func relayDesktopCommand(pack modules.Packet, msgType uint16) (bool, error) {
 func init() {
 	// Start with a reasonable RTT estimate to seed adaptive quality
 	lastRTTMs.Store(50)
-	go healthCheck()
+	go safeHealthCheck()
+}
+
+// safeHealthCheck wraps healthCheck with panic recovery and auto-restart.
+func safeHealthCheck() {
+	defer func() {
+		if r := recover(); r != nil {
+			telemetry.LogStructured("ERROR", "healthCheck panic recovered, restarting", map[string]interface{}{
+				"panic": fmt.Sprintf("%v", r),
+			})
+			time.Sleep(5 * time.Second)
+			go safeHealthCheck() // Auto-restart after panic
+		}
+	}()
+	healthCheck()
 }
 
 // startCaptureWorker launches the capture worker if not already running.
@@ -519,6 +558,7 @@ func worker() {
 		numErrors       int
 		numConsecutive  int // Consecutive errors for circuit breaker
 		screen          Screen
+		frame           *CaptureFrame
 		img             *image.RGBA
 		err             error
 		lastSuccessTime time.Time
@@ -633,11 +673,20 @@ func worker() {
 			}
 
 			// Capture frame
-			img, err = screen.Capture()
+			frame, err = screen.Capture()
+			if frame != nil {
+				img = frame.Image
+			} else {
+				img = nil
+			}
 
 			if err != nil {
 				if err == errNoImage {
 					// Screen idle - DXGI detected no changes, continue without delay
+					if frame != nil {
+						frame.Close()
+						frame = nil
+					}
 					continue
 				}
 
@@ -653,10 +702,23 @@ func worker() {
 
 				// Circuit breaker: 10 consecutive errors = fatal
 				if numConsecutive > 10 {
-					telemetry.LogStructured("ERROR", "worker: too many consecutive errors, shutting down", map[string]interface{}{
-						"error": err.Error(),
+					telemetry.LogStructured("ERROR", "worker: CIRCUIT BREAKER TRIGGERED - too many consecutive errors", map[string]interface{}{
+						"error":            err.Error(),
+						"consecutive":      numConsecutive,
+						"total_errors":     numErrors,
+						"total_frames":     frameCount,
+						"active_sessions":  sessions.Count(),
+						"monitor":          activeMonitor,
+						"bounds_width":     currentBounds.Dx(),
+						"bounds_height":    currentBounds.Dy(),
+						"is_session0":      IsSession0Mode(),
+						"last_success_ago": time.Since(lastSuccessTime).String(),
 					})
-					quitAllDesktop(err.Error())
+					if frame != nil {
+						frame.Close()
+						frame = nil
+					}
+					quitAllDesktop(fmt.Sprintf("circuit breaker: %s (consecutive=%d, frames=%d)", err.Error(), numConsecutive, frameCount))
 					return
 				}
 
@@ -664,11 +726,19 @@ func worker() {
 				timeSinceSuccess := time.Since(lastSuccessTime)
 				if timeSinceSuccess < frameDuration {
 					// Still within expected frame time, just skip this frame
+					if frame != nil {
+						frame.Close()
+						frame = nil
+					}
 					continue
 				}
 
 				// Been too long, try to resync to target cadence
 				ticker.Reset(frameDuration)
+				if frame != nil {
+					frame.Close()
+					frame = nil
+				}
 				continue
 			}
 
@@ -710,6 +780,7 @@ func worker() {
 			}
 
 			// Delta detection with performance tracking
+			isKeyframe := prev == nil
 			diff := imageCompare(img, prev, compress)
 
 			// Track metrics for performance monitoring
@@ -841,11 +912,20 @@ func worker() {
 			if diff != nil && len(diff) > 0 {
 				// Store new frame atomically
 				prevDesktop.Store(img)
-				sendImageDiff(diff)
+				sendImageDiff(diff, isKeyframe)
+			}
+
+			// Publish GPU-backed frames to hardware encoder listeners.
+			if frame != nil && frame.GPU != nil && globalHWFrameBroadcaster.HasListeners() {
+				globalHWFrameBroadcaster.Dispatch(frame)
 			}
 
 			// Broadcast to WebRTC sessions
 			broadcastRTC(img, frameDuration)
+			if frame != nil {
+				frame.Close()
+				frame = nil
+			}
 		}
 	}
 
@@ -961,17 +1041,114 @@ func GetSessionBackpressureStats(uuid string) map[string]interface{} {
 		}
 	}
 
-	session.lock.Lock()
+	snapshot, snapshotOK := buildSessionSnapshot(uuid, session)
+	if !snapshotOK {
+		return map[string]interface{}{
+			"error": "session channel not initialized",
+		}
+	}
+
+	return map[string]interface{}{
+		"uuid":                uuid,
+		"channel_len":         snapshot.ChannelLen,
+		"channel_cap":         snapshot.ChannelCap,
+		"channel_utilization": snapshot.ChannelUtilization,
+		"high_water_mark":     snapshot.HighWater,
+		"frames_dropped":      snapshot.FramesDropped,
+		"frames_delivered":    snapshot.FramesDelivered,
+		"delivery_rate":       snapshot.DeliveryRate,
+		"is_healthy":          snapshot.DeliveryRate > 95.0 && snapshot.ChannelUtilization < 80.0,
+	}
+}
+
+func (desktop *session) startMetricsReporter(uuid string) {
+	desktop.metricsStartOnce.Do(func() {
+		desktop.metricsStop = make(chan struct{})
+		go desktop.emitBackpressureMetrics(uuid)
+	})
+}
+
+func (desktop *session) stopMetricsReporter() {
+	if desktop.metricsStop == nil {
+		return
+	}
+	desktop.metricsStopOnce.Do(func() {
+		close(desktop.metricsStop)
+	})
+}
+
+func (desktop *session) emitBackpressureMetrics(uuid string) {
+	ticker := time.NewTicker(backpressureReportInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-desktop.metricsStop:
+			return
+		case <-ticker.C:
+			stats := GetSessionBackpressureStats(uuid)
+			if errVal, ok := stats["error"]; ok {
+				telemetry.LogStructured("WARN", "desktop: unable to collect backpressure stats", map[string]interface{}{
+					"desktop": uuid,
+					"error":   errVal,
+				})
+				continue
+			}
+			statsCopy := make(map[string]interface{}, len(stats)+1)
+			for k, v := range stats {
+				statsCopy[k] = v
+			}
+			statsCopy["desktop_uuid"] = uuid
+
+			desktop.lock.Lock()
+			rawEvent := desktop.rawEvent
+			desktop.lock.Unlock()
+
+			sendDesktopPacket(modules.Packet{
+				Act:  `DESKTOP_METRICS`,
+				Code: 0,
+				Data: statsCopy,
+			}, rawEvent)
+		}
+	}
+}
+
+func startSessionMetricsReporter(uuid string, desktop *session) {
+	if desktop == nil || desktop.metricsStop == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(sessionMetricsInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-desktop.metricsStop:
+				deliverSessionMetrics(uuid, desktop, true)
+				return
+			case <-ticker.C:
+				deliverSessionMetrics(uuid, desktop, false)
+			}
+		}
+	}()
+}
+
+func deliverSessionMetrics(uuid string, desktop *session, final bool) {
+	if desktop == nil || desktop.rawEvent == nil {
+		return
+	}
+
+	desktop.lock.Lock()
 	channelLen := 0
 	channelCap := 0
-	if session.channel != nil {
-		channelLen = len(session.channel)
-		channelCap = cap(session.channel)
+	if desktop.channel != nil {
+		channelLen = len(desktop.channel)
+		channelCap = cap(desktop.channel)
 	}
-	session.lock.Unlock()
+	desktop.lock.Unlock()
 
-	dropped := session.framesDropped.Load()
-	delivered := session.framesDelivered.Load()
+	dropped := desktop.framesDropped.Load()
+	delivered := desktop.framesDelivered.Load()
 	total := dropped + delivered
 	deliveryRate := float64(100.0)
 	if total > 0 {
@@ -983,17 +1160,37 @@ func GetSessionBackpressureStats(uuid string) map[string]interface{} {
 		utilization = float64(channelLen) / float64(channelCap) * 100
 	}
 
-	return map[string]interface{}{
-		"uuid":                uuid,
-		"channel_len":         channelLen,
-		"channel_cap":         channelCap,
-		"channel_utilization": utilization,
-		"high_water_mark":     session.channelHighWater.Load(),
+	payload := map[string]interface{}{
+		"desktop":             uuid,
+		"timestamp":           time.Now().Unix(),
 		"frames_dropped":      dropped,
 		"frames_delivered":    delivered,
 		"delivery_rate":       deliveryRate,
-		"is_healthy":          deliveryRate > 95.0 && utilization < 80.0,
+		"channel_depth":       channelLen,
+		"channel_capacity":    channelCap,
+		"channel_utilization": utilization,
+		"high_water_mark":     desktop.channelHighWater.Load(),
 	}
+	if final {
+		payload["final"] = true
+	}
+
+	telemetry.LogStructured("DEBUG", "desktop: session metrics snapshot", payload)
+	sendDesktopPacket(modules.Packet{
+		Act:   `DESKTOP_STATS`,
+		Code:  0,
+		Data:  payload,
+		Event: desktop.event,
+	}, desktop.rawEvent)
+}
+
+func stopSessionMetricsReporter(desktop *session) {
+	if desktop == nil || desktop.metricsStop == nil {
+		return
+	}
+	desktop.metricsStopOnce.Do(func() {
+		close(desktop.metricsStop)
+	})
 }
 
 // broadcastResolutionChange sends resolution change notification to ALL active sessions.
@@ -1006,6 +1203,16 @@ func GetSessionBackpressureStats(uuid string) map[string]interface{} {
 // 4. Send full frame with new resolution
 //
 // This ensures clients receive resolution update before any frame data with new dimensions.
+
+func appendFrameMeta(buf []byte, frameSeq uint32, chunkIndex, chunkTotal uint16) []byte {
+	start := len(buf)
+	buf = append(buf, 0, 0, 0, 0, 0, 0, 0, 0)
+	binary.BigEndian.PutUint32(buf[start:start+4], frameSeq)
+	binary.BigEndian.PutUint16(buf[start+4:start+6], chunkIndex)
+	binary.BigEndian.PutUint16(buf[start+6:start+8], chunkTotal)
+	return buf
+}
+
 // packFrameIntoChunks efficiently packs block data into chunks under MaxMessageSize.
 // Implements optimized metadata packing with zero-copy techniques where possible.
 //
@@ -1022,7 +1229,7 @@ func GetSessionBackpressureStats(uuid string) map[string]interface{} {
 // └─────────┴──────┴─────┴─────┴───────┴────────┴──────────┘
 //
 // Optimization strategy:
-// 1. Pre-allocate chunk buffer with header (22 bytes overhead)
+// 1. Pre-allocate chunk buffer with header (30 bytes overhead)
 // 2. Aggregate blocks until approaching MaxMessageSize
 // 3. Send chunk when next block would exceed limit
 // 4. Use pooled buffers for chunk building (future)
@@ -1030,30 +1237,123 @@ func GetSessionBackpressureStats(uuid string) map[string]interface{} {
 // Performance:
 // - Typical frame: 10 blocks → 1 chunk (no splitting)
 // - Large frame: 240 blocks → 3-4 chunks
-// - Overhead per chunk: 22 bytes (magic + opcode + eventID)
-func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
+// - Overhead per chunk: 30 bytes (magic + opcode + eventID + frame meta)
+func packFrameIntoChunks(rawEvent []byte, frameSeq uint32, blocks *[]*[]byte, keyframe bool) {
 	if blocks == nil || len(*blocks) == 0 {
 		return
 	}
 
 	const (
-		headerSize   = 22  // magic(5) + opcode(1) + eventID(16)
+		headerSize   = 30  // magic(5) + opcode(1) + eventID(16) + frameMeta(8)
 		safetyMargin = 128 // Leave room to avoid exact boundary
 	)
 
-	numBlocks := len(*blocks)
+	maxChunkSize := common.MaxMessageSize - safetyMargin
+	if maxChunkSize <= headerSize {
+		return
+	}
 
-	// Statistics for this frame
+	// Estimate exact chunk count and total bytes so reservation matches what we'll send.
 	var (
-		chunksCreated  int
-		totalBytesSent int
-		totalFrameSize = headerSize
+		chunkTotal     uint16
+		totalFrameSize int
+		numBlocks      int
 	)
 
 	for _, blockPtr := range *blocks {
 		if blockPtr != nil {
-			totalFrameSize += len(*blockPtr)
+			blockLen := len(*blockPtr)
+			if blockLen > 0 {
+				numBlocks++
+			}
 		}
+	}
+
+	{
+		currentChunkSize := headerSize
+		for _, blockPtr := range *blocks {
+			if blockPtr == nil {
+				continue
+			}
+			blockLen := len(*blockPtr)
+			if blockLen <= 0 {
+				continue
+			}
+
+			if currentChunkSize+blockLen >= maxChunkSize && currentChunkSize > headerSize {
+				totalFrameSize += currentChunkSize
+				chunkTotal++
+				currentChunkSize = headerSize
+			}
+			currentChunkSize += blockLen
+		}
+		if currentChunkSize > headerSize {
+			totalFrameSize += currentChunkSize
+			chunkTotal++
+		}
+	}
+
+	if chunkTotal == 0 {
+		return
+	}
+
+	// Keyframe/full-sync frames (initial sync + DESKTOP_SHOT) must never be dropped purely
+	// because the aggregate frame is larger than the pending-byte reservation cap.
+	// Instead, split the block list into multiple smaller frames that each fit under
+	// the reservation budget so the browser can paint the entire canvas deterministically.
+	//
+	// For normal delta frames, splitting only kicks in once we exceed the hard cap.
+	maxFrameBytes := int64(maxPendingFrameBytes)
+	if keyframe && adaptiveQualityManager != nil {
+		// When syncing, respect the adaptive ceiling to avoid sending a single massive burst.
+		if aqmLimit := adaptiveQualityManager.GetMaxFrameSize(); aqmLimit > 0 && aqmLimit < maxFrameBytes {
+			maxFrameBytes = aqmLimit
+		}
+	}
+
+	// Leave headroom so we stay safely below the cap after accounting for any overhead.
+	targetFrameBytes := maxFrameBytes
+	if targetFrameBytes > int64(headerSize+safetyMargin) {
+		targetFrameBytes -= int64(safetyMargin)
+	}
+
+	if targetFrameBytes > int64(headerSize) && int64(totalFrameSize) > targetFrameBytes {
+		telemetry.LogStructured("INFO", "packFrameIntoChunks: splitting oversized frame", map[string]interface{}{
+			"keyframe":           keyframe,
+			"frame_seq":          frameSeq,
+			"total_bytes":        totalFrameSize,
+			"target_frame_bytes": targetFrameBytes,
+			"blocks":             numBlocks,
+			"chunks_estimate":    chunkTotal,
+		})
+
+		batch := make([]*[]byte, 0, 64)
+		batchBytes := int64(headerSize)
+
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			// Each batch is sent as its own frame (opFirstFrame/opRestFrame sequence).
+			packFrameIntoChunks(rawEvent, frameSeq, &batch, false)
+			batch = make([]*[]byte, 0, 64)
+			batchBytes = int64(headerSize)
+		}
+
+		for _, blockPtr := range *blocks {
+			if blockPtr == nil {
+				continue
+			}
+			blockLen := int64(len(*blockPtr))
+			if len(batch) > 0 && batchBytes+blockLen > targetFrameBytes {
+				flush()
+			}
+			// Always add at least one block per batch.
+			batch = append(batch, blockPtr)
+			batchBytes += blockLen
+		}
+		flush()
+		return
 	}
 
 	if adaptiveQualityManager != nil {
@@ -1062,24 +1362,34 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 		adaptiveQualityManager.Adapt()
 	}
 
-	// Enforce transport and adaptive frame size ceilings
-	if adaptiveQualityManager != nil && adaptiveQualityManager.ShouldDropFrame(int64(totalFrameSize)) {
+	// NOTE: Do NOT drop WS chunked frames based on aggregate frame size.
+	// The desktop WS path chunks into <= common.MaxMessageSize messages already; dropping
+	// a "keyframe" (DESKTOP_INIT/SHOT) manifests as black/uninitialized tiles until a
+	// later delta touches those regions.
+
+	// CRITICAL FIX: Reserve bandwidth for ENTIRE frame atomically BEFORE sending any chunks.
+	// This prevents partial frame drops where some chunks are sent but others are dropped,
+	// which causes partial rendering on the browser side.
+	reserved := reserveFrameBytes(int64(totalFrameSize))
+	if !reserved && !keyframe {
 		backpressureStats.totalFramesDropped.Add(1)
-		telemetry.LogStructured("WARN", "packFrameIntoChunks: dropping frame over adaptive budget", map[string]interface{}{
-			"frame_size": totalFrameSize,
-			"max_size":   adaptiveQualityManager.GetMaxFrameSize(),
-			"blocks":     numBlocks,
+		telemetry.LogStructured("WARN", "packFrameIntoChunks: dropping frame due to backpressure (atomic reservation failed)", map[string]interface{}{
+			"frame_seq":     frameSeq,
+			"frame_size":    totalFrameSize,
+			"pending_bytes": pendingFrameBytes.Load(),
+			"blocks":        numBlocks,
+			"chunks":        chunkTotal,
 		})
 		return
 	}
-	if int64(totalFrameSize) > int64(DefaultWSMaxMessageSize) {
-		backpressureStats.totalFramesDropped.Add(1)
-		telemetry.LogStructured("WARN", "packFrameIntoChunks: dropping frame over transport limit", map[string]interface{}{
-			"frame_size": totalFrameSize,
-			"limit":      DefaultWSMaxMessageSize,
-			"blocks":     numBlocks,
+	if !reserved && keyframe {
+		telemetry.LogStructured("WARN", "packFrameIntoChunks: keyframe bypassing backpressure reservation", map[string]interface{}{
+			"frame_seq":     frameSeq,
+			"frame_size":    totalFrameSize,
+			"pending_bytes": pendingFrameBytes.Load(),
+			"blocks":        numBlocks,
+			"chunks":        chunkTotal,
 		})
-		return
 	}
 
 	// Get chunk buffer from pool (OPTIMIZED: reuse allocation)
@@ -1087,11 +1397,20 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 	chunkPtr := chunkBufferPool.Get().(*[]byte)
 	chunk := (*chunkPtr)[:0] // Reset length, keep capacity
 
+	chunkIndex := uint16(0)
+
 	// Build first chunk header with opFirstFrame
 	chunk = append(chunk, magicBytes...)
 	chunk = append(chunk, opFirstFrame)
 	chunk = append(chunk, rawEvent...)
+	chunk = appendFrameMeta(chunk, frameSeq, chunkIndex, chunkTotal)
 	chunkStartSize := len(chunk) // Save header size (22 bytes)
+
+	// Statistics for this frame
+	var (
+		chunksCreated  int
+		totalBytesSent int
+	)
 
 	for _, blockPtr := range *blocks {
 		if blockPtr == nil {
@@ -1109,7 +1428,12 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 				// Copy chunk data before sending (chunk buffer will be reused)
 				chunkCopy := make([]byte, len(chunk))
 				copy(chunkCopy, chunk)
-				sendDesktopData(chunkCopy)
+				chunkSize := int64(len(chunkCopy))
+				if reserved {
+					sendReservedChunk(chunkCopy, chunkSize)
+				} else {
+					sendDesktopData(chunkCopy)
+				}
 
 				chunksCreated++
 				totalBytesSent += len(chunk)
@@ -1121,10 +1445,12 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 			}
 
 			// Reset chunk with opRestFrame header
+			chunkIndex++
 			chunk = (*chunkPtr)[:0] // Reset to empty, keep capacity
 			chunk = append(chunk, magicBytes...)
 			chunk = append(chunk, opRestFrame)
 			chunk = append(chunk, rawEvent...)
+			chunk = appendFrameMeta(chunk, frameSeq, chunkIndex, chunkTotal)
 			chunkStartSize = len(chunk)
 		}
 
@@ -1137,7 +1463,12 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 		// Copy chunk data before sending
 		chunkCopy := make([]byte, len(chunk))
 		copy(chunkCopy, chunk)
-		sendDesktopData(chunkCopy)
+		chunkSize := int64(len(chunkCopy))
+		if reserved {
+			sendReservedChunk(chunkCopy, chunkSize)
+		} else {
+			sendDesktopData(chunkCopy)
+		}
 
 		chunksCreated++
 		totalBytesSent += len(chunk)
@@ -1146,6 +1477,15 @@ func packFrameIntoChunks(rawEvent []byte, blocks *[]*[]byte) {
 	// Return chunk buffer to pool
 	chunkBufferPool.Put(chunkPtr)
 	poolStats.chunkBufferPuts.Add(1)
+
+	if reserved && uint16(chunksCreated) != chunkTotal {
+		telemetry.LogStructured("WARN", "packFrameIntoChunks: chunk count mismatch", map[string]interface{}{
+			"frame_seq":    frameSeq,
+			"expected":     chunkTotal,
+			"actual":       chunksCreated,
+			"total_blocks": numBlocks,
+		})
+	}
 
 	// Update chunking statistics
 	chunkStats.totalChunks.Add(uint64(chunksCreated))
@@ -1229,7 +1569,13 @@ func broadcastResolutionChange(newBounds image.Rectangle) {
 // - Slow clients get degraded service (frame drops) vs global degradation
 // - Fast clients unaffected by slow clients
 // - Memory bounded (channel size limit)
-func sendImageDiff(diff []*[]byte) {
+func sendImageDiff(diff []*[]byte, keyframe bool) {
+	if diff == nil || len(diff) == 0 {
+		return
+	}
+
+	frameSeq := globalFrameSeq.Add(1)
+
 	sessions.IterCb(func(uuid string, desktop *session) bool {
 		if desktop.escape.Load() {
 			return true
@@ -1250,7 +1596,9 @@ func sendImageDiff(diff []*[]byte) {
 
 		// Track peak channel utilization (per-session)
 		if uint64(channelLen) > desktop.channelHighWater.Load() {
-			desktop.channelHighWater.Store(uint64(channelLen))
+			newHW := uint64(channelLen)
+			desktop.channelHighWater.Store(newHW)
+			observeGlobalChannelHighWater(newHW)
 		}
 
 		// Track peak utilization (global)
@@ -1266,6 +1614,7 @@ func sendImageDiff(diff []*[]byte) {
 			case oldFrame := <-desktop.channel:
 				// Successfully dropped oldest frame
 				desktop.framesDropped.Add(1)
+				telemetry.DesktopFramesDroppedTotal.Inc()
 				backpressureStats.totalFramesDropped.Add(1)
 
 				// Log if dropping data frames (not resolution/error messages)
@@ -1284,15 +1633,17 @@ func sendImageDiff(diff []*[]byte) {
 
 		// Try non-blocking send (NEVER block capture goroutine)
 		select {
-		case desktop.channel <- message{t: 0, frame: &diff}:
+		case desktop.channel <- message{t: 0, frame: &diff, keyframe: keyframe, frameSeq: frameSeq}:
 			// Success! Frame delivered
 			desktop.framesDelivered.Add(1)
+			telemetry.DesktopFramesDeliveredTotal.Inc()
 			backpressureStats.totalFramesDelivered.Add(1)
 
 		default:
 			// Channel still full after drop attempt
 			// Drop current frame (don't block capture goroutine)
 			desktop.framesDropped.Add(1)
+			telemetry.DesktopFramesDroppedTotal.Inc()
 			backpressureStats.totalFramesDropped.Add(1)
 
 			// Track sessions with drops (for alerting)
@@ -1341,6 +1692,20 @@ func sendImageDiff(diff []*[]byte) {
 	})
 }
 
+// observeGlobalChannelHighWater tracks the maximum queue depth observed across all sessions.
+func observeGlobalChannelHighWater(sample uint64) {
+	for {
+		current := globalChannelHighWater.Load()
+		if sample <= current {
+			return
+		}
+		if globalChannelHighWater.CompareAndSwap(current, sample) {
+			telemetry.DesktopChannelHighWater.Set(float64(sample))
+			return
+		}
+	}
+}
+
 // quitSession gracefully closes a single session with proper error path.
 // Implements robust cleanup:
 // 1. Enqueue QUIT message with reason
@@ -1359,6 +1724,7 @@ func quitSession(uuid string, desktop *session, reason string) {
 
 	// Mark session as closing
 	desktop.escape.Store(true)
+	stopSessionMetricsReporter(desktop)
 
 	desktop.lock.Lock()
 	rawEvent := desktop.rawEvent
@@ -1483,6 +1849,7 @@ func imageCompare(img, prev *image.RGBA, compress int) []*[]byte {
 	}
 
 	// Delta detection: find changed blocks at block granularity
+	// Note: getDiff returns rectangles in 0-based coordinates (relative to image dimensions)
 	diff := getDiff(img, prev)
 	if diff == nil || len(diff) == 0 {
 		// Short-circuit: entire frame is identical, return empty result
@@ -1491,9 +1858,25 @@ func imageCompare(img, prev *image.RGBA, compress int) []*[]byte {
 
 	result := make([]*[]byte, 0, len(diff))
 
+	// Image origin offset for coordinate translation
+	// Multi-monitor setups may have non-zero origins
+	originX := img.Rect.Min.X
+	originY := img.Rect.Min.Y
+
 	// Encode only the changed blocks
 	for _, rect := range diff {
-		block := getImageBlock(img, rect, compress)
+		// getDiff returns 0-based rectangles, but getImageBlock needs image-space coords
+		// Translate to image coordinate space for pixel extraction
+		srcRect := image.Rect(
+			rect.Min.X+originX,
+			rect.Min.Y+originY,
+			rect.Max.X+originX,
+			rect.Max.Y+originY,
+		)
+
+		block := getImageBlock(img, srcRect, compress)
+		// makeImageBlock receives the 0-based rect for browser canvas coordinates
+		// (browser canvas always starts at 0,0)
 		block = makeImageBlock(block, rect, compress)
 		result = append(result, &block)
 	}
@@ -1511,13 +1894,47 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 	blocksX := (imgWidth + blockSize - 1) / blockSize
 	blocksY := (imgHeight + blockSize - 1) / blockSize
 	result := make([]*[]byte, 0, blocksX*blocksY)
+
+	// Store origin offset for coordinate normalization
+	// Multi-monitor setups may have non-zero origins (e.g., secondary monitor at X=1920)
+	// Browser canvas always starts at (0,0), so we must normalize block coordinates
+	originX := rect.Min.X
+	originY := rect.Min.Y
+
+	// Log when normalization is applied (useful for debugging multi-monitor issues)
+	if originX != 0 || originY != 0 {
+		telemetry.LogStructured("INFO", "splitFullImage: normalizing coordinates from non-zero origin", map[string]interface{}{
+			"origin_x": originX,
+			"origin_y": originY,
+			"width":    imgWidth,
+			"height":   imgHeight,
+		})
+	}
+
 	for y := rect.Min.Y; y < rect.Max.Y; y += blockSize {
-		height := utils.If(y+blockSize > imgHeight, imgHeight-y, blockSize)
+		// Calculate block height, clamping to image boundary
+		blockH := blockSize
+		if y+blockSize > rect.Max.Y {
+			blockH = rect.Max.Y - y
+		}
 		for x := rect.Min.X; x < rect.Max.X; x += blockSize {
-			width := utils.If(x+blockSize > imgWidth, imgWidth-x, blockSize)
-			blockRect := image.Rect(x, y, x+width, y+height)
-			block := getImageBlock(img, blockRect, compress)
-			block = makeImageBlock(block, blockRect, compress)
+			// Calculate block width, clamping to image boundary
+			blockW := blockSize
+			if x+blockSize > rect.Max.X {
+				blockW = rect.Max.X - x
+			}
+
+			// Source rectangle in image coordinates (for pixel extraction)
+			srcRect := image.Rect(x, y, x+blockW, y+blockH)
+
+			// Destination rectangle normalized to (0,0) origin (for browser canvas)
+			// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
+			normalizedX := x - originX
+			normalizedY := y - originY
+			dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
+
+			block := getImageBlock(img, srcRect, compress)
+			block = makeImageBlock(block, dstRect, compress) // Use normalized coords for header
 			result = append(result, &block)
 		}
 	}
@@ -1825,6 +2242,9 @@ func InitDesktop(pack modules.Packet) error {
 			SetCodec(NewRawCodec())
 		case "webp":
 			SetCodec(NewWebPCodec(int(configQuality.Load())))
+		case "png", "lossless":
+			// PNG codec for lossless encoding (best for text/terminals/diagrams)
+			SetCodec(NewPNGCodecFast())
 		default:
 			jpeg := NewJPEGCodec(int(configQuality.Load()))
 			if adaptiveQualityManager != nil {
@@ -1835,10 +2255,11 @@ func InitDesktop(pack modules.Packet) error {
 	}
 
 	desktop := &session{
-		event:    pack.Event,
-		rawEvent: rawEvent,
-		channel:  make(chan message, 5),
-		lock:     &sync.Mutex{},
+		event:       pack.Event,
+		rawEvent:    rawEvent,
+		channel:     make(chan message, 5),
+		lock:        &sync.Mutex{},
+		metricsStop: make(chan struct{}),
 	}
 	desktop.allowControl.Store(true)
 	atomic.StoreInt64(&desktop.lastPack, utils.Unix)
@@ -1847,8 +2268,25 @@ func InitDesktop(pack modules.Packet) error {
 	activeMonitor := clampMonitorValue(configMonitor.Load())
 	bounds, boundsErr := getDisplayBoundsForMonitor(activeMonitor)
 	if boundsErr != nil || bounds.Dx() == 0 || bounds.Dy() == 0 {
+		// Enhanced diagnostics for display enumeration failure
+		numDisplays := screenshot.NumActiveDisplays()
+		errMsg := ""
+		if boundsErr != nil {
+			errMsg = boundsErr.Error()
+		}
+		telemetry.LogStructured("ERROR", "desktop: NO DISPLAY FOUND - initialization failed", map[string]interface{}{
+			"monitor":      activeMonitor,
+			"bounds_dx":    bounds.Dx(),
+			"bounds_dy":    bounds.Dy(),
+			"error":        errMsg,
+			"num_displays": numDisplays,
+			"is_session0":  IsSession0Mode(),
+			"desktop_uuid": uuid,
+		})
 		close(desktop.channel)
-		sendDesktopPacket(modules.Packet{Act: `DESKTOP_QUIT`, Msg: `${i18n|DESKTOP.NO_DISPLAY_FOUND}`, Event: pack.Event}, desktop.rawEvent)
+		quitMsg := fmt.Sprintf("no display found (monitor=%d, displays=%d, bounds=%dx%d, err=%s)",
+			activeMonitor, numDisplays, bounds.Dx(), bounds.Dy(), errMsg)
+		sendDesktopPacket(modules.Packet{Act: `DESKTOP_QUIT`, Msg: quitMsg, Event: pack.Event}, desktop.rawEvent)
 		if boundsErr != nil {
 			return boundsErr
 		}
@@ -1881,29 +2319,15 @@ func InitDesktop(pack modules.Packet) error {
 
 	// Add session to map BEFORE starting goroutines to avoid race conditions
 	sessions.Set(uuid, desktop)
+	desktop.startMetricsReporter(uuid)
+	startSessionMetricsReporter(uuid, desktop)
 
 	// Start capture worker (worker guards itself with CAS to avoid duplicates)
 	startCaptureWorker()
 
-	// Send initial frame if worker is already running
-	if atomic.LoadInt32(&working) == 1 {
-		prevVal := prevDesktop.Load()
-		if prevVal != nil {
-			prev := prevVal.(*image.RGBA)
-			img := splitFullImage(prev, compress)
-			if img != nil {
-				desktop.lock.Lock()
-				select {
-				case desktop.channel <- message{t: 0, frame: &img}:
-				default:
-					// Channel full, skip initial frame
-				}
-				desktop.lock.Unlock()
-			}
-		}
-	}
-
-	// Send resolution message and start handler
+	// CRITICAL: Send resolution message FIRST, before any frame data.
+	// This ensures browser canvas is sized correctly before blocks are rendered.
+	// Without this, blocks may render on wrong-sized canvas causing partial display.
 	desktop.lock.Lock()
 	select {
 	case desktop.channel <- message{t: 2}:
@@ -1912,7 +2336,36 @@ func InitDesktop(pack modules.Packet) error {
 	}
 	desktop.lock.Unlock()
 
+	// Send initial frame if worker is already running (AFTER resolution)
+	if atomic.LoadInt32(&working) == 1 {
+		prevVal := prevDesktop.Load()
+		if prevVal != nil {
+			prev := prevVal.(*image.RGBA)
+			img := splitFullImage(prev, compress)
+			if img != nil {
+				desktop.lock.Lock()
+				select {
+				case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+				default:
+					// Channel full: drop oldest queued message and retry once.
+					select {
+					case <-desktop.channel:
+					default:
+					}
+					select {
+					case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+					default:
+						// Still full, skip initial frame
+					}
+				}
+				desktop.lock.Unlock()
+			}
+		}
+	}
+
 	// Start cursor capture loop (Windows only)
+	// Fixed: Re-enabled with proper thread handling (see cursor_windows.go)
+	// Cursor capture now uses runtime.LockOSThread() to avoid Win32 API threading issues
 	StartCursorCapture(rawEvent)
 
 	go handleDesktop(pack, uuid, desktop)
@@ -1936,6 +2389,15 @@ func PingDesktop(pack modules.Packet) {
 		return
 	}
 	atomic.StoreInt64(&desktop.lastPack, utils.Unix)
+
+	// Send DESKTOP_PONG response back to the server/browser for latency measurement.
+	// Use sendDesktopPacket so we automatically choose WS or IPC transport
+	// depending on whether we're running in Session 0 or bridge mode.
+	sendDesktopPacket(modules.Packet{
+		Act:   `DESKTOP_PONG`,
+		Code:  0,
+		Event: pack.Event,
+	}, desktop.rawEvent)
 }
 
 // KillDesktop gracefully terminates a desktop session.
@@ -1985,10 +2447,31 @@ func GetDesktop(pack modules.Packet) {
 		return
 	}
 
-	// FIXED: Use atomic.Value for prevDesktop (Issue #2)
+	// FIXED: Wait briefly for first frame if not available yet
+	// This ensures the browser receives a full frame on DESKTOP_SHOT request
+	// instead of getting nothing and showing a black screen
 	prevVal := prevDesktop.Load()
 	if prevVal == nil {
-		return
+		// Wait up to 500ms for the first frame to be captured
+		// This handles the race condition where DESKTOP_SHOT arrives before
+		// the capture worker has produced its first frame
+		for i := 0; i < 50; i++ {
+			time.Sleep(10 * time.Millisecond)
+			prevVal = prevDesktop.Load()
+			if prevVal != nil {
+				break
+			}
+			// Check if session was closed while waiting
+			if desktop.escape.Load() {
+				return
+			}
+		}
+		if prevVal == nil {
+			telemetry.LogStructured("WARN", "GetDesktop: no frame available after waiting", map[string]interface{}{
+				"uuid": uuid,
+			})
+			return
+		}
 	}
 	prev := prevVal.(*image.RGBA)
 
@@ -2002,15 +2485,36 @@ func GetDesktop(pack modules.Packet) {
 
 	if desktop.channel != nil {
 		select {
-		case desktop.channel <- message{t: 0, frame: &img}:
+		case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+			telemetry.LogStructured("DEBUG", "GetDesktop: full frame sent", map[string]interface{}{
+				"uuid":   uuid,
+				"blocks": len(img),
+			})
 		default:
-			// Channel full, skip screenshot
+			// Channel full: drop oldest queued message and retry once.
+			select {
+			case <-desktop.channel:
+			default:
+			}
+			select {
+			case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+				telemetry.LogStructured("DEBUG", "GetDesktop: full frame sent after drop", map[string]interface{}{
+					"uuid":   uuid,
+					"blocks": len(img),
+				})
+			default:
+				// Still full, skip screenshot
+				telemetry.LogStructured("WARN", "GetDesktop: channel full, skipping", map[string]interface{}{
+					"uuid": uuid,
+				})
+			}
 		}
 	}
 }
 
 func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 	defer func() {
+		stopSessionMetricsReporter(desktop)
 		// Cleanup on exit
 		desktop.lock.Lock()
 		if desktop.rtc != nil {
@@ -2052,7 +2556,7 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				// Each block: [len(2)][type(2)][x(2)][y(2)][w(2)][h(2)][data(len-10)]
 				// Chunks must stay under MaxMessageSize (65KB)
 
-				packFrameIntoChunks(rawEvent, msg.frame)
+				packFrameIntoChunks(rawEvent, msg.frameSeq, msg.frame, msg.keyframe)
 				continue
 			}
 			// set resolution
@@ -2069,6 +2573,9 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				bounds := boundsVal.(image.Rectangle)
 
 				buf := append(append(magicBytes, opResolution), rawEvent...)
+				// Resolution packets use the same extended header as frames.
+				// frameSeq=0 marks this as non-frame metadata for the browser.
+				buf = appendFrameMeta(buf, 0, 0, 1)
 				data := make([]byte, 6)
 				binary.BigEndian.PutUint16(data[:2], 4)
 				binary.BigEndian.PutUint16(data[2:4], uint16(bounds.Dx()))
@@ -2097,6 +2604,7 @@ func healthCheck() {
 		sessions.IterCb(func(uuid string, desktop *session) bool {
 			lastPack := atomic.LoadInt64(&desktop.lastPack)
 			if timestamp-lastPack > MaxInterval {
+				stopSessionMetricsReporter(desktop)
 				desktop.lock.Lock()
 				if desktop.rtc != nil {
 					desktop.rtc.close()

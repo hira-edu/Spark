@@ -29,10 +29,8 @@ type audio struct {
 
 var audioSessions = melody.New()
 
-const (
-	maxSDPLength       = 1 << 15
-	maxCandidateLength = 4096
-)
+// Payload limits are now centralized in utility/limits.go
+// See: REMOTE_DESKTOP_PIPELINE_AUDIT.md - Payload Constant Centralization
 
 func init() {
 	audioSessions.Config.MaxMessageSize = common.MaxMessageSize
@@ -417,7 +415,7 @@ func normalizeSDP(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	sdp, ok := data[`sdp`].(string)
-	if !ok || len(sdp) == 0 || len(sdp) > maxSDPLength {
+	if !ok || len(sdp) == 0 || len(sdp) > utility.MaxSDPLength {
 		return nil, false
 	}
 	// Validate SDP format
@@ -455,7 +453,7 @@ func normalizeCandidate(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	candidate, ok := data[`candidate`].(string)
-	if !ok || len(candidate) == 0 || len(candidate) > maxCandidateLength {
+	if !ok || len(candidate) == 0 || len(candidate) > utility.MaxCandidateLength {
 		return nil, false
 	}
 	// Validate ICE candidate format

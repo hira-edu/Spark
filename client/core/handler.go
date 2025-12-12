@@ -422,7 +422,10 @@ func initDesktop(pack modules.Packet, wsConn *common.Conn) {
 		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: err.Error()}, pack)
 	} else {
 		telemetry.LogStructured("INFO", "[DESKTOP_INIT_HANDLER_SUCCESS] Desktop init succeeded", nil)
-		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 0}, pack)
+		// DO NOT send response here - desktop.InitDesktop already sends DESKTOP_INIT
+		// with resolution data (width, height, monitors) via sendDesktopPacket.
+		// Sending another response without this data would cause the browser to
+		// miss the resolution info and fail to size the canvas properly.
 	}
 }
 

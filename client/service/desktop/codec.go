@@ -6,6 +6,7 @@ import (
 	"errors"
 	"image"
 	"image/jpeg"
+	"image/png"
 	"sync"
 	"sync/atomic"
 
@@ -41,6 +42,7 @@ const (
 	CodecTypeVP8  = 4 // VP8 (hardware when available)
 	CodecTypeVP9  = 5 // VP9 (hardware when available)
 	CodecTypeH264 = 6 // H.264 (hardware when available)
+	CodecTypePNG  = 7 // PNG (lossless, best for text/diagrams)
 )
 
 // Codec names for protocol
@@ -52,6 +54,7 @@ const (
 	CodecNameVP8  = "vp8"
 	CodecNameVP9  = "vp9"
 	CodecNameH264 = "h264"
+	CodecNamePNG  = "png"
 )
 
 // CodecConfig holds codec selection preferences
@@ -170,6 +173,8 @@ func SelectOptimalCodec(config CodecConfig) Codec {
 		return NewHardwareCodec(CodecTypeVP9, config.Quality, support)
 	case CodecTypeH264:
 		return NewHardwareCodec(CodecTypeH264, config.Quality, support)
+	case CodecTypePNG:
+		return NewPNGCodecFast() // Use fast PNG for real-time streaming
 	}
 
 	switch config.NetworkType {
@@ -238,6 +243,76 @@ func (c *RawCodec) Name() string                { return CodecNameRaw }
 func (c *RawCodec) Type() int                   { return CodecTypeRaw }
 func (c *RawCodec) Quality() int                { return 100 } // Lossless
 func (c *RawCodec) IsHardwareAccelerated() bool { return false }
+
+// ==================== PNG CODEC ====================
+// PNG provides lossless compression, optimal for text, terminals, and diagrams
+// Based on noVNC's Tight encoding (lossless mode) and Guacamole's PNG support
+
+// PNGCodec provides lossless PNG encoding for text-heavy content
+type PNGCodec struct {
+	compressionLevel png.CompressionLevel
+	pool             *sync.Pool
+}
+
+// NewPNGCodec creates a new PNG codec with the specified compression level
+// Compression levels: png.NoCompression, png.BestSpeed, png.BestCompression, png.DefaultCompression
+func NewPNGCodec(compressionLevel png.CompressionLevel) *PNGCodec {
+	return &PNGCodec{
+		compressionLevel: compressionLevel,
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return &bytes.Buffer{}
+			},
+		},
+	}
+}
+
+// NewPNGCodecFast creates a PNG codec optimized for speed (BestSpeed compression)
+// Good for real-time streaming where latency matters more than size
+func NewPNGCodecFast() *PNGCodec {
+	return NewPNGCodec(png.BestSpeed)
+}
+
+// NewPNGCodecQuality creates a PNG codec optimized for size (BestCompression)
+// Good for bandwidth-limited connections where size matters more than latency
+func NewPNGCodecQuality() *PNGCodec {
+	return NewPNGCodec(png.BestCompression)
+}
+
+func (c *PNGCodec) Encode(img *image.RGBA) ([]byte, error) {
+	if img == nil {
+		return nil, errors.New("nil image")
+	}
+
+	// Get buffer from pool
+	writer := c.pool.Get().(*bytes.Buffer)
+	writer.Reset()
+	defer c.pool.Put(writer)
+
+	// Create PNG encoder with specified compression level
+	encoder := &png.Encoder{CompressionLevel: c.compressionLevel}
+
+	// Encode to PNG
+	err := encoder.Encode(writer, img)
+	if err != nil {
+		codecStats.encodeErrors.Add(1)
+		return nil, err
+	}
+
+	// Copy result
+	result := make([]byte, writer.Len())
+	copy(result, writer.Bytes())
+
+	codecStats.encodeCount.Add(1)
+	codecStats.encodedBytes.Add(uint64(len(result)))
+
+	return result, nil
+}
+
+func (c *PNGCodec) Name() string                { return CodecNamePNG }
+func (c *PNGCodec) Type() int                   { return CodecTypePNG }
+func (c *PNGCodec) Quality() int                { return 100 } // Lossless
+func (c *PNGCodec) IsHardwareAccelerated() bool { return false }
 
 // ==================== JPEG CODEC ====================
 
@@ -361,13 +436,57 @@ func (c *WebPCodec) IsHardwareAccelerated() bool { return false }
 // ==================== AVIF / PROXY CODECS ====================
 
 // ProxyCodec provides a lightweight wrapper to expose additional codec types
-// (e.g., AVIF, VP8/VP9/H.264) while reusing a fallback encoder underneath.
+// (e.g., AVIF, VP8/VP9/H.264) while reusing a fallback encoder underneath. It
+// keeps track of the requested codec so telemetry/config responses can surface
+// when a fallback is engaged.
 type ProxyCodec struct {
-	name      string
-	codecType int
-	hardware  bool
-	quality   int
-	inner     Codec
+	requestedName  string
+	requestedType  int
+	quality        int
+	inner          Codec
+	fallbackReason string
+}
+
+// RequestedName returns the codec name that was originally requested.
+func (c *ProxyCodec) RequestedName() string {
+	if c.requestedName != "" {
+		return c.requestedName
+	}
+	return c.Name()
+}
+
+// RequestedType returns the codec type that was originally requested.
+func (c *ProxyCodec) RequestedType() int {
+	if c.requestedType != 0 {
+		return c.requestedType
+	}
+	return c.Type()
+}
+
+// HasFallback reports whether the proxy is using a codec different from the one
+// that was requested (e.g., requested h264 but actually encoding JPEG).
+func (c *ProxyCodec) HasFallback() bool {
+	if c.inner == nil {
+		return false
+	}
+	return c.inner.Name() != c.RequestedName() || c.inner.Type() != c.RequestedType()
+}
+
+func (c *ProxyCodec) logFallback(reason string) {
+	if !c.HasFallback() {
+		return
+	}
+	c.fallbackReason = reason
+	telemetry.LogStructured("WARN", "codec: fallback engaged", map[string]interface{}{
+		"requested": c.RequestedName(),
+		"actual":    c.inner.Name(),
+		"reason":    reason,
+	})
+}
+
+// FallbackReason returns the recorded reason when a proxy uses a fallback encoder.
+func (c *ProxyCodec) FallbackReason() string {
+	return c.fallbackReason
 }
 
 func NewAVIFCodec(quality int) Codec {
@@ -375,13 +494,14 @@ func NewAVIFCodec(quality int) Codec {
 	if fallback == nil {
 		fallback = NewJPEGCodec(quality)
 	}
-	return &ProxyCodec{
-		name:      CodecNameAVIF,
-		codecType: CodecTypeAVIF,
-		hardware:  false,
-		quality:   quality,
-		inner:     fallback,
+	proxy := &ProxyCodec{
+		requestedName: CodecNameAVIF,
+		requestedType: CodecTypeAVIF,
+		quality:       quality,
+		inner:         fallback,
 	}
+	proxy.logFallback("avif codec requires CGO/libavif; using JPEG fallback")
+	return proxy
 }
 
 // NewHardwareCodec wraps a software fallback while surfacing hardware capability flags.
@@ -413,13 +533,22 @@ func NewHardwareCodec(codecType int, quality int, support *HardwareCodecSupport)
 		fallback = NewJPEGCodec(quality)
 	}
 
-	return &ProxyCodec{
-		name:      name,
-		codecType: codecType,
-		hardware:  hardware,
-		quality:   quality,
-		inner:     fallback,
+	proxy := &ProxyCodec{
+		requestedName: name,
+		requestedType: codecType,
+		quality:       quality,
+		inner:         fallback,
 	}
+
+	if fallback != nil && fallback.Name() != name {
+		reason := "hardware encoder unavailable on device"
+		if hardware {
+			reason = "hardware encoder requested but codec not built (enable CGO/libvpx)"
+		}
+		proxy.logFallback(reason)
+	}
+
+	return proxy
 }
 
 func (c *ProxyCodec) Encode(img *image.RGBA) ([]byte, error) {
@@ -436,15 +565,38 @@ func (c *ProxyCodec) EnableAdaptiveQuality(aqm *AdaptiveQualityManager) {
 	}
 }
 
-func (c *ProxyCodec) Name() string { return c.name }
-func (c *ProxyCodec) Type() int    { return c.codecType }
+func (c *ProxyCodec) Name() string {
+	if c.inner != nil {
+		return c.inner.Name()
+	}
+	if c.requestedName != "" {
+		return c.requestedName
+	}
+	return CodecNameJPEG
+}
+
+func (c *ProxyCodec) Type() int {
+	if c.inner != nil {
+		return c.inner.Type()
+	}
+	if c.requestedType != 0 {
+		return c.requestedType
+	}
+	return CodecTypeJPEG
+}
+
 func (c *ProxyCodec) Quality() int {
 	if c.inner != nil {
 		return c.inner.Quality()
 	}
 	return c.quality
 }
-func (c *ProxyCodec) IsHardwareAccelerated() bool { return c.hardware }
+func (c *ProxyCodec) IsHardwareAccelerated() bool {
+	if c.inner != nil {
+		return c.inner.IsHardwareAccelerated()
+	}
+	return false
+}
 
 // ==================== HARDWARE CODEC DETECTION ====================
 
@@ -493,7 +645,7 @@ func getHardwareSupport() *HardwareCodecSupport {
 // GetCodecStats returns current codec statistics
 func GetCodecStats() map[string]interface{} {
 	codec := GetCodec()
-	return map[string]interface{}{
+	stats := map[string]interface{}{
 		"active_codec":     codec.Name(),
 		"codec_type":       codec.Type(),
 		"codec_quality":    codec.Quality(),
@@ -504,4 +656,19 @@ func GetCodecStats() map[string]interface{} {
 		"hardware_encodes": codecStats.hardwareEncodes.Load(),
 		"codec_switches":   codecStats.codecSwitches.Load(),
 	}
+
+	if proxy, ok := codec.(*ProxyCodec); ok {
+		stats["requested_codec"] = proxy.RequestedName()
+		stats["requested_codec_type"] = proxy.RequestedType()
+		stats["codec_fallback"] = proxy.HasFallback()
+		if proxy.HasFallback() && proxy.FallbackReason() != "" {
+			stats["codec_fallback_reason"] = proxy.FallbackReason()
+		}
+	} else {
+		stats["requested_codec"] = codec.Name()
+		stats["requested_codec_type"] = codec.Type()
+		stats["codec_fallback"] = false
+	}
+
+	return stats
 }

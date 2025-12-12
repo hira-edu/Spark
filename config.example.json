@@ -35,6 +35,19 @@
     "cleanup_interval_seconds": 30,
     "use_change_streams": true
   },
+  "desktop": {
+    "capture": {
+      "mode": "auto",
+      "enable_pre_dwm": false,
+      "fallback_order": [
+        "sharedSurface",
+        "nvfbc",
+        "dxgi",
+        "gdi"
+      ],
+      "adapter_luid": ""
+    }
+  },
   "webrtc": {
     "turn_servers": [],
     "stun_servers": [
@@ -54,5 +67,13 @@
       "listen": ":53",
       "domain": "c2.example.com"
     }
+  },
+  "p2p": {
+    "enable": false,
+    "rendezvous_url": "",
+    "target": "",
+    "stun_servers": [
+      "stun:stun.l.google.com:19302"
+    ]
   }
 }

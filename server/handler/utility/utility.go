@@ -32,6 +32,22 @@ func shortCommit(commit string) string {
 	return commit[:8] + `...`
 }
 
+var browserStatKeys = []string{`rendered`, `failed`, `skipped`, `stale`, `staleRate`, `latency`, `fps`}
+
+// CollectBrowserStats safely copies allowed browser telemetry fields into a gin.H map.
+func CollectBrowserStats(data map[string]any) gin.H {
+	stats := gin.H{}
+	if data == nil {
+		return stats
+	}
+	for _, key := range browserStatKeys {
+		if val, ok := data[key]; ok {
+			stats[key] = val
+		}
+	}
+	return stats
+}
+
 // CheckForm checks if the form contains the required fields.
 // Every request must contain connection UUID or device ID.
 func CheckForm(ctx *gin.Context, form any) (string, bool) {
@@ -534,7 +550,9 @@ func WSHealthCheck(container *melody.Melody, sender Sender) {
 				`sessionUUID`: uuid[:8] + `...`,
 			})
 			s.Close()
+			return
 		}
+		s.Set(`AwaitingPong`, utils.Unix)
 	}
 
 	// Health check loop runs every 20 seconds
@@ -576,6 +594,22 @@ func WSHealthCheck(container *melody.Melody, sender Sender) {
 			}
 
 			idleTime := timestamp - lastPack
+
+			// Enforce PONG timeout if we recently sent a ping
+			if val, ok := s.Get(`AwaitingPong`); ok {
+				if awaiting, _ := val.(int64); awaiting > 0 {
+					if lastPack >= awaiting {
+						s.Set(`AwaitingPong`, int64(0))
+					} else if timestamp-awaiting >= PongTimeoutSeconds {
+						common.Warn(nil, `HEALTH_CHECK`, `timeout`, `pong timeout exceeded`, map[string]any{
+							`sessionUUID`: uuid[:8] + `...`,
+							`timeout`:     PongTimeoutSeconds,
+						})
+						queue = append(queue, s)
+						return true
+					}
+				}
+			}
 
 			// Check for exceeded idle timeout (no activity for 5 minutes)
 			if idleTime > MaxIdleSeconds {

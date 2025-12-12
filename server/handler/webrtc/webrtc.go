@@ -14,10 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	maxSDPLength       = 1 << 15 // 32 KiB
-	maxCandidateLength = 4096
-)
+// Payload limits are now centralized in utility/limits.go
+// See: REMOTE_DESKTOP_PIPELINE_AUDIT.md - Payload Constant Centralization
 
 type sdpForm struct {
 	SDP     string `json:"sdp" binding:"required"`
@@ -42,7 +40,7 @@ func Offer(ctx *gin.Context) {
 	if !ok {
 		return
 	}
-	if len(form.SDP) == 0 || len(form.SDP) > maxSDPLength {
+	if len(form.SDP) == 0 || len(form.SDP) > utility.MaxSDPLength {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
@@ -91,7 +89,7 @@ func Answer(ctx *gin.Context) {
 	if !ok {
 		return
 	}
-	if len(form.SDP) == 0 || len(form.SDP) > maxSDPLength {
+	if len(form.SDP) == 0 || len(form.SDP) > utility.MaxSDPLength {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
@@ -140,7 +138,7 @@ func ICE(ctx *gin.Context) {
 	if !ok {
 		return
 	}
-	if len(form.Candidate) == 0 || len(form.Candidate) > maxCandidateLength {
+	if len(form.Candidate) == 0 || len(form.Candidate) > utility.MaxCandidateLength {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
@@ -207,8 +205,21 @@ func iceServers() gin.H {
 			`stun`: []string{},
 		}
 	}
+
+	cfg := servercfg.Config.WebRTC
+
+	// Use BuildICEServers for consistent credential generation
+	servers := utility.BuildICEServers(
+		cfg.Stun,
+		cfg.Turn,
+		cfg.TurnSecret,
+		"webrtc",
+		cfg.TurnCredentialTTL,
+	)
+
 	return gin.H{
-		`turn`: servercfg.Config.WebRTC.Turn,
-		`stun`: servercfg.Config.WebRTC.Stun,
+		`ice_servers`: servers,
+		`stun`:        cfg.Stun, // Legacy format for backwards compatibility
+		`turn`:        cfg.Turn, // Legacy format for backwards compatibility
 	}
 }

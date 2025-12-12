@@ -15,6 +15,7 @@ import Overview from "./pages/overview";
 import SharePage from "./pages/share";
 import LoginPage from "./pages/login";
 import SetupPage from "./pages/setup";
+import MockDesktopPage from "./pages/mock-desktop";
 import {translate} from "./utils/utils";
 
 axios.defaults.baseURL = '.';
@@ -78,6 +79,7 @@ root.render(
 					<Route path="/login" element={<LoginPage/>}/>
 					<Route path="/setup" element={<SetupPage/>}/>
 					<Route path="/share" element={<SharePage/>}/>
+					<Route path="/mock-desktop" element={<MockDesktopPage/>}/>
 
 					{/* Protected routes */}
 					<Route path="/" element={

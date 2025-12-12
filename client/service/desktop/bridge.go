@@ -200,6 +200,10 @@ func (b *Bridge) handleInit(payload []byte) {
 func (b *Bridge) handleKill(payload []byte) {
 	var pack modules.Packet
 	if err := utils.JSON.Unmarshal(payload, &pack); err != nil {
+		telemetry.LogStructured("WARN", "Bridge: failed to unmarshal KILL packet", map[string]interface{}{
+			"error":        err.Error(),
+			"payload_size": len(payload),
+		})
 		return
 	}
 	if b.shouldDropPacket(&pack) {
@@ -211,6 +215,10 @@ func (b *Bridge) handleKill(payload []byte) {
 func (b *Bridge) handlePing(payload []byte) {
 	var pack modules.Packet
 	if err := utils.JSON.Unmarshal(payload, &pack); err != nil {
+		telemetry.LogStructured("WARN", "Bridge: failed to unmarshal PING packet", map[string]interface{}{
+			"error":        err.Error(),
+			"payload_size": len(payload),
+		})
 		return
 	}
 	if b.shouldDropPacket(&pack) {
@@ -222,6 +230,10 @@ func (b *Bridge) handlePing(payload []byte) {
 func (b *Bridge) handleInput(payload []byte) {
 	var pack modules.Packet
 	if err := utils.JSON.Unmarshal(payload, &pack); err != nil {
+		telemetry.LogStructured("WARN", "Bridge: failed to unmarshal INPUT packet", map[string]interface{}{
+			"error":        err.Error(),
+			"payload_size": len(payload),
+		})
 		return
 	}
 	if b.shouldDropPacket(&pack) {
@@ -233,6 +245,10 @@ func (b *Bridge) handleInput(payload []byte) {
 func (b *Bridge) handleConfig(payload []byte) {
 	var pack modules.Packet
 	if err := utils.JSON.Unmarshal(payload, &pack); err != nil {
+		telemetry.LogStructured("WARN", "Bridge: failed to unmarshal CONFIG packet", map[string]interface{}{
+			"error":        err.Error(),
+			"payload_size": len(payload),
+		})
 		return
 	}
 	if b.shouldDropPacket(&pack) {
@@ -244,6 +260,10 @@ func (b *Bridge) handleConfig(payload []byte) {
 func (b *Bridge) handleShot(payload []byte) {
 	var pack modules.Packet
 	if err := utils.JSON.Unmarshal(payload, &pack); err != nil {
+		telemetry.LogStructured("WARN", "Bridge: failed to unmarshal SHOT packet", map[string]interface{}{
+			"error":        err.Error(),
+			"payload_size": len(payload),
+		})
 		return
 	}
 	if b.shouldDropPacket(&pack) {

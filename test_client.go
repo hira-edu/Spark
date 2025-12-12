@@ -8,10 +8,14 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +25,16 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// Mock desktop configuration
+var (
+	mockDesktopMode   bool
+	mockDesktopWidth  int
+	mockDesktopHeight int
+	mockDesktopFPS    int
+	mockFrameCount    int64
+	mockWireFrameSeq  uint32
 )
 
 // Packet represents a message packet
@@ -44,9 +58,37 @@ func main() {
 	port := flag.Int("port", 8443, "Server port")
 	salt := flag.String("salt", "testsalt1234567890123", "Server salt (must match config.json)")
 	secure := flag.Bool("secure", false, "Use wss:// instead of ws://")
+	mockDesktop := flag.Bool("mock-desktop", false, "Enable mock desktop mode for E2E testing")
+	mockWidth := flag.Int("mock-width", 1920, "Mock desktop width")
+	mockHeight := flag.Int("mock-height", 1080, "Mock desktop height")
+	mockFPS := flag.Int("mock-fps", 10, "Mock desktop FPS")
+	mockStandalone := flag.Bool("mock-standalone", false, "Run standalone mock desktop server (no Rocket connection)")
+	mockListenPort := flag.Int("mock-port", 18081, "Standalone mock desktop server port")
 	flag.Parse()
 
+	// Set mock desktop globals
+	mockDesktopMode = *mockDesktop
+	mockDesktopWidth = *mockWidth
+	mockDesktopHeight = *mockHeight
+	mockDesktopFPS = *mockFPS
+
+	// Standalone mock desktop server mode (used by Playwright E2E harness)
+	if *mockStandalone {
+		listenPort := *mockListenPort
+		if *port != 8443 {
+			listenPort = *port
+		}
+		if listenPort == 0 {
+			listenPort = 18081
+		}
+		runStandaloneMockServer(listenPort, mockDesktopWidth, mockDesktopHeight, mockDesktopFPS)
+		return
+	}
+
 	fmt.Println("=== Spark WebSocket Test Client ===")
+	if mockDesktopMode {
+		fmt.Printf("Mock Desktop Mode: %dx%d @ %d FPS\n", mockDesktopWidth, mockDesktopHeight, mockDesktopFPS)
+	}
 	fmt.Printf("Connecting to %s:%d (secure=%v)\n", *host, *port, *secure)
 
 	// Generate credentials
@@ -94,6 +136,11 @@ func main() {
 	// Start message reader
 	go readMessages()
 
+	// Start mock desktop streaming if enabled
+	if mockDesktopMode {
+		go runMockDesktop()
+	}
+
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -111,6 +158,12 @@ func main() {
 	fmt.Println("  ping <id>     - Ping device")
 	fmt.Println("  raw <json>    - Send raw JSON packet")
 	fmt.Println("  quit          - Exit")
+	if mockDesktopMode {
+		fmt.Println("\nMock Desktop commands:")
+		fmt.Println("  resolution <w> <h> - Change resolution")
+		fmt.Println("  pong [source]      - Send DESKTOP_PONG")
+		fmt.Println("  stats              - Show frame statistics")
+	}
 	fmt.Println()
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -196,6 +249,50 @@ func readMessages() {
 				deviceID = data
 				fmt.Printf("Device ID set to: %s\n", deviceID)
 			}
+		}
+
+		// Echo input events for E2E test verification (mock-desktop mode)
+		if mockDesktopMode && pack.Act == "DESKTOP_INPUT" {
+			if events, ok := pack.Data["events"].([]interface{}); ok {
+				fmt.Printf("[MockDesktop] INPUT_RECEIVED events=%d\n", len(events))
+				for i, evt := range events {
+					if evtMap, ok := evt.(map[string]interface{}); ok {
+						fmt.Printf("[MockDesktop]   [%d] type=%v x=%v y=%v button=%v key=%v down=%v\n",
+							i,
+							evtMap["type"],
+							evtMap["x"],
+							evtMap["y"],
+							evtMap["button"],
+							evtMap["key"],
+							evtMap["down"])
+					}
+				}
+			}
+		}
+
+		// Echo ping requests and respond with pong (mock-desktop mode)
+		if mockDesktopMode && pack.Act == "DESKTOP_PING" {
+			fmt.Println("[MockDesktop] PING received, sending PONG")
+			pongPack := Packet{
+				Act: "DESKTOP_PONG",
+				Data: map[string]interface{}{
+					"source": "device",
+				},
+			}
+			jsonBytes, _ := json.Marshal(pongPack)
+			sendJSONPacket(jsonBytes)
+		}
+
+		// Echo shot requests (mock-desktop mode)
+		if mockDesktopMode && pack.Act == "DESKTOP_SHOT" {
+			fmt.Println("[MockDesktop] SHOT request received, sending full frame")
+			// Send a full-screen frame
+			sendMockFullFrame()
+		}
+
+		// Echo config changes (mock-desktop mode)
+		if mockDesktopMode && pack.Act == "DESKTOP_CONFIG" {
+			fmt.Printf("[MockDesktop] CONFIG received: %+v\n", pack.Data)
 		}
 	}
 }
@@ -338,6 +435,28 @@ func handleCommand(input string) {
 		}
 		sendPacket(pack)
 
+	// Mock desktop specific commands
+	case "resolution":
+		if mockDesktopMode {
+			handleMockDesktopCommand(input)
+		} else {
+			fmt.Println("Command only available in mock-desktop mode")
+		}
+
+	case "pong":
+		if mockDesktopMode {
+			handleMockDesktopCommand(input)
+		} else {
+			fmt.Println("Command only available in mock-desktop mode")
+		}
+
+	case "stats":
+		if mockDesktopMode {
+			handleMockDesktopCommand(input)
+		} else {
+			fmt.Println("Command only available in mock-desktop mode")
+		}
+
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 	}
@@ -431,6 +550,360 @@ func xorBytes(data, key []byte) []byte {
 		result[i] = data[i] ^ key[i%len(key)]
 	}
 	return result
+}
+
+// ============================================================================
+// Mock Desktop Functions (for E2E testing)
+// ============================================================================
+
+// Protocol constants (must match client/service/desktop/desktop.go)
+const (
+	magicDesktop   = "\x22\x16\x13\x11" // 34, 22, 19, 17
+	serviceDesktop = 20
+	serviceShare   = 21
+
+	opFrameFirst    = 0 // First chunk of frame
+	opFrameContinue = 1 // Continuation chunk
+	opResolution    = 2 // Resolution update
+	opJSON          = 3 // JSON control message
+
+	// Protocol v2 adds 8 bytes of per-frame metadata after the event ID.
+	eventIDLength           = 16
+	frameMetaLength         = 8
+	legacyFrameHeaderLength = 4 + 1 + 1 + eventIDLength
+	frameHeaderLength       = legacyFrameHeaderLength + frameMetaLength
+)
+
+// runMockDesktop starts the mock desktop streaming loop
+func runMockDesktop() {
+	fmt.Println("[MockDesktop] Starting mock desktop stream...")
+
+	// Wait for connection to stabilize
+	time.Sleep(500 * time.Millisecond)
+
+	// Send initial resolution
+	sendMockResolution(mockDesktopWidth, mockDesktopHeight)
+
+	// Send DESKTOP_INIT response
+	sendMockDesktopInit()
+
+	// Start frame loop
+	ticker := time.NewTicker(time.Second / time.Duration(mockDesktopFPS))
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if conn == nil {
+			return
+		}
+		mockFrameCount++
+		sendMockFrame()
+
+		// Log every 30 frames
+		if mockFrameCount%30 == 0 {
+			fmt.Printf("[MockDesktop] Sent %d frames\n", mockFrameCount)
+		}
+	}
+}
+
+// sendMockResolution sends a binary resolution packet
+func sendMockResolution(width, height int) {
+	// Format (v2): magic(4) + service(1) + op(1) + eventID(16) + frameMeta(8) + bodyLen(2) + width(2) + height(2)
+	buf := make([]byte, frameHeaderLength+2+2+2)
+	offset := 0
+
+	// Magic prefix
+	copy(buf[offset:], magicDesktop)
+	offset += 4
+
+	// Service and op
+	buf[offset] = serviceDesktop
+	offset++
+	buf[offset] = opResolution
+	offset++
+
+	// Event ID (16 random bytes)
+	eventID := generateEventIDBytes()
+	copy(buf[offset:], eventID)
+	offset += 16
+
+	// Frame metadata (frameSeq=0 marks non-frame payloads like resolution updates)
+	binary.BigEndian.PutUint32(buf[offset:], 0)
+	binary.BigEndian.PutUint16(buf[offset+4:], 0)
+	binary.BigEndian.PutUint16(buf[offset+6:], 1)
+	offset += 8
+
+	// Body length (4 bytes: width + height)
+	binary.BigEndian.PutUint16(buf[offset:], 4)
+	offset += 2
+
+	// Width and height
+	binary.BigEndian.PutUint16(buf[offset:], uint16(width))
+	offset += 2
+	binary.BigEndian.PutUint16(buf[offset:], uint16(height))
+
+	connMutex.Lock()
+	err := conn.WriteMessage(websocket.BinaryMessage, buf)
+	connMutex.Unlock()
+
+	if err != nil {
+		fmt.Printf("[MockDesktop] Failed to send resolution: %v\n", err)
+		return
+	}
+	fmt.Printf("[MockDesktop] Sent resolution: %dx%d\n", width, height)
+}
+
+// sendMockDesktopInit sends a JSON DESKTOP_INIT packet
+func sendMockDesktopInit() {
+	pack := Packet{
+		Act: "DESKTOP_INIT",
+		Data: map[string]interface{}{
+			"width":  mockDesktopWidth,
+			"height": mockDesktopHeight,
+			"monitors": []map[string]interface{}{
+				{
+					"id":     0,
+					"name":   "MockDisplay",
+					"width":  mockDesktopWidth,
+					"height": mockDesktopHeight,
+				},
+			},
+		},
+	}
+
+	jsonBytes, _ := json.Marshal(pack)
+	sendJSONPacket(jsonBytes)
+	fmt.Println("[MockDesktop] Sent DESKTOP_INIT")
+}
+
+// sendJSONPacket sends a JSON packet with the desktop protocol header
+func sendJSONPacket(jsonBytes []byte) {
+	// Format: magic(4) + service(1) + op(1) + bodyLen(2) + body
+	buf := make([]byte, 4+1+1+2+len(jsonBytes))
+	offset := 0
+
+	copy(buf[offset:], magicDesktop)
+	offset += 4
+
+	buf[offset] = serviceDesktop
+	offset++
+	buf[offset] = opJSON
+	offset++
+
+	binary.BigEndian.PutUint16(buf[offset:], uint16(len(jsonBytes)))
+	offset += 2
+
+	copy(buf[offset:], jsonBytes)
+
+	connMutex.Lock()
+	err := conn.WriteMessage(websocket.BinaryMessage, buf)
+	connMutex.Unlock()
+
+	if err != nil {
+		fmt.Printf("[MockDesktop] Failed to send JSON packet: %v\n", err)
+	}
+}
+
+// sendMockFrame sends a mock desktop frame with a simple test pattern
+func sendMockFrame() {
+	// Generate a small test image block
+	blockWidth := 100
+	blockHeight := 100
+	blockX := int(mockFrameCount*10) % (mockDesktopWidth - blockWidth)
+	blockY := int(mockFrameCount*7) % (mockDesktopHeight - blockHeight)
+
+	// Create test image with varying color
+	img := image.NewRGBA(image.Rect(0, 0, blockWidth, blockHeight))
+	r := uint8((mockFrameCount * 3) % 256)
+	g := uint8((mockFrameCount * 5) % 256)
+	b := uint8((mockFrameCount * 7) % 256)
+	for y := 0; y < blockHeight; y++ {
+		for x := 0; x < blockWidth; x++ {
+			img.Set(x, y, color.RGBA{r, g, b, 255})
+		}
+	}
+
+	// Encode as JPEG
+	var jpegBuf bytes.Buffer
+	jpeg.Encode(&jpegBuf, img, &jpeg.Options{Quality: 70})
+	jpegBytes := jpegBuf.Bytes()
+
+	// Build frame packet
+	// Block format: bodyLen(2) + imageType(2) + x(2) + y(2) + w(2) + h(2) + imageData
+	blockBodyLen := 10 + len(jpegBytes)
+	blockBuf := make([]byte, 2+blockBodyLen)
+	blockOffset := 0
+
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockBodyLen))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], 1) // JPEG = 1
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockX))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockY))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockWidth))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockHeight))
+	blockOffset += 2
+	copy(blockBuf[blockOffset:], jpegBytes)
+
+	connMutex.Lock()
+	mockWireFrameSeq++
+	frameSeq := mockWireFrameSeq
+
+	// Frame header: magic(4) + service(1) + op(1) + eventID(16) + blocks
+	frameBuf := make([]byte, frameHeaderLength+len(blockBuf))
+	offset := 0
+
+	copy(frameBuf[offset:], magicDesktop)
+	offset += 4
+	frameBuf[offset] = serviceDesktop
+	offset++
+	frameBuf[offset] = opFrameFirst
+	offset++
+
+	eventID := generateEventIDBytes()
+	copy(frameBuf[offset:], eventID)
+	offset += 16
+
+	binary.BigEndian.PutUint32(frameBuf[offset:], frameSeq)
+	binary.BigEndian.PutUint16(frameBuf[offset+4:], 0)
+	binary.BigEndian.PutUint16(frameBuf[offset+6:], 1)
+	offset += 8
+
+	copy(frameBuf[offset:], blockBuf)
+
+	err := conn.WriteMessage(websocket.BinaryMessage, frameBuf)
+	connMutex.Unlock()
+
+	if err != nil {
+		fmt.Printf("[MockDesktop] Failed to send frame: %v\n", err)
+	}
+}
+
+// generateEventIDBytes generates a 16-byte event ID
+func generateEventIDBytes() []byte {
+	id := make([]byte, 16)
+	now := time.Now().UnixNano()
+	for i := range id {
+		id[i] = byte(now>>(i*4)) ^ byte(i*31+13)
+	}
+	return id
+}
+
+// sendMockFullFrame sends a complete frame covering the entire screen
+// Used when DESKTOP_SHOT is requested to ensure the browser gets a full initial frame
+func sendMockFullFrame() {
+	// Create a full-screen gradient image
+	img := image.NewRGBA(image.Rect(0, 0, mockDesktopWidth, mockDesktopHeight))
+	for y := 0; y < mockDesktopHeight; y++ {
+		for x := 0; x < mockDesktopWidth; x++ {
+			r := uint8(x * 255 / mockDesktopWidth)
+			g := uint8(y * 255 / mockDesktopHeight)
+			b := uint8(128)
+			img.Set(x, y, color.RGBA{r, g, b, 255})
+		}
+	}
+
+	// Encode as JPEG with higher quality for full frames
+	var jpegBuf bytes.Buffer
+	jpeg.Encode(&jpegBuf, img, &jpeg.Options{Quality: 80})
+	jpegBytes := jpegBuf.Bytes()
+
+	// Build full frame packet
+	blockBodyLen := 10 + len(jpegBytes)
+	blockBuf := make([]byte, 2+blockBodyLen)
+	blockOffset := 0
+
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(blockBodyLen))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], 1) // JPEG = 1
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], 0) // x = 0
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], 0) // y = 0
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(mockDesktopWidth))
+	blockOffset += 2
+	binary.BigEndian.PutUint16(blockBuf[blockOffset:], uint16(mockDesktopHeight))
+	blockOffset += 2
+	copy(blockBuf[blockOffset:], jpegBytes)
+
+	connMutex.Lock()
+	mockWireFrameSeq++
+	frameSeq := mockWireFrameSeq
+
+	// Frame header (v2)
+	frameBuf := make([]byte, frameHeaderLength+len(blockBuf))
+	offset := 0
+
+	copy(frameBuf[offset:], magicDesktop)
+	offset += 4
+	frameBuf[offset] = serviceDesktop
+	offset++
+	frameBuf[offset] = opFrameFirst
+	offset++
+
+	eventID := generateEventIDBytes()
+	copy(frameBuf[offset:], eventID)
+	offset += 16
+
+	binary.BigEndian.PutUint32(frameBuf[offset:], frameSeq)
+	binary.BigEndian.PutUint16(frameBuf[offset+4:], 0)
+	binary.BigEndian.PutUint16(frameBuf[offset+6:], 1)
+	offset += 8
+
+	copy(frameBuf[offset:], blockBuf)
+
+	err := conn.WriteMessage(websocket.BinaryMessage, frameBuf)
+	connMutex.Unlock()
+
+	if err != nil {
+		fmt.Printf("[MockDesktop] Failed to send full frame: %v\n", err)
+	} else {
+		fmt.Printf("[MockDesktop] Sent full frame (%dx%d, %d bytes)\n", mockDesktopWidth, mockDesktopHeight, len(frameBuf))
+	}
+}
+
+// handleMockDesktopCommand handles stdin commands for mock desktop control
+func handleMockDesktopCommand(cmd string) {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return
+	}
+
+	switch parts[0] {
+	case "resolution":
+		if len(parts) >= 3 {
+			var w, h int
+			fmt.Sscanf(parts[1], "%d", &w)
+			fmt.Sscanf(parts[2], "%d", &h)
+			if w > 0 && h > 0 {
+				mockDesktopWidth = w
+				mockDesktopHeight = h
+				sendMockResolution(w, h)
+			}
+		} else {
+			fmt.Println("Usage: resolution <width> <height>")
+		}
+	case "pong":
+		source := "device"
+		if len(parts) >= 2 {
+			source = parts[1]
+		}
+		pack := Packet{
+			Act: "DESKTOP_PONG",
+			Data: map[string]interface{}{
+				"source": source,
+			},
+		}
+		jsonBytes, _ := json.Marshal(pack)
+		sendJSONPacket(jsonBytes)
+		fmt.Printf("[MockDesktop] Sent PONG (source=%s)\n", source)
+	case "stats":
+		fmt.Printf("[MockDesktop] Frames sent: %d\n", mockFrameCount)
+		fmt.Printf("[MockDesktop] Resolution: %dx%d @ %d FPS\n", mockDesktopWidth, mockDesktopHeight, mockDesktopFPS)
+	}
 }
 
 func init() {

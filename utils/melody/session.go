@@ -130,6 +130,13 @@ func (s *Session) readPump() {
 			break
 		}
 
+		// CRITICAL FIX: Extend read deadline on EVERY message received
+		// Without this, connections close after PongWait (60s) even if app-level
+		// messages are flowing. The original code only extended deadline on
+		// WebSocket-level PONGs, but our protocol uses app-level DESKTOP_PING.
+		// This prevents code 1006 closures during active streaming.
+		s.conn.SetReadDeadline(time.Now().Add(s.melody.Config.PongWait))
+
 		if t == ws.TextMessage {
 			s.melody.messageHandler(s, message)
 		}

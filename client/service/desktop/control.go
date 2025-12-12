@@ -5,6 +5,7 @@ import (
 	"Rocket/client/telemetry"
 	"Rocket/modules"
 	"errors"
+	"fmt"
 	"image"
 	"reflect"
 	"strings"
@@ -23,6 +24,7 @@ func init() {
 	configFPS.Store(fpsDefault)
 	configQuality.Store(imageQuality)
 	configMonitor.Store(0)
+	setConfiguredCaptureBackend(CaptureBackendAuto)
 }
 
 // HandleConfig processes DESKTOP_CONFIG action with atomic updates.
@@ -44,6 +46,7 @@ func HandleConfig(pack modules.Packet) error {
 
 	var updated []string
 	var errors []string
+	var warnings []string
 	var selectedBounds image.Rectangle
 
 	// Update allowControl (per session toggle)
@@ -155,6 +158,27 @@ skipQuality:
 	}
 skipMonitor:
 
+	// Update capture backend preference (nvfbc, dxgi, gdi, etc.)
+	if captureVal, ok := pack.Data["capture"]; ok {
+		captureStr, ok := captureVal.(string)
+		if !ok {
+			errors = append(errors, "capture: invalid type (expected string)")
+			goto skipCapture
+		}
+		newBackend, err := captureBackendFromString(captureStr)
+		if err != nil {
+			errors = append(errors, err.Error())
+			goto skipCapture
+		}
+		oldBackend := setConfiguredCaptureBackend(newBackend)
+		updated = append(updated, "capture")
+		telemetry.LogStructured("INFO", "config: capture backend updated", map[string]interface{}{
+			"old": captureBackendName(oldBackend),
+			"new": captureBackendName(newBackend),
+		})
+	}
+skipCapture:
+
 	// Update codec (if provided)
 	if codecVal, ok := pack.Data["codec"]; ok {
 		codecName, ok := codecVal.(string)
@@ -194,17 +218,38 @@ skipMonitor:
 		if newCodec != nil {
 			SetCodec(newCodec)
 			updated = append(updated, "codec")
+			if proxy, ok := newCodec.(*ProxyCodec); ok && proxy.HasFallback() {
+				reason := proxy.FallbackReason()
+				if reason == "" {
+					reason = "hardware encoder unavailable"
+				}
+				warnings = append(warnings, fmt.Sprintf("Requested %s codec but using %s (%s)", proxy.RequestedName(), proxy.Name(), reason))
+			}
 		}
 	}
 skipCodec:
 
 	// Send acknowledgement
+	currentCodec := GetCodec()
 	ackData := map[string]interface{}{
-		"updated": updated,
-		"fps":     configFPS.Load(),
-		"quality": configQuality.Load(),
-		"monitor": configMonitor.Load(),
-		"codec":   GetCodec().Name(),
+		"updated":                updated,
+		"fps":                    configFPS.Load(),
+		"quality":                configQuality.Load(),
+		"monitor":                configMonitor.Load(),
+		"codec":                  currentCodec.Name(),
+		"capture_backend":        captureBackendName(getConfiguredCaptureBackend()),
+		"capture_backend_active": getActiveCaptureBackend(),
+	}
+	if proxy, ok := currentCodec.(*ProxyCodec); ok {
+		ackData["codec_requested"] = proxy.RequestedName()
+		ackData["codec_fallback"] = proxy.HasFallback()
+		if proxy.HasFallback() && proxy.FallbackReason() != "" {
+			ackData["codec_fallback_reason"] = proxy.FallbackReason()
+			warnings = append(warnings, fmt.Sprintf("Codec fallback active: requested %s but running %s (%s)", proxy.RequestedName(), proxy.Name(), proxy.FallbackReason()))
+		}
+	} else {
+		ackData["codec_requested"] = currentCodec.Name()
+		ackData["codec_fallback"] = false
 	}
 	// Attach current monitor bounds to help UI redraw
 	if selectedBounds.Dx() == 0 || selectedBounds.Dy() == 0 {
@@ -222,6 +267,9 @@ skipCodec:
 
 	if len(errors) > 0 {
 		ackData["errors"] = errors
+	}
+	if len(warnings) > 0 {
+		ackData["warnings"] = warnings
 	}
 
 	sendDesktopPacket(modules.Packet{

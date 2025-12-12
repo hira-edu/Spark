@@ -35,6 +35,25 @@ func CreateConn(wsConn *ws.Conn, secret []byte) *Conn {
 	}
 }
 
+// CreateConnWithAdapter creates a Conn using a transport adapter (P2P, QUIC, etc.)
+func CreateConnWithAdapter(adapter TransportAdapter, secret []byte) *Conn {
+	var secretHex string
+	if secret != nil {
+		secretHex = hex.EncodeToString(secret)
+	}
+	return &Conn{
+		Conn:      nil,
+		adapter:   adapter,
+		secret:    secret,
+		secretHex: secretHex,
+	}
+}
+
+// NewConnWithAdapter is an alias for CreateConnWithAdapter (Phase 3 P2P)
+func NewConnWithAdapter(adapter TransportAdapter, secret []byte) (*Conn, error) {
+	return CreateConnWithAdapter(adapter, secret), nil
+}
+
 func CreateClient() *req.Client {
 	return req.C().SetUserAgent(`SPARK COMMIT: ` + config.Commit)
 }

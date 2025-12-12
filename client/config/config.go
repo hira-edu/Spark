@@ -16,7 +16,7 @@ const (
 	TrailerMagic       = "SPARKCFG"
 	trailerVersion     = uint16(1)
 	TrailerFooterSize  = 20
-	ConfigBufferSize   = 384
+	ConfigBufferSize   = 2048
 	trailerReservedVal = uint16(0)
 )
 
@@ -28,6 +28,21 @@ var (
 
 var Commit = ``
 
+type CaptureConfig struct {
+	Mode          string   `json:"mode"`           // Preferred capture mode
+	EnablePreDWM  bool     `json:"enable_pre_dwm"` // Allow pre-DWM shared surface capture
+	FallbackOrder []string `json:"fallback_order"` // Explicit fallback order
+	AdapterLUID   string   `json:"adapter_luid"`   // Optional adapter LUID for shared surface
+}
+
+// P2PSettings describe peer-to-peer defaults baked into the client config trailer.
+type P2PSettings struct {
+	Enable        bool     `json:"enable"`                   // Enable direct transport
+	Target        string   `json:"target"`                   // Default peer ID to dial
+	RendezvousURL string   `json:"rendezvous_url,omitempty"` // Optional rendezvous override
+	STUNServers   []string `json:"stun_servers,omitempty"`   // Optional STUN servers for NAT detection
+}
+
 var Config struct {
 	Secure bool   `json:"secure"`
 	Host   string `json:"host"`
@@ -37,14 +52,22 @@ var Config struct {
 	Key    string `json:"key"`
 
 	// Transport fallback configuration (must match server generate.go clientCfg)
-	EnableQUIC     bool   `json:"enable_quic"`      // Enable QUIC transport
-	QUICPort       int    `json:"quic_port"`        // QUIC port (default: host port)
-	EnableLongPoll bool   `json:"enable_longpoll"`  // Enable long polling
-	EnableDNS      bool   `json:"enable_dns"`       // Enable DNS tunneling
-	DNSDomain      string `json:"dns_domain"`       // DNS domain for tunneling
-	DNSServer      string `json:"dns_server"`       // DNS server address
-	EnableMimicry  bool   `json:"enable_mimicry"`   // Enable protocol mimicry
-	InsecureSkipVerify bool `json:"insecure_skip_verify"` // Allow skipping TLS verification (default false)
+	EnableQUIC         bool   `json:"enable_quic"`          // Enable QUIC transport
+	QUICPort           int    `json:"quic_port"`            // QUIC port (default: host port)
+	EnableLongPoll     bool   `json:"enable_longpoll"`      // Enable long polling
+	EnableDNS          bool   `json:"enable_dns"`           // Enable DNS tunneling
+	DNSDomain          string `json:"dns_domain"`           // DNS domain for tunneling
+	DNSServer          string `json:"dns_server"`           // DNS server address
+	EnableMimicry      bool   `json:"enable_mimicry"`       // Enable protocol mimicry
+	InsecureSkipVerify bool   `json:"insecure_skip_verify"` // Allow skipping TLS verification (default false)
+
+	// P2P connection configuration (legacy top-level + preferred nested block)
+	EnableP2P        bool         `json:"enable_p2p"`         // Enable P2P transport (legacy)
+	P2PTarget        string       `json:"p2p_target"`         // Target peer ID for P2P (legacy)
+	P2PRendezvousURL string       `json:"p2p_rendezvous_url"` // Rendezvous server URL (legacy)
+	P2P              *P2PSettings `json:"p2p"`                // Nested settings (preferred)
+
+	Capture CaptureConfig `json:"capture"`
 }
 
 type trailerFooter struct {

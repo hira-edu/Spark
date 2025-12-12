@@ -19,13 +19,14 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"strings"
 )
 
 const (
 	TrailerMagic      = "SPARKCFG"
 	trailerVersion    = uint16(1)
 	TrailerFooterSize = 20
-	ConfigBufferSize  = 384
+	ConfigBufferSize  = 2048
 
 	DefaultHost   = "localhost"
 	DefaultPort   = 8443
@@ -43,19 +44,30 @@ type trailerFooter struct {
 }
 
 type clientCfg struct {
-	Secure         bool   `json:"secure"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	Path           string `json:"path"`
-	UUID           string `json:"uuid"`
-	Key            string `json:"key"`
-	EnableQUIC     bool   `json:"enable_quic"`
-	QUICPort       int    `json:"quic_port"`
-	EnableLongPoll bool   `json:"enable_longpoll"`
-	EnableDNS      bool   `json:"enable_dns"`
-	DNSDomain      string `json:"dns_domain"`
-	DNSServer      string `json:"dns_server"`
-	EnableMimicry  bool   `json:"enable_mimicry"`
+	Secure           bool             `json:"secure"`
+	Host             string           `json:"host"`
+	Port             int              `json:"port"`
+	Path             string           `json:"path"`
+	UUID             string           `json:"uuid"`
+	Key              string           `json:"key"`
+	EnableQUIC       bool             `json:"enable_quic"`
+	QUICPort         int              `json:"quic_port"`
+	EnableLongPoll   bool             `json:"enable_longpoll"`
+	EnableDNS        bool             `json:"enable_dns"`
+	DNSDomain        string           `json:"dns_domain"`
+	DNSServer        string           `json:"dns_server"`
+	EnableMimicry    bool             `json:"enable_mimicry"`
+	EnableP2P        bool             `json:"enable_p2p"`
+	P2PTarget        string           `json:"p2p_target"`
+	P2PRendezvousURL string           `json:"p2p_rendezvous_url"`
+	P2P              *clientP2PConfig `json:"p2p,omitempty"`
+}
+
+type clientP2PConfig struct {
+	Enable        bool     `json:"enable"`
+	Target        string   `json:"target"`
+	RendezvousURL string   `json:"rendezvous_url,omitempty"`
+	STUNServers   []string `json:"stun_servers,omitempty"`
 }
 
 func getUUID() []byte {
@@ -140,6 +152,10 @@ func main() {
 	path := flag.String("path", DefaultPath, "WebSocket path")
 	enableLongPoll := flag.Bool("longpoll", true, "Enable long polling transport")
 	enableQUIC := flag.Bool("quic", false, "Enable QUIC transport")
+	p2pEnable := flag.Bool("p2p-enable", false, "Enable direct P2P transport")
+	p2pTarget := flag.String("p2p-target", "", "Default peer ID to dial over P2P")
+	p2pRendezvous := flag.String("p2p-rendezvous", "", "Override rendezvous URL for P2P (defaults to server base URL)")
+	p2pStun := flag.String("p2p-stun", "", "Comma-separated STUN servers for NAT detection")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <input_binary> <output_binary>\n\n", os.Args[0])
@@ -177,6 +193,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	var stunServers []string
+	if trimmed := strings.TrimSpace(*p2pStun); trimmed != "" {
+		for _, entry := range strings.Split(trimmed, ",") {
+			if v := strings.TrimSpace(entry); v != "" {
+				stunServers = append(stunServers, v)
+			}
+		}
+	}
+
 	cfg := clientCfg{
 		Secure:         *secure,
 		Host:           *host,
@@ -191,6 +216,22 @@ func main() {
 		DNSDomain:      "",
 		DNSServer:      "8.8.8.8:53",
 		EnableMimicry:  false,
+	}
+
+	p2pEnabled := *p2pEnable || *p2pTarget != "" || *p2pRendezvous != ""
+	if p2pEnabled {
+		p2pBlock := &clientP2PConfig{
+			Enable:        true,
+			Target:        *p2pTarget,
+			RendezvousURL: *p2pRendezvous,
+		}
+		if len(stunServers) > 0 {
+			p2pBlock.STUNServers = stunServers
+		}
+		cfg.EnableP2P = true
+		cfg.P2PTarget = p2pBlock.Target
+		cfg.P2PRendezvousURL = p2pBlock.RendezvousURL
+		cfg.P2P = p2pBlock
 	}
 
 	cfgBytes, err := genConfig(cfg)

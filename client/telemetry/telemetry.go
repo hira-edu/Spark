@@ -105,6 +105,22 @@ var (
 		Name: "rocket_last_heartbeat_timestamp",
 		Help: "Unix timestamp of last successful heartbeat",
 	})
+
+	// Desktop streaming metrics
+	DesktopFramesDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "rocket_desktop_frames_dropped_total",
+		Help: "Total desktop frames dropped locally due to backpressure",
+	})
+
+	DesktopFramesDeliveredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "rocket_desktop_frames_delivered_total",
+		Help: "Total desktop frames delivered to local viewers",
+	})
+
+	DesktopChannelHighWater = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "rocket_desktop_channel_high_water",
+		Help: "Highest desktop frame queue depth observed across sessions",
+	})
 )
 
 // HealthStatus tracks the overall health of the agent
@@ -201,29 +217,29 @@ func (h *HealthStatus) GetSnapshot() HealthSnapshot {
 	defer h.mu.RUnlock()
 
 	return HealthSnapshot{
-		WSConnected:         h.wsConnected.Load(),
-		LastConnectTime:     h.lastConnectTime,
-		LastDisconnectTime:  h.lastDisconnectTime,
-		ActiveSessionID:     h.activeSessionID,
-		UIProcessRunning:    h.uiProcessRunning.Load(),
-		UIProcessPID:        h.uiProcessPID,
-		UptimeSeconds:       int64(time.Since(h.startTime).Seconds()),
-		LastHeartbeat:       h.lastHeartbeat,
-		CircuitBreakerOpen:  h.circuitBreakerOpen.Load(),
+		WSConnected:        h.wsConnected.Load(),
+		LastConnectTime:    h.lastConnectTime,
+		LastDisconnectTime: h.lastDisconnectTime,
+		ActiveSessionID:    h.activeSessionID,
+		UIProcessRunning:   h.uiProcessRunning.Load(),
+		UIProcessPID:       h.uiProcessPID,
+		UptimeSeconds:      int64(time.Since(h.startTime).Seconds()),
+		LastHeartbeat:      h.lastHeartbeat,
+		CircuitBreakerOpen: h.circuitBreakerOpen.Load(),
 	}
 }
 
 // HealthSnapshot is a point-in-time snapshot of health status
 type HealthSnapshot struct {
-	WSConnected         bool      `json:"ws_connected"`
-	LastConnectTime     time.Time `json:"last_connect_time"`
-	LastDisconnectTime  time.Time `json:"last_disconnect_time,omitempty"`
-	ActiveSessionID     uint32    `json:"active_session_id,omitempty"`
-	UIProcessRunning    bool      `json:"ui_process_running"`
-	UIProcessPID        uint32    `json:"ui_process_pid,omitempty"`
-	UptimeSeconds       int64     `json:"uptime_seconds"`
-	LastHeartbeat       time.Time `json:"last_heartbeat,omitempty"`
-	CircuitBreakerOpen  bool      `json:"circuit_breaker_open"`
+	WSConnected        bool      `json:"ws_connected"`
+	LastConnectTime    time.Time `json:"last_connect_time"`
+	LastDisconnectTime time.Time `json:"last_disconnect_time,omitempty"`
+	ActiveSessionID    uint32    `json:"active_session_id,omitempty"`
+	UIProcessRunning   bool      `json:"ui_process_running"`
+	UIProcessPID       uint32    `json:"ui_process_pid,omitempty"`
+	UptimeSeconds      int64     `json:"uptime_seconds"`
+	LastHeartbeat      time.Time `json:"last_heartbeat,omitempty"`
+	CircuitBreakerOpen bool      `json:"circuit_breaker_open"`
 }
 
 // IsHealthy returns true if the agent is in a healthy state

@@ -37,9 +37,11 @@ func initDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	err := desktop.InitDesktop(pack)
 	if err != nil {
 		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: err.Error()}, pack)
-	} else {
-		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 0}, pack)
 	}
+	// DO NOT send success response here - desktop.InitDesktop already sends DESKTOP_INIT
+	// with resolution data (width, height, monitors) via sendDesktopPacket.
+	// Sending another response without this data would cause the browser to
+	// miss the resolution info and fail to size the canvas properly.
 }
 
 // pingDesktopWithRelay handles DESKTOP_PING with Session 0 relay support

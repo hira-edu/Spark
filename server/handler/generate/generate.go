@@ -28,13 +28,33 @@ type clientCfg struct {
 	Key    string `json:"key"`
 
 	// Transport fallback configuration
-	EnableQUIC     bool   `json:"enable_quic"`      // Enable QUIC transport
-	QUICPort       int    `json:"quic_port"`        // QUIC port (default: host port)
-	EnableLongPoll bool   `json:"enable_longpoll"`  // Enable long polling
-	EnableDNS      bool   `json:"enable_dns"`       // Enable DNS tunneling
-	DNSDomain      string `json:"dns_domain"`       // DNS domain for tunneling
-	DNSServer      string `json:"dns_server"`       // DNS server address
-	EnableMimicry  bool   `json:"enable_mimicry"`   // Enable protocol mimicry
+	EnableQUIC       bool   `json:"enable_quic"`        // Enable QUIC transport
+	QUICPort         int    `json:"quic_port"`          // QUIC port (default: host port)
+	EnableLongPoll   bool   `json:"enable_longpoll"`    // Enable long polling
+	EnableDNS        bool   `json:"enable_dns"`         // Enable DNS tunneling
+	DNSDomain        string `json:"dns_domain"`         // DNS domain for tunneling
+	DNSServer        string `json:"dns_server"`         // DNS server address
+	EnableMimicry    bool   `json:"enable_mimicry"`     // Enable protocol mimicry
+	EnableP2P        bool   `json:"enable_p2p"`         // Enable direct P2P (legacy)
+	P2PTarget        string `json:"p2p_target"`         // Default target peer
+	P2PRendezvousURL string `json:"p2p_rendezvous_url"` // Rendezvous override
+
+	Capture clientcfg.CaptureConfig `json:"capture"`
+	P2P     *clientP2PConfig        `json:"p2p,omitempty"`
+}
+
+type clientP2PConfig struct {
+	Enable        bool     `json:"enable"`
+	Target        string   `json:"target"`
+	RendezvousURL string   `json:"rendezvous_url,omitempty"`
+	STUNServers   []string `json:"stun_servers,omitempty"`
+}
+
+type captureForm struct {
+	CaptureMode         string `json:"capture_mode" yaml:"capture_mode" form:"capture_mode"`
+	CaptureEnablePreDWM string `json:"capture_enable_pre_dwm" yaml:"capture_enable_pre_dwm" form:"capture_enable_pre_dwm"`
+	CaptureFallback     string `json:"capture_fallback" yaml:"capture_fallback" form:"capture_fallback"`
+	CaptureAdapterLUID  string `json:"capture_adapter_luid" yaml:"capture_adapter_luid" form:"capture_adapter_luid"`
 }
 
 var (
@@ -58,6 +78,11 @@ func CheckClient(ctx *gin.Context) {
 		DNSDomain      string `json:"dns_domain" yaml:"dns_domain" form:"dns_domain"`
 		DNSServer      string `json:"dns_server" yaml:"dns_server" form:"dns_server"`
 		EnableMimicry  string `json:"enable_mimicry" yaml:"enable_mimicry" form:"enable_mimicry"`
+		P2PEnable      string `json:"p2p_enable" yaml:"p2p_enable" form:"p2p_enable"`
+		P2PTarget      string `json:"p2p_target" yaml:"p2p_target" form:"p2p_target"`
+		P2PRendezvous  string `json:"p2p_rendezvous_url" yaml:"p2p_rendezvous_url" form:"p2p_rendezvous_url"`
+
+		captureForm
 	}
 	if err := ctx.ShouldBind(&form); err != nil {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
@@ -108,7 +133,9 @@ func CheckClient(ctx *gin.Context) {
 		enableMimicry = true
 	}
 
-	_, err = genConfig(clientCfg{
+	p2pCfg := resolveP2PConfig(form.P2PEnable, form.P2PTarget, form.P2PRendezvous)
+
+	cfg := clientCfg{
 		Secure:         form.Secure == `true`,
 		Host:           form.Host,
 		Port:           int(form.Port),
@@ -122,7 +149,16 @@ func CheckClient(ctx *gin.Context) {
 		DNSDomain:      dnsDomain,
 		DNSServer:      dnsServer,
 		EnableMimicry:  enableMimicry,
-	})
+		Capture:        resolveCaptureConfig(form.captureForm),
+		P2P:            p2pCfg,
+	}
+	if p2pCfg != nil {
+		cfg.EnableP2P = p2pCfg.Enable
+		cfg.P2PTarget = p2pCfg.Target
+		cfg.P2PRendezvousURL = p2pCfg.RendezvousURL
+	}
+
+	_, err = genConfig(cfg)
 	if err != nil {
 		if err == ErrTooLargeEntity {
 			ctx.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.CONFIG_TOO_LARGE}`})
@@ -151,6 +187,11 @@ func GenerateClient(ctx *gin.Context) {
 		DNSDomain      string `json:"dns_domain" yaml:"dns_domain" form:"dns_domain"`
 		DNSServer      string `json:"dns_server" yaml:"dns_server" form:"dns_server"`
 		EnableMimicry  string `json:"enable_mimicry" yaml:"enable_mimicry" form:"enable_mimicry"`
+		P2PEnable      string `json:"p2p_enable" yaml:"p2p_enable" form:"p2p_enable"`
+		P2PTarget      string `json:"p2p_target" yaml:"p2p_target" form:"p2p_target"`
+		P2PRendezvous  string `json:"p2p_rendezvous_url" yaml:"p2p_rendezvous_url" form:"p2p_rendezvous_url"`
+
+		captureForm
 	}
 	if err := ctx.ShouldBind(&form); err != nil {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
@@ -208,7 +249,9 @@ func GenerateClient(ctx *gin.Context) {
 		enableMimicry = true
 	}
 
-	cfgBytes, err := genConfig(clientCfg{
+	p2pCfg := resolveP2PConfig(form.P2PEnable, form.P2PTarget, form.P2PRendezvous)
+
+	cfg := clientCfg{
 		Secure:         form.Secure == `true`,
 		Host:           form.Host,
 		Port:           int(form.Port),
@@ -222,7 +265,16 @@ func GenerateClient(ctx *gin.Context) {
 		DNSDomain:      dnsDomain,
 		DNSServer:      dnsServer,
 		EnableMimicry:  enableMimicry,
-	})
+		Capture:        resolveCaptureConfig(form.captureForm),
+		P2P:            p2pCfg,
+	}
+	if p2pCfg != nil {
+		cfg.EnableP2P = p2pCfg.Enable
+		cfg.P2PTarget = p2pCfg.Target
+		cfg.P2PRendezvousURL = p2pCfg.RendezvousURL
+	}
+
+	cfgBytes, err := genConfig(cfg)
 	if err != nil {
 		if err == ErrTooLargeEntity {
 			ctx.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, modules.Packet{Code: 1, Msg: `${i18n|GENERATOR.CONFIG_TOO_LARGE}`})
@@ -247,6 +299,90 @@ func GenerateClient(ctx *gin.Context) {
 	io.Copy(ctx.Writer, tpl)
 	ctx.Writer.Write(cfgBytes)
 	ctx.Writer.Write(trailerFooter)
+}
+
+func resolveCaptureConfig(form captureForm) clientcfg.CaptureConfig {
+	var cfg clientcfg.CaptureConfig
+	if servercfg.Config.Desktop != nil {
+		cfg.Mode = servercfg.Config.Desktop.Capture.Mode
+		cfg.EnablePreDWM = servercfg.Config.Desktop.Capture.EnablePreDWM
+		if len(servercfg.Config.Desktop.Capture.FallbackOrder) > 0 {
+			cfg.FallbackOrder = append([]string{}, servercfg.Config.Desktop.Capture.FallbackOrder...)
+		}
+		cfg.AdapterLUID = servercfg.Config.Desktop.Capture.AdapterLUID
+	}
+
+	if form.CaptureMode != "" {
+		cfg.Mode = form.CaptureMode
+	}
+	if val, ok := parseBoolString(form.CaptureEnablePreDWM); ok {
+		cfg.EnablePreDWM = val
+	}
+	if form.CaptureAdapterLUID != "" {
+		cfg.AdapterLUID = form.CaptureAdapterLUID
+	}
+	if form.CaptureFallback != "" {
+		values := strings.Split(form.CaptureFallback, ",")
+		fallback := make([]string, 0, len(values))
+		for _, v := range values {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				fallback = append(fallback, trimmed)
+			}
+		}
+		cfg.FallbackOrder = fallback
+	}
+
+	return cfg
+}
+
+func resolveP2PConfig(enableFlag, target, rendezvous string) *clientP2PConfig {
+	var cfg clientP2PConfig
+	var haveBase bool
+
+	if servercfg.Config.P2P != nil {
+		cfg.Enable = servercfg.Config.P2P.Enable
+		cfg.Target = servercfg.Config.P2P.Target
+		cfg.RendezvousURL = servercfg.Config.P2P.RendezvousURL
+		if len(servercfg.Config.P2P.STUNServers) > 0 {
+			cfg.STUNServers = append([]string{}, servercfg.Config.P2P.STUNServers...)
+		}
+		haveBase = true
+	}
+
+	if val, ok := parseBoolString(enableFlag); ok {
+		cfg.Enable = val
+		haveBase = true
+	}
+	if target != "" {
+		cfg.Target = target
+		haveBase = true
+	}
+	if rendezvous != "" {
+		cfg.RendezvousURL = rendezvous
+		haveBase = true
+	}
+
+	if !cfg.Enable {
+		return nil
+	}
+	if !haveBase && cfg.Target == "" && cfg.RendezvousURL == "" && len(cfg.STUNServers) == 0 {
+		return nil
+	}
+	return &cfg
+}
+
+func parseBoolString(raw string) (bool, bool) {
+	if raw == "" {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // genConfig generates the client configuration payload.

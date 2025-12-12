@@ -6,6 +6,8 @@ import (
 	"flag"
 	"github.com/kataras/golog"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 type config struct {
@@ -16,8 +18,10 @@ type config struct {
 	TLS       *tls              `json:"tls"`
 	WebRTC    *webrtc           `json:"webrtc"`
 	Transport *transport        `json:"transport"` // Transport configuration
+	P2P       *p2p              `json:"p2p"`       // P2P defaults for generated clients
 	MongoDB   *mongodb          `json:"mongodb"`   // MongoDB configuration
 	Cluster   *cluster          `json:"cluster"`   // Cluster/broker configuration
+	Desktop   *desktop          `json:"desktop"`   // Remote desktop defaults
 	SaltBytes []byte            `json:"-"`
 }
 
@@ -43,6 +47,14 @@ type log struct {
 type webrtc struct {
 	Turn []string `json:"turn_servers"`
 	Stun []string `json:"stun_servers"`
+
+	// TurnSecret is the shared secret for RFC 8656 ephemeral credentials (coturn --use-auth-secret)
+	// If set, time-limited credentials are generated for each ICE config request.
+	// If empty, TURN URIs are returned without credentials (static auth mode).
+	TurnSecret string `json:"turn_secret"`
+
+	// TurnCredentialTTL is the validity period in seconds for ephemeral credentials (default: 3600)
+	TurnCredentialTTL int `json:"turn_credential_ttl"`
 }
 
 type transport struct {
@@ -54,6 +66,13 @@ type transport struct {
 
 	// DNS Tunneling configuration
 	DNS *dnsConfig `json:"dns"`
+}
+
+type p2p struct {
+	Enable        bool     `json:"enable"`
+	RendezvousURL string   `json:"rendezvous_url"`
+	Target        string   `json:"target"`
+	STUNServers   []string `json:"stun_servers"`
 }
 
 type longPolling struct {
@@ -91,12 +110,39 @@ type cluster struct {
 	ProxyTimeoutSeconds    int    `json:"proxy_timeout_seconds"`    // Dial/TLS timeout for proxy handoff
 }
 
+type desktop struct {
+	Capture captureConfig `json:"capture"`
+}
+
+type captureConfig struct {
+	Mode          string   `json:"mode"`
+	EnablePreDWM  bool     `json:"enable_pre_dwm"`
+	FallbackOrder []string `json:"fallback_order"`
+	AdapterLUID   string   `json:"adapter_luid"`
+}
+
 // Commit is hash of this commit, for auto upgrade.
 var Commit = ``
 var Config config
 var BuiltPath = `./built/%v_%v`
 
+func runningUnderTests() bool {
+	exe := filepath.Base(os.Args[0])
+	return strings.HasSuffix(exe, ".test")
+}
+
 func init() {
+	if runningUnderTests() {
+		Config = config{
+			Log: &log{
+				Level: "disable",
+				Path:  "./logs",
+				Days:  7,
+			},
+		}
+		return
+	}
+
 	golog.SetTimeFormat(`2006/01/02 15:04:05`)
 
 	var (

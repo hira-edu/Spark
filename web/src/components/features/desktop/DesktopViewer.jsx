@@ -19,11 +19,12 @@ const DesktopViewer = ({
   onClose,
 }) => {
   // State
-  const [quality, setQuality] = useState(30); // Lower default for better FPS
+  const [quality, setQuality] = useState(50); // Balanced quality and performance
   const [targetFps, setTargetFps] = useState(30);
   const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const deviceId = device?.id || null;
 
   // Refs
   const containerRef = useRef(null);
@@ -67,13 +68,13 @@ const DesktopViewer = ({
 
   // Connect on mount
   useEffect(() => {
-    if (device?.id) {
+    if (deviceId) {
       connect();
     }
     return () => {
       disconnect();
     };
-  }, [device?.id, shareToken, connect, disconnect]);
+  }, [deviceId, shareToken, shareSecret, connect, disconnect]);
 
   // Send config when settings change
   useEffect(() => {

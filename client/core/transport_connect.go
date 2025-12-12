@@ -7,6 +7,7 @@ import (
 	"Rocket/client/transport"
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/kataras/golog"
@@ -26,16 +27,16 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 		quicPort = 443 // Default QUIC port
 	}
 
-		cfg := &transport.Config{
+	cfg := &transport.Config{
 		// Use HTTP(S) base URL; WebSocket transport will convert schemes.
-		ServerURL:  config.GetBaseURL(false),
-		UUID:       config.Config.UUID,
-		Key:        config.Config.Key,
+		ServerURL: config.GetBaseURL(false),
+		UUID:      config.Config.UUID,
+		Key:       config.Config.Key,
 
 		// Timeouts
-		ConnectTimeout:  10 * time.Second,
-		ReadTimeout:     90 * time.Second,
-		WriteTimeout:    10 * time.Second,
+		ConnectTimeout: 10 * time.Second,
+		ReadTimeout:    90 * time.Second,
+		WriteTimeout:   10 * time.Second,
 
 		// TLS settings
 		InsecureSkipVerify: config.Config.InsecureSkipVerify,
@@ -67,6 +68,74 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 			},
 			Protocol: "h2", // HTTP/2
 		},
+	}
+
+	// Optional P2P configuration
+	var bakedP2P *config.P2PSettings
+	if config.Config.P2P != nil {
+		bakedP2P = config.Config.P2P
+	} else if config.Config.EnableP2P || config.Config.P2PTarget != "" || config.Config.P2PRendezvousURL != "" {
+		bakedP2P = &config.P2PSettings{
+			Enable:        config.Config.EnableP2P,
+			Target:        config.Config.P2PTarget,
+			RendezvousURL: config.Config.P2PRendezvousURL,
+		}
+	}
+
+	var p2pTarget string
+	var rendezvousURL string
+	var stunServers []string
+	if bakedP2P != nil && bakedP2P.Enable {
+		p2pTarget = bakedP2P.Target
+		rendezvousURL = bakedP2P.RendezvousURL
+		if len(bakedP2P.STUNServers) > 0 {
+			stunServers = append([]string{}, bakedP2P.STUNServers...)
+		}
+	}
+	if envTarget := os.Getenv("SPARK_P2P_TARGET"); envTarget != "" {
+		p2pTarget = envTarget
+	}
+	if p2pTarget != "" {
+		if rendezvousURL == "" {
+			rendezvousURL = config.GetBaseURL(false)
+		}
+		cfg.EnableP2P = true
+		cfg.P2PTargetID = p2pTarget
+		cfg.P2PConfig = &transport.P2PConfig{
+			STUNServers:     stunServers,
+			RendezvousURL:   rendezvousURL,
+			PeerID:          config.Config.UUID,
+			PeerKey:         config.Config.Key,
+			FallbackToRelay: true,
+			RelayConfig: &transport.Config{
+				ServerURL:          config.GetBaseURL(false),
+				UUID:               config.Config.UUID,
+				Key:                config.Config.Key,
+				ConnectTimeout:     cfg.ConnectTimeout,
+				ReadTimeout:        cfg.ReadTimeout,
+				WriteTimeout:       cfg.WriteTimeout,
+				InsecureSkipVerify: config.Config.InsecureSkipVerify,
+			},
+		}
+	}
+
+	if cfg.EnableP2P && cfg.P2PConfig != nil && cfg.P2PTargetID != "" {
+		selector := transport.NewTransportSelector(cfg)
+		if result, err := selector.SelectWithDetails(ctx); err == nil && result.Transport != nil {
+			if result.Transport.Name() == "p2p" {
+				conn, err := result.Transport.Connect(ctx, cfg)
+				if err == nil {
+					telemetry.LogWSEvent("connected via transport", map[string]interface{}{
+						"transport": result.Transport.Name(),
+						"priority":  result.Transport.Priority(),
+						"reason":    result.Reason,
+					})
+					golog.Infof("core: Connected successfully using %s transport", result.Transport.Name())
+					return conn, nil
+				}
+				golog.Warnf("core: P2P selection failed (%s): %v", result.Reason, err)
+			}
+		}
 	}
 
 	// Create transport manager

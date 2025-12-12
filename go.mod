@@ -6,6 +6,7 @@ toolchain go1.24.10
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
+	github.com/StackExchange/wmi v1.2.1
 	github.com/blackjack/webcam v0.6.1
 	github.com/creack/pty v1.1.18
 	github.com/denisbrodbeck/machineid v1.0.1
@@ -22,6 +23,7 @@ require (
 	github.com/kataras/golog v0.1.7
 	github.com/kbinani/screenshot v0.0.0-20250624051815-089614a94018
 	github.com/kirides/go-d3d v1.0.0
+	github.com/klauspost/cpuid/v2 v2.2.8
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
 	github.com/miekg/dns v1.1.68
 	github.com/pion/interceptor v0.1.40
@@ -43,7 +45,6 @@ require (
 )
 
 require (
-	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bytedance/sonic v1.11.9 // indirect
 	github.com/bytedance/sonic/loader v0.1.1 // indirect
@@ -70,7 +71,6 @@ require (
 	github.com/jezek/xgb v1.1.1 // indirect
 	github.com/kataras/pio v0.0.10 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
-	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -81,6 +81,7 @@ require (
 	github.com/otiai10/gosseract v2.2.1+incompatible // indirect
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
+	github.com/pion/dtls/v2 v2.2.7 // indirect
 	github.com/pion/dtls/v3 v3.0.6 // indirect
 	github.com/pion/ice/v4 v4.0.10 // indirect
 	github.com/pion/logging v0.2.4 // indirect
@@ -92,6 +93,7 @@ require (
 	github.com/pion/sdp/v3 v3.0.13 // indirect
 	github.com/pion/srtp/v3 v3.0.5 // indirect
 	github.com/pion/stun/v3 v3.0.0 // indirect
+	github.com/pion/transport/v2 v2.2.1 // indirect
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/turn/v4 v4.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect

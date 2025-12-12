@@ -1,0 +1,10 @@
+.mock-desktop-page {
+  width: 100vw;
+  height: 100vh;
+  background: #0f1117;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+}

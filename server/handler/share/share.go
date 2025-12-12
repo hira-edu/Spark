@@ -2,6 +2,7 @@ package share
 
 import (
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
 	servercfg "Rocket/server/config"
 	"Rocket/server/handler/utility"
@@ -13,11 +14,10 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"Rocket/server/cluster"
 	"github.com/gin-gonic/gin"
-	"github.com/kataras/golog"
 )
 
 type guestDesktop struct {
@@ -26,6 +26,12 @@ type guestDesktop struct {
 	srcConn    *melody.Session
 	deviceConn *melody.Session
 	viewOnly   bool
+
+	// Rate limiting for input events (security: prevents flood attacks)
+	inputTokens      int64     // Available tokens (atomic)
+	inputLastRefill  time.Time // Last token refill time
+	inputRateLimited bool      // True if currently rate limited
+	inputLock        sync.Mutex
 }
 
 var (
@@ -38,15 +44,91 @@ const (
 	maxTTLSeconds     = 86400 // 24 hours
 )
 
+// Rate limiting constants for input events (security: prevents flood attacks)
+// Based on RustDesk and Guacamole best practices
+const (
+	inputRateTokensPerSecond = 200 // Max events per second (generous for normal use)
+	inputRateBucketSize      = 100 // Max burst size
+	inputRateRefillInterval  = 50 * time.Millisecond
+)
+
+// checkInputRateLimit implements token bucket rate limiting for input events.
+// Returns true if the input should be allowed, false if rate limited.
+// Following RustDesk pattern: https://github.com/rustdesk/rustdesk
+func (g *guestDesktop) checkInputRateLimit(eventCount int) bool {
+	g.inputLock.Lock()
+	defer g.inputLock.Unlock()
+
+	now := time.Now()
+
+	// Initialize on first call
+	if g.inputLastRefill.IsZero() {
+		g.inputLastRefill = now
+		g.inputTokens = inputRateBucketSize
+	}
+
+	// Refill tokens based on elapsed time
+	elapsed := now.Sub(g.inputLastRefill)
+	tokensToAdd := int64(elapsed.Seconds() * inputRateTokensPerSecond)
+	if tokensToAdd > 0 {
+		g.inputTokens += tokensToAdd
+		if g.inputTokens > inputRateBucketSize {
+			g.inputTokens = inputRateBucketSize
+		}
+		g.inputLastRefill = now
+	}
+
+	// Check if we have enough tokens
+	tokensNeeded := int64(eventCount)
+	if g.inputTokens >= tokensNeeded {
+		g.inputTokens -= tokensNeeded
+		g.inputRateLimited = false
+		return true
+	}
+
+	// Rate limited - log once per burst
+	if !g.inputRateLimited {
+		g.inputRateLimited = true
+		common.Warn(g.srcConn, `SHARE_RATE_LIMIT`, `triggered`, `input rate limited`, map[string]any{
+			`share_id`:      g.shareID,
+			`tokens`:        g.inputTokens,
+			`tokens_needed`: tokensNeeded,
+		})
+		recordShareRateLimit(g.srcConn, g.shareID, g.inputTokens)
+	}
+	return false
+}
+
 func init() {
 	repo = storage.NewShareRepository()
 	guestSessions.Config.MaxMessageSize = common.MaxMessageSize
+	// Extended timeouts for guest desktop streaming stability:
+	// - PongWait: 120s (up from 60s default) to handle network jitter
+	// - WriteWait: 30s (up from 10s) for large frame writes
+	// - PingPeriod: 90s (3/4 of PongWait) per WebSocket best practices
+	guestSessions.Config.PongWait = 120 * time.Second
+	guestSessions.Config.WriteWait = 30 * time.Second
+	guestSessions.Config.PingPeriod = 90 * time.Second
 	guestSessions.HandleConnect(onGuestConnect)
 	guestSessions.HandleMessage(onGuestMessage)
 	guestSessions.HandleMessageBinary(onGuestMessage)
 	guestSessions.HandleDisconnect(onGuestDisconnect)
 	go utility.WSHealthCheck(guestSessions, sendGuestPack)
-	go cleanupExpiredShares()
+	go safeCleanupExpiredShares()
+}
+
+// safeCleanupExpiredShares wraps cleanupExpiredShares with panic recovery.
+func safeCleanupExpiredShares() {
+	defer func() {
+		if r := recover(); r != nil {
+			common.Warn(nil, `SHARE_CLEANUP`, `panic`, `cleanup goroutine panicked, restarting`, map[string]any{
+				`panic`: r,
+			})
+			time.Sleep(1 * time.Minute)
+			go safeCleanupExpiredShares() // Auto-restart
+		}
+	}()
+	cleanupExpiredShares()
 }
 
 func isExpired(entry *storage.ShareEntry, now time.Time) bool {
@@ -70,7 +152,14 @@ func ensureDesktop(entry *storage.ShareEntry) string {
 	}
 	if current.Desktop == "" {
 		current.Desktop = utils.GetStrUUID()
-		repo.UpdateDesktop(ctx, current.ID, current.Desktop)
+		if err := repo.UpdateDesktop(ctx, current.ID, current.Desktop); err != nil {
+			common.Warn(nil, `SHARE_UPDATE_DESKTOP`, `fail`, `failed to update desktop ID`, map[string]any{
+				`share_id`: entry.ID,
+				`error`:    err.Error(),
+			})
+			// Return empty to signal failure - caller should handle gracefully
+			return ""
+		}
 	}
 	return current.Desktop
 }
@@ -83,13 +172,37 @@ func guestICEConfig(entry *storage.ShareEntry) gin.H {
 	if entry == nil {
 		return ice
 	}
-	if cfg := servercfg.Config.WebRTC; cfg != nil {
-		if !entry.TurnOnly {
-			ice[`stun`] = append(ice[`stun`].([]string), cfg.Stun...)
+
+	cfg := servercfg.Config.WebRTC
+	if cfg != nil {
+		// Determine which servers to include
+		stunServers := cfg.Stun
+		if entry.TurnOnly {
+			stunServers = nil // Exclude STUN for TurnOnly shares
 		}
-		ice[`turn`] = append(ice[`turn`].([]string), cfg.Turn...)
+
+		// Use share ID as identifier for audit trail
+		identifier := "guest"
+		if entry.ID != "" && len(entry.ID) >= 8 {
+			identifier = "share:" + entry.ID[:8]
+		}
+
+		// Build ICE servers with ephemeral credentials (if configured)
+		servers := utility.BuildICEServers(
+			stunServers,
+			cfg.Turn,
+			cfg.TurnSecret,
+			identifier,
+			cfg.TurnCredentialTTL,
+		)
+
+		ice[`ice_servers`] = servers
+		ice[`stun`] = stunServers // Legacy format
+		ice[`turn`] = cfg.Turn    // Legacy format
 		return ice
 	}
+
+	// Fallback to public STUN servers when no WebRTC config exists
 	if !entry.TurnOnly {
 		ice[`stun`] = []string{
 			"stun:stun.l.google.com:19302",
@@ -102,13 +215,18 @@ func guestICEConfig(entry *storage.ShareEntry) gin.H {
 // cleanupExpiredShares periodically removes expired share entries
 func cleanupExpiredShares() {
 	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop() // Prevent resource leak if function ever exits
 	for range ticker.C {
 		ctx := context.Background()
 		count, err := repo.DeleteExpired(ctx, time.Now())
 		if err != nil {
-			golog.Warnf("Failed to cleanup expired shares: %v", err)
+			common.Warn(nil, `SHARE_CLEANUP`, `fail`, `failed to cleanup expired shares`, map[string]any{
+				`error`: err.Error(),
+			})
 		} else if count > 0 {
-			golog.Infof("Cleaned up %d expired shares", count)
+			common.Info(nil, `SHARE_CLEANUP`, `success`, ``, map[string]any{
+				`count`: count,
+			})
 		}
 	}
 }
@@ -157,23 +275,27 @@ func ValidateShareToken(ctx *gin.Context) {
 
 // InitGuestDesktop handles guest desktop WebSocket connections
 func InitGuestDesktop(ctx *gin.Context) {
-	golog.Infof("InitGuestDesktop called: isWebsocket=%v", ctx.IsWebsocket())
 	if !ctx.IsWebsocket() {
-		golog.Warnf("InitGuestDesktop: not a websocket request")
+		common.Warn(ctx, `SHARE_GUEST_HANDSHAKE`, `fail`, `not a websocket request`, map[string]any{
+			`is_websocket`: ctx.IsWebsocket(),
+		})
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
 	// Validate origin for CSWSH protection
 	if !utility.ValidateWebSocketOrigin(ctx, true) {
-		golog.Warnf("InitGuestDesktop: origin validation failed, origin=%s host=%s", ctx.GetHeader("Origin"), ctx.Request.Host)
+		common.Warn(ctx, `SHARE_GUEST_HANDSHAKE`, `fail`, `origin validation failed`, map[string]any{
+			`origin`: ctx.GetHeader("Origin"),
+			`host`:   ctx.Request.Host,
+		})
 		ctx.AbortWithStatus(http.StatusForbidden)
 		return
 	}
 
 	token := ctx.Query(`token`)
 	if token == "" {
-		golog.Warnf("InitGuestDesktop: empty token")
+		common.Warn(ctx, `SHARE_GUEST_HANDSHAKE`, `fail`, `empty token`, nil)
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
@@ -181,16 +303,24 @@ func InitGuestDesktop(ctx *gin.Context) {
 	dbCtx := context.Background()
 	entry, err := repo.GetByToken(dbCtx, token)
 	if err != nil || entry == nil || isExpired(entry, time.Now()) {
-		golog.Warnf("InitGuestDesktop: token not found or expired, token=%s err=%v entry=%v", token[:8]+"...", err, entry != nil)
+		common.Warn(ctx, `SHARE_TOKEN_VALIDATE`, `fail`, `token not found or expired`, map[string]any{
+			`token_prefix`: token[:8],
+			`error`:        err,
+			`entry_exists`: entry != nil,
+		})
 		logAccess(token, ctx, false, "token not found")
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
 
 	secretStr, ok := ctx.GetQuery(`secret`)
-	golog.Infof("InitGuestDesktop: token valid, checking secret: provided=%v len=%d expected_len=%d", ok, len(secretStr), len(entry.Secret))
 	if !ok || len(secretStr) != len(entry.Secret) || strings.ToLower(secretStr) != strings.ToLower(entry.Secret) {
-		golog.Warnf("InitGuestDesktop: secret mismatch, provided=%s expected=%s", secretStr, entry.Secret)
+		common.Warn(ctx, `SHARE_TOKEN_VALIDATE`, `fail`, `secret mismatch`, map[string]any{
+			`token_prefix`:    token[:8],
+			`secret_provided`: ok,
+			`secret_len`:      len(secretStr),
+			`expected_len`:    len(entry.Secret),
+		})
 		ctx.AbortWithStatus(http.StatusUnauthorized)
 		return
 	}
@@ -234,7 +364,11 @@ func InitGuestDesktop(ctx *gin.Context) {
 	}
 
 	logAccess(token, ctx, true, "")
-	golog.Infof("Guest desktop connection: share=%s device=%s ip=%s", entry.ID, entry.Device, ctx.ClientIP())
+	common.Info(ctx, `SHARE_GUEST_CONNECT`, `success`, ``, map[string]any{
+		`share_id`:  entry.ID,
+		`device`:    entry.Device,
+		`view_only`: entry.ViewOnly,
+	})
 
 	guestSessions.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
 		`Secret`:    secret,
@@ -342,13 +476,23 @@ func CreateShare(ctx *gin.Context) {
 
 	dbCtx := context.Background()
 	if err := repo.Create(dbCtx, entry); err != nil {
-		golog.Errorf("Failed to create share: %v", err)
+		common.Error(ctx, `SHARE_CREATE`, `fail`, `failed to create share`, map[string]any{
+			`error`:  err.Error(),
+			`device`: body.Device,
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
 
-	golog.Infof("Share created: id=%s device=%s singleUse=%v viewOnly=%v turnOnly=%v ttl=%ds by=%s",
-		entry.ID, entry.Device, entry.SingleUse, entry.ViewOnly, entry.TurnOnly, ttl, adminUser)
+	common.Info(ctx, `SHARE_CREATE`, `success`, ``, map[string]any{
+		`share_id`:   entry.ID,
+		`device`:     entry.Device,
+		`single_use`: entry.SingleUse,
+		`view_only`:  entry.ViewOnly,
+		`turn_only`:  entry.TurnOnly,
+		`ttl`:        ttl,
+		`created_by`: adminUser,
+	})
 
 	ctx.JSON(200, modules.Packet{Code: 0, Data: gin.H{`share`: entry}})
 }
@@ -358,7 +502,9 @@ func ListShares(ctx *gin.Context) {
 	dbCtx := context.Background()
 	shares, err := repo.ListAll(dbCtx, 100, 0) // Limit to 100 shares
 	if err != nil {
-		golog.Errorf("Failed to list shares: %v", err)
+		common.Error(ctx, `SHARE_LIST`, `fail`, `failed to list shares`, map[string]any{
+			`error`: err.Error(),
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
@@ -386,7 +532,10 @@ func GetShare(ctx *gin.Context) {
 	dbCtx := context.Background()
 	s, err := repo.GetByID(dbCtx, id)
 	if err != nil {
-		golog.Errorf("Failed to get share: %v", err)
+		common.Error(ctx, `SHARE_GET`, `fail`, `failed to get share`, map[string]any{
+			`share_id`: id,
+			`error`:    err.Error(),
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
@@ -408,7 +557,10 @@ func GetShareToken(ctx *gin.Context) {
 	dbCtx := context.Background()
 	s, err := repo.GetByID(dbCtx, id)
 	if err != nil {
-		golog.Errorf("Failed to get share: %v", err)
+		common.Error(ctx, `SHARE_GET_TOKEN`, `fail`, `failed to get share token`, map[string]any{
+			`share_id`: id,
+			`error`:    err.Error(),
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
@@ -435,7 +587,10 @@ func GetShareAccessLog(ctx *gin.Context) {
 	dbCtx := context.Background()
 	s, err := repo.GetByID(dbCtx, id)
 	if err != nil {
-		golog.Errorf("Failed to get share: %v", err)
+		common.Error(ctx, `SHARE_GET_ACCESS_LOG`, `fail`, `failed to get share access log`, map[string]any{
+			`share_id`: id,
+			`error`:    err.Error(),
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
@@ -459,13 +614,19 @@ func RevokeShare(ctx *gin.Context) {
 	dbCtx := context.Background()
 	s, _ := repo.GetByID(dbCtx, body.ID)
 	if err := repo.Delete(dbCtx, body.ID); err != nil {
-		golog.Errorf("Failed to revoke share: %v", err)
+		common.Error(ctx, `SHARE_REVOKE`, `fail`, `failed to revoke share`, map[string]any{
+			`share_id`: body.ID,
+			`error`:    err.Error(),
+		})
 		ctx.AbortWithStatusJSON(500, modules.Packet{Code: 1, Msg: `${i18n|COMMON.INTERNAL_ERROR}`})
 		return
 	}
 
 	if s != nil {
-		golog.Infof("Share revoked: id=%s device=%s", s.ID, s.Device)
+		common.Info(ctx, `SHARE_REVOKE`, `success`, ``, map[string]any{
+			`share_id`: s.ID,
+			`device`:   s.Device,
+		})
 	}
 
 	// Close any active guest sessions for this share
@@ -486,9 +647,15 @@ func CloseGuestSessionsByDevice(deviceID string) {
 	dbCtx := context.Background()
 	count, err := repo.DeleteByDevice(dbCtx, deviceID)
 	if err != nil {
-		golog.Errorf("Failed to delete shares for device %s: %v", deviceID, err)
+		common.Error(nil, `SHARE_AUTO_REVOKE`, `fail`, `failed to delete shares for device`, map[string]any{
+			`device`: deviceID,
+			`error`:  err.Error(),
+		})
 	} else if count > 0 {
-		golog.Infof("Share auto-revoked on device disconnect: count=%d device=%s", count, deviceID)
+		common.Info(nil, `SHARE_AUTO_REVOKE`, `success`, `shares auto-revoked on device disconnect`, map[string]any{
+			`device`: deviceID,
+			`count`:  count,
+		})
 	}
 
 	// Close guest WebSocket sessions
@@ -571,7 +738,10 @@ func logAccess(token string, ctx *gin.Context, success bool, reason string) {
 		Reason:    reason,
 	}
 	if err := repo.AppendAccessLog(dbCtx, token, entry); err != nil {
-		golog.Warnf("Failed to log access for token %s: %v", token[:8]+"...", err)
+		common.Warn(ctx, `SHARE_ACCESS_LOG`, `fail`, `failed to log access`, map[string]any{
+			`token_prefix`: token[:8],
+			`error`:        err.Error(),
+		})
 	}
 }
 
@@ -583,6 +753,7 @@ func expiredSession(session *melody.Session, shareID string) bool {
 		if expAt, ok := expVal.(time.Time); ok && !expAt.IsZero() && time.Now().After(expAt) {
 			sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|DESKTOP.SESSION_CLOSED}`}, session)
 			session.Close()
+			recordShareExpirationEnforcement(session, shareID, "expired")
 			return true
 		}
 	}
@@ -592,16 +763,16 @@ func expiredSession(session *melody.Session, shareID string) bool {
 	}
 	sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
 	session.Close()
+	recordShareExpirationEnforcement(session, shareID, "revoked")
 	return true
 }
 
 // Guest WebSocket handlers
 
 func onGuestConnect(session *melody.Session) {
-	golog.Infof("Guest onConnect starting")
 	shareID, ok := session.Get(`ShareID`)
 	if !ok {
-		golog.Warnf("Guest connect failed: no ShareID")
+		common.Warn(session, `SHARE_GUEST_WS_CONNECT`, `fail`, `no ShareID in session`, nil)
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|SHARE.INVALID_TOKEN}`}, session)
 		session.Close()
 		return
@@ -612,9 +783,10 @@ func onGuestConnect(session *melody.Session) {
 	viewOnly, _ := session.Get(`ViewOnly`)
 	desktopVal, _ := session.Get(`Desktop`)
 	desktopUUID, _ := desktopVal.(string)
-	golog.Infof("Guest connect: shareID=%s device=%v connUUID=%v desktop=%s", shareID, device, connUUID, desktopUUID)
 	if desktopUUID == "" {
-		golog.Warnf("Guest connect failed: empty desktopUUID")
+		common.Warn(session, `SHARE_GUEST_WS_CONNECT`, `fail`, `empty desktopUUID`, map[string]any{
+			`share_id`: shareID,
+		})
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		session.Close()
 		return
@@ -622,7 +794,10 @@ func onGuestConnect(session *melody.Session) {
 
 	deviceConn, ok := common.Melody.GetSessionByUUID(connUUID.(string))
 	if !ok {
-		golog.Warnf("Guest connect failed: device session not found for connUUID=%v", connUUID)
+		common.Warn(session, `SHARE_GUEST_WS_CONNECT`, `fail`, `device session not found`, map[string]any{
+			`share_id`:  shareID,
+			`conn_uuid`: connUUID,
+		})
 		sendGuestPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
 		return
@@ -647,7 +822,11 @@ func onGuestConnect(session *melody.Session) {
 		`desktop`: desktopUUID,
 	}, Event: desktopUUID}, deviceConn)
 
-	golog.Infof("Guest connected: share=%s desktop=%s viewOnly=%v", shareIDStr, desktopUUID, viewOnlyBool)
+	common.Info(session, `SHARE_GUEST_WS_CONNECT`, `success`, ``, map[string]any{
+		`share_id`:  shareIDStr,
+		`desktop`:   desktopUUID,
+		`view_only`: viewOnlyBool,
+	})
 }
 
 func onGuestMessage(session *melody.Session, data []byte) {
@@ -657,6 +836,8 @@ func onGuestMessage(session *melody.Session, data []byte) {
 	}
 	guest := val.(*guestDesktop)
 	desktopUUID, _ := session.Get(`DesktopUUID`)
+	shareVal, _ := session.Get(`ShareID`)
+	shareIDStr, _ := shareVal.(string)
 	if expiredSession(session, guest.shareID) {
 		return
 	}
@@ -667,6 +848,7 @@ func onGuestMessage(session *melody.Session, data []byte) {
 	if guest.shareID != "" && !isShareValidForSession(guest.shareID) {
 		sendGuestPack(modules.Packet{Act: `QUIT`, Msg: `${i18n|SHARE.SESSION_REVOKED}`}, session)
 		session.Close()
+		recordShareExpirationEnforcement(session, guest.shareID, "revoked")
 		return
 	}
 
@@ -693,9 +875,32 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	switch pack.Act {
 	case `DESKTOP_PING`:
+		// Forward ping to device for keep-alive
 		common.SendPack(modules.Packet{Act: `DESKTOP_PING`, Data: gin.H{
 			`desktop`: desktopUUID,
 		}, Event: desktopUUID.(string)}, guest.deviceConn)
+		// Send quick ACK so guest browser sees server-side round trip
+		sendGuestPack(modules.Packet{Act: `DESKTOP_PONG`, Data: gin.H{
+			`source`: `server`,
+		}}, session)
+		return
+
+	case `DESKTOP_BROWSER_STATS`:
+		statsPayload := utility.CollectBrowserStats(pack.Data)
+		if desktopUUIDStr, ok := desktopUUID.(string); ok {
+			statsPayload[`desktop_uuid`] = desktopUUIDStr
+		} else {
+			statsPayload[`desktop_uuid`] = desktopUUID
+		}
+		statsPayload[`share_id`] = shareIDStr
+		if guest.device != `` {
+			deviceID := guest.device
+			if len(deviceID) > 16 {
+				deviceID = deviceID[:16] + `...`
+			}
+			statsPayload[`device_id`] = deviceID
+		}
+		common.Info(session, `[SERVER_SHARE_BROWSER_STATS]`, ``, `Browser telemetry snapshot`, statsPayload)
 		return
 
 	case `DESKTOP_KILL`:
@@ -721,12 +926,22 @@ func onGuestMessage(session *melody.Session, data []byte) {
 	case `DESKTOP_INPUT`:
 		// Block input for view-only guests
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_INPUT_BLOCKED]`, ``, `View-only guest attempted input`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: `DESKTOP_INPUT`, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
 		// Forward input to device
 		events, ok := normalizeInputEvents(pack.Data)
 		if !ok || len(events) == 0 {
+			return
+		}
+		// Rate limiting: prevent flood attacks (security)
+		// Token bucket algorithm: 200 events/sec, burst of 100
+		if !guest.checkInputRateLimit(len(events)) {
+			sendGuestPack(modules.Packet{Act: `DESKTOP_INPUT`, Code: 1, Msg: `${i18n|SHARE.RATE_LIMITED}`}, session)
 			return
 		}
 		common.SendPack(modules.Packet{
@@ -742,6 +957,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	case `DESKTOP_CLIPBOARD`:
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_CLIPBOARD_BLOCKED]`, ``, `View-only guest attempted clipboard`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
@@ -755,6 +974,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	case `DESKTOP_FILE_DROP`:
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_FILEDROP_BLOCKED]`, ``, `View-only guest attempted file drop`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
@@ -768,6 +991,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	case `DESKTOP_AUDIO`:
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_AUDIO_BLOCKED]`, ``, `View-only guest attempted audio control`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
@@ -781,6 +1008,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_WEBRTC_BLOCKED]`, ``, `View-only guest attempted WebRTC negotiation`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
@@ -794,6 +1025,10 @@ func onGuestMessage(session *melody.Session, data []byte) {
 
 	case `DESKTOP_WEBRTC_ICE`:
 		if guest.viewOnly {
+			common.Warn(session, `[SERVER_SHARE_WEBRTC_BLOCKED]`, ``, `View-only guest attempted ICE exchange`, map[string]any{
+				`share_id`: shareIDStr,
+			})
+			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
 			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
 			return
 		}
@@ -805,7 +1040,12 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	}
-	session.Close()
+	common.Warn(session, `[SERVER_SHARE_UNKNOWN_ACTION]`, ``, `Unknown share desktop action from guest`, map[string]any{
+		`act`:      pack.Act,
+		`share_id`: shareIDStr,
+	})
+	sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+	return
 }
 
 func onGuestDisconnect(session *melody.Session) {
@@ -822,7 +1062,10 @@ func onGuestDisconnect(session *melody.Session) {
 	common.RemoveEvent(desktopUUID.(string))
 	session.Set(`Guest`, nil)
 
-	golog.Infof("Guest disconnected: share=%s desktop=%s", guest.shareID, desktopUUID)
+	common.Info(session, `SHARE_GUEST_DISCONNECT`, `success`, ``, map[string]any{
+		`share_id`: guest.shareID,
+		`desktop`:  desktopUUID,
+	})
 }
 
 func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCallback {
@@ -854,7 +1097,12 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 				sendGuestPack(modules.Packet{Act: `QUIT`, Msg: msg}, guest.srcConn)
 				common.RemoveEvent(desktopUUID)
 				guest.srcConn.Close()
+				return
 			}
+
+			// Forward DESKTOP_INIT success payload so guests resize their canvas
+			// before the first binary frame arrives (mirrors primary desktop handler).
+			sendGuestPack(modules.Packet{Act: `DESKTOP_INIT`, Code: 0, Data: pack.Data}, guest.srcConn)
 		case `DESKTOP_QUIT`:
 			msg := `${i18n|DESKTOP.SESSION_CLOSED}`
 			if len(pack.Msg) > 0 {
@@ -869,6 +1117,14 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 			}
 		case `CURSOR_UPDATE`:
 			sendGuestPack(pack, guest.srcConn)
+		case `DESKTOP_PONG`:
+			payload := gin.H{`source`: `device`}
+			if pack.Data != nil {
+				for k, v := range pack.Data {
+					payload[k] = v
+				}
+			}
+			sendGuestPack(modules.Packet{Act: `DESKTOP_PONG`, Code: pack.Code, Data: payload}, guest.srcConn)
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
 			if pack.Code != 0 {
 				sendGuestPack(pack, guest.srcConn)
@@ -892,14 +1148,8 @@ func sendGuestPack(pack modules.Packet, session *melody.Session) bool {
 	return err == nil
 }
 
-const (
-	maxGuestInputBatch = 32
-	maxSDPLength       = 1 << 15
-	maxCandidateLength = 4096
-	maxClipboardBytes  = 64 * 1024
-	maxFileDropEntries = 5
-	maxFileNameLength  = 255
-)
+// Payload limits are now centralized in utility/limits.go
+// See: REMOTE_DESKTOP_PIPELINE_AUDIT.md - Payload Constant Centralization
 
 func normalizeInputEvents(data map[string]any) ([]any, bool) {
 	if data == nil {
@@ -911,8 +1161,8 @@ func normalizeInputEvents(data map[string]any) ([]any, bool) {
 	}
 	switch events := rawEvents.(type) {
 	case []any:
-		if len(events) > maxGuestInputBatch {
-			return events[:maxGuestInputBatch], true
+		if len(events) > utility.MaxDesktopInputBatch {
+			return events[:utility.MaxDesktopInputBatch], true
 		}
 		return events, true
 	default:
@@ -925,7 +1175,7 @@ func normalizeSDP(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	sdp, ok := data[`sdp`].(string)
-	if !ok || len(sdp) == 0 || len(sdp) > maxSDPLength {
+	if !ok || len(sdp) == 0 || len(sdp) > utility.MaxSDPLength {
 		return nil, false
 	}
 	if !isValidSDP(sdp) {
@@ -950,7 +1200,7 @@ func normalizeCandidate(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	candidate, ok := data[`candidate`].(string)
-	if !ok || len(candidate) == 0 || len(candidate) > maxCandidateLength {
+	if !ok || len(candidate) == 0 || len(candidate) > utility.MaxCandidateLength {
 		return nil, false
 	}
 	if !isValidICECandidate(candidate) {
@@ -997,8 +1247,8 @@ func normalizeClipboard(data map[string]any) (gin.H, bool) {
 	if !ok || len(text) == 0 {
 		return nil, false
 	}
-	if len(text) > maxClipboardBytes {
-		text = text[:maxClipboardBytes]
+	if len(text) > utility.MaxClipboardBytes {
+		text = text[:utility.MaxClipboardBytes]
 	}
 	payload := gin.H{`text`: text}
 	if mime, ok := data[`mime`].(string); ok && len(mime) > 0 {
@@ -1022,7 +1272,7 @@ func normalizeFileDrop(data map[string]any) (gin.H, bool) {
 
 	files := make([]gin.H, 0, len(list))
 	for _, item := range list {
-		if len(files) >= maxFileDropEntries {
+		if len(files) >= utility.MaxFileDropEntries {
 			break
 		}
 		m, ok := item.(map[string]any)
@@ -1030,8 +1280,8 @@ func normalizeFileDrop(data map[string]any) (gin.H, bool) {
 			continue
 		}
 		name, _ := m[`name`].(string)
-		if len(name) > maxFileNameLength {
-			name = name[:maxFileNameLength]
+		if len(name) > utility.MaxFileNameLength {
+			name = name[:utility.MaxFileNameLength]
 		}
 		size := int64(0)
 		switch v := m[`size`].(type) {

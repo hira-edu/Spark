@@ -2,9 +2,11 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"Rocket/modules"
@@ -20,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type desktop struct {
@@ -31,26 +34,196 @@ type desktop struct {
 }
 
 var desktopSessions = melody.New()
+var frameRelayStats struct {
+	forwarded atomic.Uint64
+	failures  atomic.Uint64
+	lastLog   atomic.Int64
+}
+var desktopTelemetry struct {
+	handshakeAttempts  atomic.Uint64
+	handshakeSuccesses atomic.Uint64
+	handshakeFailures  atomic.Uint64
+	heartbeatSuccesses atomic.Uint64
+	heartbeatFailures  atomic.Uint64
+	policyViolations   atomic.Uint64
+}
+var desktopTelemetryLastLog atomic.Int64
 
-const maxDesktopInputBatch = 32
 const (
-	maxSDPLength       = 1 << 15
-	maxCandidateLength = 4096
-	maxClipboardBytes  = 64 * 1024
-	maxFileDropEntries = 5
-	maxFileNameLength  = 255
-	// Cursor validation limits
-	maxCursorWidth    = 256
-	maxCursorHeight   = 256
-	maxCursorDataSize = maxCursorWidth * maxCursorHeight * 4 * 4 / 3 // base64 overhead ~1.33x
+	desktopTelemetryLogInterval = int64(60) // seconds
+	frameRelayLogInterval       = int64(30) // seconds
 )
+
+// desktopCounterSnapshot returns a point-in-time copy of telemetry counters.
+func desktopCounterSnapshot() map[string]uint64 {
+	return map[string]uint64{
+		"handshake_attempts":  desktopTelemetry.handshakeAttempts.Load(),
+		"handshake_successes": desktopTelemetry.handshakeSuccesses.Load(),
+		"handshake_failures":  desktopTelemetry.handshakeFailures.Load(),
+		"heartbeat_successes": desktopTelemetry.heartbeatSuccesses.Load(),
+		"heartbeat_failures":  desktopTelemetry.heartbeatFailures.Load(),
+		"policy_violations":   desktopTelemetry.policyViolations.Load(),
+		"frames_forwarded":    frameRelayStats.forwarded.Load(),
+		"frame_failures":      frameRelayStats.failures.Load(),
+	}
+}
+
+func traceAttributes(values map[string]any) []attribute.KeyValue {
+	if len(values) == 0 {
+		return nil
+	}
+	attrs := make([]attribute.KeyValue, 0, len(values))
+	for k, v := range values {
+		switch val := v.(type) {
+		case string:
+			attrs = append(attrs, attribute.String(k, val))
+		case fmt.Stringer:
+			attrs = append(attrs, attribute.String(k, val.String()))
+		case bool:
+			attrs = append(attrs, attribute.Bool(k, val))
+		case int:
+			attrs = append(attrs, attribute.Int(k, val))
+		case int64:
+			attrs = append(attrs, attribute.Int64(k, val))
+		case uint64:
+			attrs = append(attrs, attribute.Int64(k, int64(val)))
+		case float64:
+			attrs = append(attrs, attribute.Float64(k, val))
+		default:
+			attrs = append(attrs, attribute.String(k, fmt.Sprintf("%v", v)))
+		}
+	}
+	return attrs
+}
+
+func recordDesktopHandshakeAttempt() {
+	desktopTelemetry.handshakeAttempts.Add(1)
+}
+
+func recordDesktopHandshakeSuccess() {
+	desktopTelemetry.handshakeSuccesses.Add(1)
+	logDesktopTelemetrySnapshot("handshake_success")
+}
+
+func recordDesktopHandshakeFailure() {
+	desktopTelemetry.handshakeFailures.Add(1)
+	logDesktopTelemetrySnapshot("handshake_failure")
+}
+
+func recordDesktopHeartbeatSuccess() {
+	desktopTelemetry.heartbeatSuccesses.Add(1)
+	logDesktopTelemetrySnapshot("heartbeat_success")
+}
+
+func recordDesktopHeartbeatFailure() {
+	desktopTelemetry.heartbeatFailures.Add(1)
+	logDesktopTelemetrySnapshot("heartbeat_failure")
+}
+
+func recordDesktopPolicyViolation() {
+	desktopTelemetry.policyViolations.Add(1)
+	logDesktopTelemetrySnapshot("policy_violation")
+}
+
+func recordDesktopFrameRelayFailure(desktopUUID string, frameSize int) {
+	frameRelayStats.failures.Add(1)
+	logFrameRelaySnapshot("write_error", desktopUUID, frameSize)
+}
+
+func logDesktopTelemetrySnapshot(trigger string) {
+	now := time.Now().Unix()
+	last := desktopTelemetryLastLog.Load()
+	if trigger != "policy_violation" && now-last < desktopTelemetryLogInterval {
+		return
+	}
+	if !desktopTelemetryLastLog.CompareAndSwap(last, now) {
+		return
+	}
+
+	forwarded := frameRelayStats.forwarded.Load()
+	failed := frameRelayStats.failures.Load()
+	totalFrames := forwarded + failed
+	deliveryRate := float64(100)
+	if totalFrames > 0 {
+		deliveryRate = float64(forwarded) / float64(totalFrames) * 100
+	}
+
+	common.Info(nil, `[SERVER_DESKTOP_METRICS]`, ``, `Desktop telemetry snapshot`, map[string]any{
+		`trigger`:             trigger,
+		`handshake_attempts`:  desktopTelemetry.handshakeAttempts.Load(),
+		`handshake_successes`: desktopTelemetry.handshakeSuccesses.Load(),
+		`handshake_failures`:  desktopTelemetry.handshakeFailures.Load(),
+		`heartbeat_successes`: desktopTelemetry.heartbeatSuccesses.Load(),
+		`heartbeat_failures`:  desktopTelemetry.heartbeatFailures.Load(),
+		`policy_violations`:   desktopTelemetry.policyViolations.Load(),
+		`frames_forwarded`:    forwarded,
+		`frames_failed`:       failed,
+		`delivery_rate`:       deliveryRate,
+	})
+}
+
+func logFrameRelaySnapshot(trigger, desktopUUID string, frameSize int) {
+	now := time.Now().Unix()
+	last := frameRelayStats.lastLog.Load()
+	if trigger != "write_error" && now-last < frameRelayLogInterval {
+		return
+	}
+	if !frameRelayStats.lastLog.CompareAndSwap(last, now) {
+		return
+	}
+
+	forwarded := frameRelayStats.forwarded.Load()
+	failed := frameRelayStats.failures.Load()
+	total := forwarded + failed
+	deliveryRate := float64(100)
+	if total > 0 {
+		deliveryRate = float64(forwarded) / float64(total) * 100
+	}
+
+	common.Info(nil, `[SERVER_FRAME_RELAY_SUMMARY]`, ``, `Frame relay snapshot`, map[string]any{
+		`trigger`:       trigger,
+		`desktop_uuid`:  desktopUUID,
+		`frame_size`:    frameSize,
+		`frames_sent`:   forwarded,
+		`frames_failed`: failed,
+		`delivery_rate`: deliveryRate,
+	})
+	logDesktopTelemetrySnapshot("frame_relay")
+}
+
+// Session control key for view-only enforcement
+const sessionAllowControlKey = `DesktopAllowControl`
+
+// Payload limits are now centralized in utility/limits.go
+// See: REMOTE_DESKTOP_PIPELINE_AUDIT.md - Payload Constant Centralization
 
 func init() {
 	desktopSessions.Config.MaxMessageSize = common.MaxMessageSize
+	// Extended timeouts for desktop streaming stability:
+	// - PongWait: 120s (up from 60s default) to handle network jitter
+	// - WriteWait: 30s (up from 10s) for large frame writes
+	// - PingPeriod: 90s (3/4 of PongWait) per WebSocket best practices
+	desktopSessions.Config.PongWait = 120 * time.Second
+	desktopSessions.Config.WriteWait = 30 * time.Second
+	desktopSessions.Config.PingPeriod = 90 * time.Second
+	// Disable permessage-deflate compression (RFC 7692).
+	// Desktop payloads are already compressed (JPEG/etc); RFC 7692 adds CPU + latency.
+	desktopSessions.EnableCompress(false)
 	desktopSessions.HandleConnect(onDesktopConnect)
 	desktopSessions.HandleMessage(onDesktopMessage)
 	desktopSessions.HandleMessageBinary(onDesktopMessage)
 	desktopSessions.HandleDisconnect(onDesktopDisconnect)
+	// Capture WebSocket close codes for debugging connection issues
+	desktopSessions.HandleClose(func(session *melody.Session, code int, text string) error {
+		// Store close info for onDesktopDisconnect to log
+		session.Set(`CloseCode`, code)
+		session.Set(`CloseText`, text)
+		common.Info(session, `[SERVER_DESKTOP_WS_CLOSE]`, ``, `WebSocket close frame received`, map[string]any{
+			`close_code`: code,
+			`close_text`: text,
+		})
+		return nil
+	})
 	go utility.WSHealthCheck(desktopSessions, sendPack)
 }
 
@@ -62,6 +235,7 @@ func InitDesktop(ctx *gin.Context) {
 	ctx.Request = ctx.Request.WithContext(ctxSpan)
 
 	start := time.Now()
+	recordDesktopHandshakeAttempt()
 	logAbort := func(status int, reason string, extra map[string]any) {
 		if extra == nil {
 			extra = map[string]any{}
@@ -69,8 +243,12 @@ func InitDesktop(ctx *gin.Context) {
 		extra[`path`] = ctx.Request.URL.String()
 		extra[`ua`] = ctx.Request.UserAgent()
 		extra[`latency_ms`] = time.Since(start).Milliseconds()
+		span.RecordError(errors.New(reason))
+		span.SetStatus(codes.Error, reason)
+		span.AddEvent("desktop.handshake.abort", trace.WithAttributes(traceAttributes(extra)...))
 		common.Warn(ctx, `DESKTOP_HANDSHAKE`, `fail`, reason, extra)
 		ctx.AbortWithStatus(status)
+		recordDesktopHandshakeFailure()
 	}
 
 	if !ctx.IsWebsocket() {
@@ -114,10 +292,14 @@ func InitDesktop(ctx *gin.Context) {
 		`LastPack`: utils.Unix,
 	})
 
+	span.AddEvent("desktop.handshake.accepted", trace.WithAttributes(attribute.String("device", device)))
+	span.SetStatus(codes.Ok, "accepted")
+
 	common.Info(ctx, `DESKTOP_HANDSHAKE`, `success`, ``, map[string]any{
 		`device`:     device,
 		`latency_ms`: time.Since(start).Milliseconds(),
 	})
+	recordDesktopHandshakeSuccess()
 	span.SetAttributes(
 		attribute.String("desktop.device", device),
 		attribute.Int64("latency_ms", time.Since(start).Milliseconds()),
@@ -138,6 +320,15 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 		// Extend leases on any device→browser traffic (best effort)
 		if storage.IsMongoEnabled() {
 			go func(sessID, deviceID string) {
+				defer func() {
+					if r := recover(); r != nil {
+						common.Warn(nil, `DESKTOP_HEARTBEAT`, `panic`, `heartbeat goroutine panicked`, map[string]any{
+							`session_id`: sessID,
+							`device_id`:  deviceID,
+							`panic`:      r,
+						})
+					}
+				}()
 				ctx, cancel := storage.WithTimeout(context.Background())
 				defer cancel()
 				if mgr := cluster.Current(); mgr != nil {
@@ -161,14 +352,17 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 						`frame_count`:  desktop.frameCount,
 						`data_size`:    len(data),
 					})
-				}
-				// Log every 100th frame for monitoring
-				if desktop.frameCount%100 == 0 {
-					common.Info(nil, `[FRAME_RELAY_STATS]`, ``, `Frame relay statistics`, map[string]any{
-						`desktop_uuid`: desktop.uuid[:8] + `...`,
-						`frame_count`:  desktop.frameCount,
-						`data_size`:    len(data),
-					})
+					recordDesktopFrameRelayFailure(desktop.uuid, len(data))
+				} else {
+					frameRelayStats.forwarded.Add(1)
+					// Log every 100th frame for monitoring
+					if desktop.frameCount%100 == 0 {
+						common.Info(nil, `[FRAME_RELAY_STATS]`, ``, `Frame relay statistics`, map[string]any{
+							`desktop_uuid`: desktop.uuid[:8] + `...`,
+							`frame_count`:  desktop.frameCount,
+							`data_size`:    len(data),
+						})
+					}
 				}
 				return
 			}
@@ -191,6 +385,8 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				`desktop_uuid`: desktop.uuid[:8] + `...`,
 				`has_data`:     pack.Data != nil,
 			})
+		case `DESKTOP_METRICS`:
+			handleDesktopMetricsPacket(desktop, pack)
 
 			if pack.Code != 0 {
 				msg := `${i18n|DESKTOP.CREATE_SESSION_FAILED}`
@@ -217,6 +413,10 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				common.Info(desktop.srcConn, `DESKTOP_INIT`, `success`, ``, map[string]any{
 					`deviceConn`: desktop.deviceConn,
 				})
+
+				// Forward DESKTOP_INIT to browser with resolution data so canvas can be sized
+				// BEFORE any frame data arrives. This prevents rendering on wrong-sized canvas.
+				sendPack(modules.Packet{Act: `DESKTOP_INIT`, Code: 0, Data: pack.Data}, desktop.srcConn)
 
 				// Persist session start (best effort)
 				if storage.IsMongoEnabled() {
@@ -255,6 +455,24 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 					}
 				}(desktop.uuid)
 			}
+		case `DESKTOP_PONG`:
+			// Relay device-originated PONG back to browser for latency measurement
+			payload := gin.H{`source`: `device`}
+			for k, v := range pack.Data {
+				payload[k] = v
+			}
+			sendPack(modules.Packet{Act: `DESKTOP_PONG`, Code: 0, Data: payload}, desktop.srcConn)
+		case `DESKTOP_STATS`:
+			payload := gin.H{
+				`desktop_uuid`: desktop.uuid,
+				`device_id`:    desktop.device,
+			}
+			for k, v := range pack.Data {
+				payload[k] = v
+			}
+
+			common.Info(nil, `[SERVER_DESKTOP_STATS]`, ``, `Desktop session metrics snapshot received`, payload)
+			sendPack(modules.Packet{Act: `DESKTOP_STATS`, Code: 0, Data: payload}, desktop.srcConn)
 		case `DESKTOP_INPUT`:
 			if pack.Code != 0 {
 				sendPack(pack, desktop.srcConn)
@@ -272,6 +490,56 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			sendPack(pack, desktop.srcConn)
 		}
 	}
+}
+
+func handleDesktopMetricsPacket(desktop *desktop, pack modules.Packet) {
+	if pack.Data == nil {
+		common.Warn(nil, `[SERVER_DESKTOP_METRICS_INVALID]`, ``, `Desktop metrics payload missing data`, map[string]any{
+			`desktop_uuid`: desktop.uuid[:8] + `...`,
+		})
+		return
+	}
+
+	raw, err := utils.JSON.Marshal(pack.Data)
+	if err != nil {
+		common.Warn(nil, `[SERVER_DESKTOP_METRICS_MARSHAL_ERROR]`, ``, `Failed to marshal desktop metrics payload`, map[string]any{
+			`desktop_uuid`: desktop.uuid[:8] + `...`,
+			`error`:        err.Error(),
+		})
+		return
+	}
+
+	payload := struct {
+		Sessions    []DesktopSessionMetrics `json:"sessions"`
+		GeneratedAt int64                   `json:"generated_at"`
+	}{}
+
+	if err := utils.JSON.Unmarshal(raw, &payload); err != nil {
+		common.Warn(nil, `[SERVER_DESKTOP_METRICS_DECODE_FAILED]`, ``, `Failed to decode desktop metrics payload`, map[string]any{
+			`desktop_uuid`: desktop.uuid[:8] + `...`,
+			`error`:        err.Error(),
+		})
+		return
+	}
+
+	if payload.GeneratedAt == 0 {
+		payload.GeneratedAt = time.Now().Unix()
+	}
+
+	envelope := DesktopMetricsEnvelope{
+		DeviceID:    desktop.device,
+		DesktopUUID: desktop.uuid,
+		GeneratedAt: payload.GeneratedAt,
+		Sessions:    payload.Sessions,
+	}
+	storeDesktopMetrics(envelope)
+
+	common.Info(nil, `[SERVER_DESKTOP_METRICS]`, ``, `Desktop metrics snapshot stored`, map[string]any{
+		`desktop_uuid`: desktop.uuid[:8] + `...`,
+		`device`:       desktop.device,
+		`sessions`:     len(payload.Sessions),
+		`generated_at`: payload.GeneratedAt,
+	})
 }
 
 func onDesktopConnect(session *melody.Session) {
@@ -346,6 +614,7 @@ func onDesktopConnect(session *melody.Session) {
 		deviceConn: deviceConn,
 	}
 	session.Set(`Desktop`, desktop)
+	session.Set(sessionAllowControlKey, true)
 
 	common.Info(session, `[SERVER_DESKTOP_SESSION_CREATED]`, ``, `Desktop session created`, map[string]any{
 		`desktop_uuid`: desktopUUID[:8] + `...`,
@@ -466,9 +735,23 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	switch pack.Act {
 	case `DESKTOP_PING`:
 		common.Info(session, `[SERVER_DESKTOP_PING]`, ``, `Relaying DESKTOP_PING to device`, nil)
-		common.SendPack(modules.Packet{Act: `DESKTOP_PING`, Data: gin.H{
+		// Forward ping to device for keep-alive
+		if ok := common.SendPack(modules.Packet{Act: `DESKTOP_PING`, Data: gin.H{
 			`desktop`: desktop.uuid,
-		}, Event: desktop.uuid}, desktop.deviceConn)
+		}, Event: desktop.uuid}, desktop.deviceConn); !ok {
+			common.Warn(session, `[SERVER_DESKTOP_PING]`, `fail`, `failed to forward ping to device`, map[string]any{
+				`desktop_uuid`: desktop.uuid[:8] + `...`,
+			})
+			recordDesktopHeartbeatFailure()
+		} else {
+			recordDesktopHeartbeatSuccess()
+		}
+
+		// Send quick ACK so browser knows server link is alive (tagged as server source)
+		sendPack(modules.Packet{Act: `DESKTOP_PONG`, Data: gin.H{
+			`source`: `server`,
+		}}, session)
+
 		if storage.IsMongoEnabled() {
 			go func(sessID string) {
 				ctx, cancel := storage.WithTimeout(context.Background())
@@ -480,6 +763,12 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 				}
 			}(desktop.uuid)
 		}
+		return
+	case `DESKTOP_BROWSER_STATS`:
+		statsPayload := utility.CollectBrowserStats(pack.Data)
+		statsPayload[`desktop_uuid`] = desktop.uuid[:8] + `...`
+		statsPayload[`device_id`] = desktop.device[:16] + `...`
+		common.Info(session, `[SERVER_DESKTOP_BROWSER_STATS]`, ``, `Browser telemetry snapshot`, statsPayload)
 		return
 	case `DESKTOP_KILL`:
 		common.Info(desktop.srcConn, `DESKTOP_KILL`, `success`, ``, map[string]any{
@@ -500,6 +789,13 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		common.Info(session, `[SERVER_DESKTOP_INPUT]`, ``, `Relaying desktop input to device`, map[string]any{
 			`has_events`: pack.Data != nil && pack.Data[`events`] != nil,
 		})
+		if allow, ok := pack.Data[`allowControl`].(bool); ok {
+			setAllowControlFlag(session, allow)
+		}
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		events, ok := normalizeInputEvents(pack.Data)
 		if !ok {
 			common.Warn(desktop.srcConn, `DESKTOP_INPUT`, `fail`, `invalid events payload`, map[string]any{
@@ -511,11 +807,13 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			return
 		}
 
+		allowControl := allowControlEnabled(session)
 		common.SendPack(modules.Packet{
 			Act: `DESKTOP_INPUT`,
 			Data: gin.H{
-				`events`:  events,
-				`desktop`: desktop.uuid,
+				`events`:       events,
+				`desktop`:      desktop.uuid,
+				`allowControl`: allowControl,
 			},
 			Event: desktop.uuid,
 		}, desktop.deviceConn)
@@ -526,11 +824,18 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 			sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 			return
 		}
+		if allowVal, exists := payload[`allowControl`].(bool); exists {
+			setAllowControlFlag(session, allowVal)
+		}
 		payload[`desktop`] = desktop.uuid
 		common.Info(session, `[SERVER_DESKTOP_CONFIG]`, ``, `Relaying desktop configuration to device`, payload)
 		common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	case `DESKTOP_CLIPBOARD`:
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		if payload, ok := normalizeClipboard(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -539,6 +844,10 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_FILE_DROP`:
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		if payload, ok := normalizeFileDrop(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -547,6 +856,10 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_AUDIO`:
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		if payload, ok := normalizeAudioControl(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -555,6 +868,10 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		if payload, ok := normalizeSDP(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -563,6 +880,10 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_WEBRTC_ICE`:
+		if !allowControlEnabled(session) {
+			blockControlAction(session, desktop, pack.Act)
+			return
+		}
 		if payload, ok := normalizeCandidate(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -571,11 +892,29 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	}
-	session.Close()
+	common.Warn(session, `[SERVER_DESKTOP_UNKNOWN_ACTION]`, ``, `Unknown desktop action from browser`, map[string]any{
+		`act`:          pack.Act,
+		`desktop_uuid`: desktop.uuid[:8] + `...`,
+	})
+	sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+	return
 }
 
 func onDesktopDisconnect(session *melody.Session) {
-	common.Info(session, `[SERVER_DESKTOP_DISCONNECT]`, ``, `Browser disconnected from desktop session`, nil)
+	// Collect diagnostic info for disconnect analysis
+	closeCode := 0
+	closeText := ""
+	if code, ok := session.Get(`CloseCode`); ok {
+		closeCode, _ = code.(int)
+	}
+	if text, ok := session.Get(`CloseText`); ok {
+		closeText, _ = text.(string)
+	}
+
+	common.Info(session, `[SERVER_DESKTOP_DISCONNECT]`, ``, `Browser disconnected from desktop session`, map[string]any{
+		`close_code`: closeCode,
+		`close_text`: closeText,
+	})
 	common.Info(session, `DESKTOP_CLOSE`, `success`, ``, nil)
 
 	val, ok := session.Get(`Desktop`)
@@ -592,6 +931,9 @@ func onDesktopDisconnect(session *melody.Session) {
 	common.Info(session, `[SERVER_DESKTOP_CLEANUP]`, ``, `Cleaning up desktop session`, map[string]any{
 		`desktop_uuid`: desktop.uuid[:8] + `...`,
 		`device_id`:    desktop.device[:16] + `...`,
+		`frame_count`:  desktop.frameCount,
+		`close_code`:   closeCode,
+		`close_text`:   closeText,
 	})
 
 	if !common.SendPack(modules.Packet{Act: `DESKTOP_KILL`, Data: gin.H{
@@ -627,6 +969,54 @@ func sendPack(pack modules.Packet, session *melody.Session) bool {
 	data = utility.SimpleEncrypt(data, session)
 	err = session.WriteBinary(append([]byte{34, 22, 19, 17, 20, 03}, data...))
 	return err == nil
+}
+
+func setAllowControlFlag(session *melody.Session, allowed bool) {
+	if session == nil {
+		return
+	}
+	prev := allowControlEnabled(session)
+	session.Set(sessionAllowControlKey, allowed)
+	if prev == allowed {
+		return
+	}
+
+	if val, ok := session.Get(`Desktop`); ok {
+		if desktop, ok := val.(*desktop); ok {
+			common.Info(session, `[SERVER_DESKTOP_POLICY]`, ``, `allowControl updated`, map[string]any{
+				`desktop_uuid`: desktop.uuid[:8] + `...`,
+				`previous`:     prev,
+				`current`:      allowed,
+			})
+			if !allowed {
+				recordDesktopPolicyViolation()
+			}
+		}
+	}
+}
+
+func allowControlEnabled(session *melody.Session) bool {
+	if session == nil {
+		return true
+	}
+	val, ok := session.Get(sessionAllowControlKey)
+	if !ok {
+		return true
+	}
+	allowed, ok := val.(bool)
+	if !ok {
+		return true
+	}
+	return allowed
+}
+
+func blockControlAction(session *melody.Session, desktop *desktop, act string) {
+	common.Warn(session, `[SERVER_DESKTOP_POLICY]`, `fail`, `control action blocked`, map[string]any{
+		`desktop_uuid`: desktop.uuid[:8] + `...`,
+		`action`:       act,
+	})
+	sendPack(modules.Packet{Act: act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+	recordDesktopPolicyViolation()
 }
 
 func CloseSessionsByDevice(deviceID string) {
@@ -671,8 +1061,8 @@ func normalizeInputEvents(data map[string]any) ([]any, bool) {
 
 	switch events := rawEvents.(type) {
 	case []any:
-		if len(events) > maxDesktopInputBatch {
-			return events[:maxDesktopInputBatch], true
+		if len(events) > utility.MaxDesktopInputBatch {
+			return events[:utility.MaxDesktopInputBatch], true
 		}
 		return events, true
 	default:
@@ -685,7 +1075,7 @@ func normalizeSDP(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	sdp, ok := data[`sdp`].(string)
-	if !ok || len(sdp) == 0 || len(sdp) > maxSDPLength {
+	if !ok || len(sdp) == 0 || len(sdp) > utility.MaxSDPLength {
 		return nil, false
 	}
 	// Validate SDP format
@@ -723,7 +1113,7 @@ func normalizeCandidate(data map[string]any) (gin.H, bool) {
 		return nil, false
 	}
 	candidate, ok := data[`candidate`].(string)
-	if !ok || len(candidate) == 0 || len(candidate) > maxCandidateLength {
+	if !ok || len(candidate) == 0 || len(candidate) > utility.MaxCandidateLength {
 		return nil, false
 	}
 	// Validate ICE candidate format
@@ -769,8 +1159,8 @@ func normalizeClipboard(data map[string]any) (gin.H, bool) {
 	if !ok || len(text) == 0 {
 		return nil, false
 	}
-	if len(text) > maxClipboardBytes {
-		text = text[:maxClipboardBytes]
+	if len(text) > utility.MaxClipboardBytes {
+		text = text[:utility.MaxClipboardBytes]
 	}
 	payload := gin.H{`text`: text}
 	if mime, ok := data[`mime`].(string); ok && len(mime) > 0 {
@@ -794,7 +1184,7 @@ func normalizeFileDrop(data map[string]any) (gin.H, bool) {
 
 	files := make([]gin.H, 0, len(list))
 	for _, item := range list {
-		if len(files) >= maxFileDropEntries {
+		if len(files) >= utility.MaxFileDropEntries {
 			break
 		}
 		m, ok := item.(map[string]any)
@@ -802,8 +1192,8 @@ func normalizeFileDrop(data map[string]any) (gin.H, bool) {
 			continue
 		}
 		name, _ := m[`name`].(string)
-		if len(name) > maxFileNameLength {
-			name = name[:maxFileNameLength]
+		if len(name) > utility.MaxFileNameLength {
+			name = name[:utility.MaxFileNameLength]
 		}
 		size := int64(0)
 		switch v := m[`size`].(type) {
@@ -845,13 +1235,13 @@ func normalizeCursor(data map[string]any) (gin.H, bool) {
 	if !wOk || !hOk || width <= 0 || height <= 0 {
 		return nil, false
 	}
-	if width > maxCursorWidth || height > maxCursorHeight {
+	if width > utility.MaxCursorWidth || height > utility.MaxCursorHeight {
 		return nil, false
 	}
 
 	// Validate base64 data size
 	dataStr, ok := data[`data`].(string)
-	if ok && len(dataStr) > maxCursorDataSize {
+	if ok && len(dataStr) > utility.MaxCursorDataSize {
 		return nil, false
 	}
 
