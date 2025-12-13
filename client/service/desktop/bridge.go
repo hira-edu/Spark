@@ -171,6 +171,18 @@ func (b *Bridge) handleInit(payload []byte) {
 	b.state = bridgeStateCapturing
 	b.mu.Unlock()
 
+	// If we already have an active capture session (e.g., started lazily on CONFIG/SHOT),
+	// don't reinitialize and risk stomping session state.
+	if b.desktopUUID != "" {
+		if _, ok := sessions.Get(b.desktopUUID); ok {
+			telemetry.LogStructured("INFO", "Bridge: DESKTOP_INIT received but session already active", map[string]interface{}{
+				"session_id": b.sessionID,
+				"desktop":    b.desktopUUID,
+			})
+			return
+		}
+	}
+
 	// Initialize desktop capture - this runs in user session so it has access to desktop
 	err := initDesktopCapture(pack, b.sendFrame)
 	if err != nil {
@@ -254,6 +266,7 @@ func (b *Bridge) handleConfig(payload []byte) {
 	if b.shouldDropPacket(&pack) {
 		return
 	}
+	b.ensureDesktopSession(pack, "config")
 	HandleConfig(pack)
 }
 
@@ -269,7 +282,53 @@ func (b *Bridge) handleShot(payload []byte) {
 	if b.shouldDropPacket(&pack) {
 		return
 	}
+	b.ensureDesktopSession(pack, "shot")
 	GetDesktop(pack)
+}
+
+// ensureDesktopSession lazily starts a desktop capture session if we receive CONFIG/SHOT
+// before INIT (or if INIT was lost). This prevents 0fps/black screen caused by missing
+// capture worker startup in the UI bridge process.
+func (b *Bridge) ensureDesktopSession(pack modules.Packet, reason string) {
+	desktopID, _ := pack.Data["desktop"].(string)
+	if desktopID == "" || pack.Event == "" {
+		return
+	}
+	if _, ok := sessions.Get(desktopID); ok {
+		return
+	}
+
+	telemetry.LogStructured("WARN", "Bridge: starting desktop session lazily", map[string]interface{}{
+		"reason":     reason,
+		"session_id": b.sessionID,
+		"desktop":    desktopID,
+	})
+
+	b.mu.Lock()
+	b.desktopUUID = desktopID
+	b.eventHex = pack.Event
+	b.state = bridgeStateCapturing
+	b.mu.Unlock()
+
+	if err := initDesktopCapture(pack, b.sendFrame); err != nil {
+		telemetry.LogStructured("ERROR", "Bridge: lazy desktop init failed", map[string]interface{}{
+			"reason":     reason,
+			"session_id": b.sessionID,
+			"desktop":    desktopID,
+			"error":      err.Error(),
+		})
+		if b.server != nil {
+			errPack := modules.Packet{
+				Act:   "DESKTOP_INIT",
+				Code:  1,
+				Msg:   err.Error(),
+				Event: pack.Event,
+			}
+			if data, marshalErr := utils.JSON.Marshal(errPack); marshalErr == nil {
+				_ = b.server.Send(&ipc.Message{Type: ipc.MsgTypeDesktopPacket, Payload: data})
+			}
+		}
+	}
 }
 
 func (b *Bridge) handleHello(payload []byte) {
