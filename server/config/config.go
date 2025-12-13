@@ -7,6 +7,7 @@ import (
 	"github.com/kataras/golog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 )
 
@@ -125,6 +126,19 @@ type captureConfig struct {
 var Commit = ``
 var Config config
 var BuiltPath = `./built/%v_%v`
+
+func buildRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info == nil {
+		return ``
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == `vcs.revision` && len(setting.Value) > 0 {
+			return setting.Value
+		}
+	}
+	return ``
+}
 
 func runningUnderTests() bool {
 	exe := filepath.Base(os.Args[0])
@@ -254,8 +268,12 @@ func init() {
 	Config.SaltBytes = Config.SaltBytes[:24]
 
 	if len(Commit) == 0 {
-		Commit = `dev`
-		golog.Warn(`Commit hash not set at build time; using fallback 'dev'`)
+		if rev := buildRevision(); len(rev) > 0 {
+			Commit = rev
+		} else {
+			Commit = `dev`
+			golog.Warn(`Commit hash not set at build time; using fallback 'dev'`)
+		}
 	}
 
 	// Initialize transport defaults if not configured

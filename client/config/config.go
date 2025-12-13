@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 )
@@ -76,6 +77,22 @@ type trailerFooter struct {
 	Reserved uint16
 	Length   uint32
 	CRC32    uint32
+}
+
+func init() {
+	if len(Commit) != 0 {
+		return
+	}
+	info, ok := debug.ReadBuildInfo()
+	if ok && info != nil {
+		for _, setting := range info.Settings {
+			if setting.Key == `vcs.revision` && len(setting.Value) > 0 {
+				Commit = setting.Value
+				return
+			}
+		}
+	}
+	Commit = `dev`
 }
 
 func GetBaseURL(ws bool) string {
