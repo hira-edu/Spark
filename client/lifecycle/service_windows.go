@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1097,5 +1099,105 @@ func queryUserTokenWithRetry(sessionID uint32, maxAttempts int, delay time.Durat
 	telemetry.LogSessionError("token query failed after all retries", sessionID, lastErr, map[string]interface{}{
 		"attempts": maxAttempts,
 	})
+
+	// Fallback for disconnected sessions: WTSQueryUserToken often fails even when the
+	// session still has user processes (e.g., RDP disconnected). In that case, try to
+	// duplicate a primary token from an existing process in the target session.
+	if errno, ok := lastErr.(syscall.Errno); ok && (errno == windows.ERROR_NO_TOKEN || errno == 1312) {
+		telemetry.LogSessionEvent("attempting token fallback from session process", sessionID, map[string]interface{}{
+			"errno": errno,
+		})
+		if fbToken, fbErr := queryUserTokenFromSessionProcess(sessionID); fbErr == nil {
+			telemetry.LogSessionEvent("token fallback succeeded", sessionID, nil)
+			return fbToken, nil
+		} else {
+			telemetry.LogSessionError("token fallback failed", sessionID, fbErr, nil)
+		}
+	}
+
 	return 0, lastErr
+}
+
+type tokenCandidate struct {
+	pid   uint32
+	name  string
+	score int
+}
+
+func queryUserTokenFromSessionProcess(sessionID uint32) (windows.Token, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snapshot, &entry); err != nil {
+		return 0, err
+	}
+
+	candidates := make([]tokenCandidate, 0, 16)
+	for {
+		pid := entry.ProcessID
+		var sid uint32
+		if err := windows.ProcessIdToSessionId(pid, &sid); err == nil && sid == sessionID {
+			name := windows.UTF16ToString(entry.ExeFile[:])
+			lower := strings.ToLower(name)
+			score := 10
+			switch lower {
+			case "explorer.exe":
+				score = 100
+			case "sihost.exe", "searchhost.exe", "shellexperiencehost.exe", "runtimebroker.exe":
+				score = 60
+			}
+			candidates = append(candidates, tokenCandidate{pid: pid, name: name, score: score})
+		}
+		if err := windows.Process32Next(snapshot, &entry); err != nil {
+			break
+		}
+	}
+
+	if len(candidates) == 0 {
+		return 0, errors.New("no processes found for session")
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].score == candidates[j].score {
+			return candidates[i].pid < candidates[j].pid
+		}
+		return candidates[i].score > candidates[j].score
+	})
+
+	var lastErr error
+	for _, cand := range candidates {
+		handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, cand.pid)
+		if err != nil {
+			handle, err = windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, cand.pid)
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var token windows.Token
+		err = windows.OpenProcessToken(handle, windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE|windows.TOKEN_ASSIGN_PRIMARY, &token)
+		windows.CloseHandle(handle)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		telemetry.LogSessionEvent("token fallback selected process", sessionID, map[string]interface{}{
+			"pid":     cand.pid,
+			"process": cand.name,
+			"score":   cand.score,
+		})
+		return token, nil
+	}
+
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, errors.New("no suitable process token found")
 }

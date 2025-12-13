@@ -357,6 +357,13 @@ func (r *Relay) ensureConnectedLocked() error {
 	if err := client.Connect(); err != nil {
 		r.state = relayStateDegraded
 		r.scheduleRetryLocked()
+		telemetry.LogStructured("WARN", "Desktop relay connect failed", map[string]interface{}{
+			"session_id": r.sessionID,
+			"pipe":       ipc.GetPipeName(r.sessionID),
+			"error":      err.Error(),
+			"next_retry": r.nextRetry.Format(time.RFC3339Nano),
+			"backoff_ms": r.backoff.Milliseconds(),
+		})
 		return err
 	}
 
