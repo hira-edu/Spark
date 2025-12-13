@@ -195,7 +195,12 @@ func attemptConnection(ctx context.Context) error {
 	}
 
 	telemetry.LogWSEvent("connected and registered", nil)
-	checkUpdate(wsConn)
+	if err := checkUpdate(wsConn); err != nil {
+		telemetry.LogWSError("update check failed", err, nil)
+	}
+	if stopFlag.Load() {
+		return nil
+	}
 
 	// Handle messages (blocks until disconnect)
 	err = handleWS(wsConn)
@@ -379,13 +384,18 @@ func checkUpdate(wsConn *common.Conn) error {
 				return err
 			}
 
-			// When running as a Windows service, an immediate os.Exit can trigger the
-			// SCM "failure restart" action and race the self-update. Drop a sentinel
-			// so Stop requests are honored, then ask SCM to stop the service.
-			if runtime.GOOS == "windows" {
+			if runtime.GOOS == "windows" && desktop.IsSession0Mode() {
+				// When running as a Windows service, do not os.Exit immediately: it can
+				// trigger SCM recovery restarts and/or leave spawned UI workers running,
+				// which keeps the executable locked and causes an endless update loop.
 				_ = os.WriteFile(selfPath+`.disable`, []byte{}, 0600)
 				_ = exec.Command("sc", "stop", "WinUpdateSvc").Start()
-				time.Sleep(500 * time.Millisecond)
+
+				Stop()
+				if wsConn != nil {
+					wsConn.Close()
+				}
+				return nil
 			}
 
 			stopAndExit(wsConn, 0)
