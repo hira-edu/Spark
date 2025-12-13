@@ -236,7 +236,11 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 	})
 
 	switch eventType {
-	case windows.WTS_SESSION_LOGON, windows.WTS_SESSION_UNLOCK, windows.WTS_CONSOLE_CONNECT, windows.WTS_REMOTE_CONNECT:
+	case windows.WTS_SESSION_LOGON, windows.WTS_SESSION_UNLOCK, windows.WTS_CONSOLE_CONNECT, windows.WTS_REMOTE_CONNECT,
+		// Keep the UI bridge alive while the session is locked/disconnected so the Session 0 relay
+		// can still capture and forward the desktop (otherwise the service can't connect to the
+		// per-session named pipe and desktop shows black/0fps).
+		windows.WTS_SESSION_LOCK, windows.WTS_CONSOLE_DISCONNECT, windows.WTS_REMOTE_DISCONNECT:
 		// User became active - launch UI
 		telemetry.LogSessionEvent("handleSessionChangeEvent: user active event", sessionID, map[string]interface{}{
 			"event": eventName,
@@ -255,15 +259,17 @@ func handleSessionChangeEvent(eventType uint32, sessionID uint32) {
 			reconcileSession(sessionID)
 		}()
 
-	case windows.WTS_SESSION_LOGOFF, windows.WTS_SESSION_TERMINATE, windows.WTS_SESSION_LOCK, windows.WTS_CONSOLE_DISCONNECT, windows.WTS_REMOTE_DISCONNECT:
-		// User became inactive - terminate UI
+	case windows.WTS_SESSION_LOGOFF, windows.WTS_SESSION_TERMINATE:
+		// User session ended - terminate UI
 		telemetry.LogSessionEvent("handleSessionChangeEvent: user inactive event", sessionID, map[string]interface{}{
 			"event": eventName,
 		})
 		// Reset launch attempts when session becomes inactive - fresh start next time
 		resetSessionLaunchAttempts(sessionID)
 		setSessionDesiredState(sessionID, "none")
-		desktop.SetActiveSessionID(0)
+		if desktop.GetActiveSessionID() == sessionID {
+			desktop.SetActiveSessionID(0)
+		}
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -870,6 +876,14 @@ func getInteractiveSessionID() (uint32, error) {
 	// Second pass: look for connected sessions
 	for _, s := range sessionSlice {
 		if s.State == windows.WTSConnected && s.SessionID != 0 {
+			return s.SessionID, nil
+		}
+	}
+
+	// Third pass: allow disconnected sessions (e.g., RDP disconnected) so the service can
+	// keep the UI bridge alive and the Session 0 desktop relay can still function.
+	for _, s := range sessionSlice {
+		if s.State == windows.WTSDisconnected && s.SessionID != 0 {
 			return s.SessionID, nil
 		}
 	}
