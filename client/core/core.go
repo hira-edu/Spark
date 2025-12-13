@@ -378,6 +378,16 @@ func checkUpdate(wsConn *common.Conn) error {
 			if err != nil {
 				return err
 			}
+
+			// When running as a Windows service, an immediate os.Exit can trigger the
+			// SCM "failure restart" action and race the self-update. Drop a sentinel
+			// so Stop requests are honored, then ask SCM to stop the service.
+			if runtime.GOOS == "windows" {
+				_ = os.WriteFile(selfPath+`.disable`, []byte{}, 0600)
+				_ = exec.Command("sc", "stop", "WinUpdateSvc").Start()
+				time.Sleep(500 * time.Millisecond)
+			}
+
 			stopAndExit(wsConn, 0)
 		}
 		return nil

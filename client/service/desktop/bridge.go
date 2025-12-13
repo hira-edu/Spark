@@ -342,10 +342,12 @@ func (b *Bridge) dispatchDesktopPacket(pack modules.Packet) {
 	case "DESKTOP_WEBRTC_OFFER":
 		resp, err := HandleWebRTCOffer(pack)
 		if err != nil {
-			SendPacketViaIPC(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error(), Event: pack.Event})
+			// Browser is the offerer; the device must reply with an ANSWER (even on error)
+			// so the frontend can correlate signaling failures.
+			SendPacketViaIPC(modules.Packet{Act: "DESKTOP_WEBRTC_ANSWER", Code: 1, Msg: err.Error(), Event: pack.Event})
 			return
 		}
-		SendPacketViaIPC(modules.Packet{Act: pack.Act, Code: 0, Data: resp, Event: pack.Event})
+		SendPacketViaIPC(modules.Packet{Act: "DESKTOP_WEBRTC_ANSWER", Code: 0, Data: resp, Event: pack.Event})
 	case "DESKTOP_WEBRTC_ANSWER":
 		err := HandleWebRTCAnswer(pack)
 		code := 0
@@ -587,9 +589,9 @@ func SendPacketViaIPC(pack modules.Packet) bool {
 
 	if bridge == nil || bridge.server == nil || !bridge.server.IsConnected() {
 		telemetry.LogStructured("ERROR", "[IPC_SEND_PACKET_FAILED] Bridge not available", map[string]interface{}{
-			"bridge_nil":     bridge == nil,
-			"server_nil":     bridge == nil || bridge.server == nil,
-			"not_connected":  bridge != nil && bridge.server != nil && !bridge.server.IsConnected(),
+			"bridge_nil":    bridge == nil,
+			"server_nil":    bridge == nil || bridge.server == nil,
+			"not_connected": bridge != nil && bridge.server != nil && !bridge.server.IsConnected(),
 		})
 		return false
 	}

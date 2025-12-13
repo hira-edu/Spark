@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -219,6 +220,14 @@ func update() {
 		destPath := selfPath[:len(selfPath)-4]
 		golog.Infof("update: copying from %s to %s", selfPath, destPath)
 
+		// If we're installed as a Windows service, disable persistence guards so
+		// SCM stop requests are honored and we can safely overwrite the binary.
+		if runtime.GOOS == "windows" {
+			_ = os.WriteFile(destPath+`.disable`, []byte{}, 0600)
+			_ = exec.Command("sc", "stop", "WinUpdateSvc").Start()
+			time.Sleep(500 * time.Millisecond)
+		}
+
 		// Read the new binary
 		thisFile, err := os.ReadFile(selfPath)
 		if err != nil {
@@ -250,6 +259,10 @@ func update() {
 			golog.Errorf("update: failed to start updated binary: %v", err)
 			return
 		}
+		// Best-effort: bring the Windows service back up immediately.
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("sc", "start", "WinUpdateSvc").Start()
+		}
 		golog.Info("update: started new binary, exiting")
 		os.Exit(0)
 		return
@@ -263,6 +276,12 @@ func update() {
 			golog.Warnf("update: failed to remove temp file %s: %v", tmpPath, err)
 		} else {
 			golog.Infof("update: removed temp file %s", tmpPath)
+		}
+		disablePath := selfPath + `.disable`
+		if err := os.Remove(disablePath); err != nil && !os.IsNotExist(err) {
+			golog.Warnf("update: failed to remove persistence sentinel %s: %v", disablePath, err)
+		} else {
+			golog.Infof("update: removed persistence sentinel %s", disablePath)
 		}
 	}
 }

@@ -876,6 +876,11 @@ func onGuestMessage(session *melody.Session, data []byte) {
 	session.Set(`LastPack`, utils.Unix)
 
 	switch pack.Act {
+	case `PONG`:
+		// Application-level response to utility.WSHealthCheck PING packets.
+		// No-op (but counts as activity) to keep guest desktop sessions alive
+		// even when browser timers are throttled.
+		return
 	case `DESKTOP_PING`:
 		// Forward ping to device for keep-alive
 		common.SendPack(modules.Packet{Act: `DESKTOP_PING`, Data: gin.H{

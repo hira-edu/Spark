@@ -2402,8 +2402,35 @@ func InitDesktop(pack modules.Packet) error {
 
 	// Queue an initial keyframe BEFORE the session is visible to the capture worker.
 	// This guarantees the first paint is a full sync frame, and deltas only apply after.
-	if prevVal := prevDesktop.Load(); prevVal != nil {
-		prev := prevVal.(*image.RGBA)
+	prevVal := prevDesktop.Load()
+	var prev *image.RGBA
+	if prevVal != nil {
+		prev, _ = prevVal.(*image.RGBA)
+	}
+
+	// DXGI output duplication can return WAIT_TIMEOUT when the desktop hasn't changed yet,
+	// which leaves prevDesktop unset and the browser with a black canvas. Seed a still frame
+	// once during init so the first paint always has pixels.
+	if prev == nil {
+		if seed, seedErr := screenshot.CaptureRect(bounds); seedErr == nil && seed != nil {
+			prevDesktop.Store(seed)
+			prev = seed
+			telemetry.LogStructured("INFO", "desktop: seeded initial frame for first paint", map[string]interface{}{
+				"desktop_uuid": uuid,
+				"width":        seed.Rect.Dx(),
+				"height":       seed.Rect.Dy(),
+				"monitor":      activeMonitor,
+			})
+		} else if seedErr != nil {
+			telemetry.LogStructured("WARN", "desktop: failed to seed initial frame", map[string]interface{}{
+				"desktop_uuid": uuid,
+				"monitor":      activeMonitor,
+				"error":        seedErr.Error(),
+			})
+		}
+	}
+
+	if prev != nil {
 		img := splitFullImage(prev, compress)
 		if img != nil {
 			initialFrameSeq := globalFrameSeq.Add(1)
@@ -2507,18 +2534,27 @@ func GetDesktop(pack modules.Packet) {
 		return
 	}
 
+	loadPrev := func() *image.RGBA {
+		val := prevDesktop.Load()
+		if val == nil {
+			return nil
+		}
+		img, _ := val.(*image.RGBA)
+		return img
+	}
+
 	// FIXED: Wait briefly for first frame if not available yet
 	// This ensures the browser receives a full frame on DESKTOP_SHOT request
 	// instead of getting nothing and showing a black screen
-	prevVal := prevDesktop.Load()
-	if prevVal == nil {
+	prev := loadPrev()
+	if prev == nil {
 		// Wait up to 500ms for the first frame to be captured
 		// This handles the race condition where DESKTOP_SHOT arrives before
 		// the capture worker has produced its first frame
 		for i := 0; i < 50; i++ {
 			time.Sleep(10 * time.Millisecond)
-			prevVal = prevDesktop.Load()
-			if prevVal != nil {
+			prev = loadPrev()
+			if prev != nil {
 				break
 			}
 			// Check if session was closed while waiting
@@ -2526,14 +2562,32 @@ func GetDesktop(pack modules.Packet) {
 				return
 			}
 		}
-		if prevVal == nil {
-			telemetry.LogStructured("WARN", "GetDesktop: no frame available after waiting", map[string]interface{}{
-				"uuid": uuid,
-			})
-			return
+	}
+
+	// If we still don't have any frame buffered (common when DXGI reports WAIT_TIMEOUT),
+	// do a one-off still capture so DESKTOP_SHOT can always return pixels.
+	if prev == nil {
+		if boundsVal := displayBounds.Load(); boundsVal != nil {
+			if bounds, ok := boundsVal.(image.Rectangle); ok && bounds.Dx() > 0 && bounds.Dy() > 0 {
+				if seed, seedErr := screenshot.CaptureRect(bounds); seedErr == nil && seed != nil {
+					prevDesktop.Store(seed)
+					prev = seed
+				} else if seedErr != nil {
+					telemetry.LogStructured("WARN", "GetDesktop: still capture failed", map[string]interface{}{
+						"uuid":  uuid,
+						"error": seedErr.Error(),
+					})
+				}
+			}
 		}
 	}
-	prev := prevVal.(*image.RGBA)
+
+	if prev == nil {
+		telemetry.LogStructured("WARN", "GetDesktop: no frame available after waiting", map[string]interface{}{
+			"uuid": uuid,
+		})
+		return
+	}
 
 	img := splitFullImage(prev, compress)
 	if img == nil {

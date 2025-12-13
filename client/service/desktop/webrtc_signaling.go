@@ -1,7 +1,6 @@
 package desktop
 
 import (
-	"Rocket/client/common"
 	"Rocket/modules"
 	"errors"
 	"os"
@@ -233,21 +232,35 @@ func HandleWebRTCIce(pack modules.Packet) error {
 }
 
 func notifyICE(desktopID string, c *webrtc.ICECandidate) {
-	if c == nil || len(desktopID) == 0 || common.WSConn == nil {
+	if c == nil || len(desktopID) == 0 {
 		return
 	}
+
+	// Look up the session so we can route through WS (service mode) or IPC (bridge mode).
+	sess, ok := sessions.Get(desktopID)
+	if !ok || sess == nil || sess.escape.Load() {
+		return
+	}
+
 	json := c.ToJSON()
-	// Use DESKTOP_WEBRTC_ICE for consistency with server handlers
-	_ = common.WSConn.SendPack(modules.Packet{
-		Act: `DESKTOP_WEBRTC_ICE`,
+	candidate := strings.TrimSpace(json.Candidate)
+	if candidate == "" || len(candidate) > maxCandidateLength {
+		return
+	}
+
+	// Deliver ICE candidates back to the browser via the server desktop event (Event=desktop uuid).
+	sendDesktopPacket(modules.Packet{
+		Act:   `DESKTOP_WEBRTC_ICE`,
+		Event: sess.event,
+		Code:  0,
 		Data: map[string]any{
 			`desktop`:   desktopID,
-			`candidate`: json.Candidate,
+			`candidate`: candidate,
 			`sdpMid`:    json.SDPMid,
-			`mLine`:     json.SDPMLineIndex, // Use consistent field name
+			`mLine`:     json.SDPMLineIndex,
 			`role`:      `device`,
 		},
-	})
+	}, sess.rawEvent)
 }
 
 func parseSDPType(t string) (webrtc.SDPType, error) {

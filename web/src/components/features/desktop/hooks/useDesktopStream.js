@@ -665,6 +665,22 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       }
     }
 
+    // Respond to server health-check PING packets (utility.WSHealthCheck).
+    // Without this, the server can close an otherwise healthy stream if the tab
+    // stops sending client->server messages (e.g., timers throttled in background).
+    if (data?.act === 'PING') {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const body = new TextEncoder().encode(JSON.stringify({ act: 'PONG' }));
+        const buffer = new Uint8Array(body.length + 8);
+        buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
+        buffer.set(new Uint8Array([body.length >> 8, body.length & 0xFF]), 6);
+        buffer.set(body, 8);
+        ws.send(buffer.buffer);
+      }
+      return;
+    }
+
     // Handle pong for latency measurement
     if (data?.act === 'DESKTOP_PONG') {
       const source = data?.data?.source || 'device';

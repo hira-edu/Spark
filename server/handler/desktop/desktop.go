@@ -737,6 +737,22 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	})
 
 	switch pack.Act {
+	case `PONG`:
+		// Application-level response to utility.WSHealthCheck PING packets.
+		// Keep this as a no-op (but count as activity) so the desktop stream
+		// isn't torn down just because the browser paused its timers.
+		if storage.IsMongoEnabled() {
+			go func(sessID string) {
+				ctx, cancel := storage.WithTimeout(context.Background())
+				defer cancel()
+				if mgr := cluster.Current(); mgr != nil {
+					mgr.HeartbeatSession(ctx, sessID)
+				} else {
+					_ = storage.HeartbeatSession(ctx, sessID, sessionLeaseTTL())
+				}
+			}(desktop.uuid)
+		}
+		return
 	case `DESKTOP_PING`:
 		common.Info(session, `[SERVER_DESKTOP_PING]`, ``, `Relaying DESKTOP_PING to device`, nil)
 		// Forward ping to device for keep-alive
