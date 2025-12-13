@@ -501,30 +501,7 @@ func (b *Bridge) sendFrame(data []byte) {
 	if b.server == nil || !b.server.IsConnected() {
 		return
 	}
-	if !b.shouldSendFrame() {
-		return
-	}
 	b.server.Send(&ipc.Message{Type: ipc.MsgTypeDesktopFrame, Payload: data})
-}
-
-func (b *Bridge) shouldSendFrame() bool {
-	if b == nil {
-		return false
-	}
-	if b.wsConnectedFlag.Load() {
-		return true
-	}
-
-	now := time.Now().Unix()
-	prev := b.lastDropUnix.Load()
-	if prev == 0 || now-prev >= 30 {
-		if b.lastDropUnix.CompareAndSwap(prev, now) {
-			telemetry.LogStructured("WARN", "Bridge: dropping frames while WS disconnected", map[string]interface{}{
-				"session_id": b.sessionID,
-			})
-		}
-	}
-	return false
 }
 
 // sendIPCMessage sends a typed IPC message to Session 0
