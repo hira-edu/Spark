@@ -385,9 +385,6 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				`desktop_uuid`: desktop.uuid[:8] + `...`,
 				`has_data`:     pack.Data != nil,
 			})
-		case `DESKTOP_METRICS`:
-			handleDesktopMetricsPacket(desktop, pack)
-
 			if pack.Code != 0 {
 				msg := `${i18n|DESKTOP.CREATE_SESSION_FAILED}`
 				if len(pack.Msg) > 0 {
@@ -431,6 +428,8 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 					}(desktop.uuid, desktop.device, common.GetControllerID())
 				}
 			}
+		case `DESKTOP_METRICS`:
+			handleDesktopMetricsPacket(desktop, pack)
 		case `DESKTOP_QUIT`:
 			msg := `${i18n|DESKTOP.SESSION_CLOSED}`
 			if len(pack.Msg) > 0 {

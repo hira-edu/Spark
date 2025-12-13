@@ -34,6 +34,21 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const INPUT_BATCH_LIMIT = 32;
   const CLIPBOARD_CHAR_LIMIT = 64 * 1024; // Bound clipboard payload to ~64KB
   const FILE_DROP_LIMIT = 5;
+  // Cap concurrent bitmap decodes to avoid overwhelming the browser when many
+  // tiles arrive at once (e.g., 3440x1440 full-frame updates).
+  const MAX_BITMAP_DECODE_IN_FLIGHT = (() => {
+    // Allow runtime override for troubleshooting high-res performance.
+    const override = typeof window !== 'undefined' ? window.__rocketDesktopDebug?.maxDecodeInflight : null;
+    if (Number.isFinite(override) && override > 0) {
+      return Math.max(1, Math.min(64, Math.trunc(override)));
+    }
+
+    const cores = typeof navigator !== 'undefined' ? Math.trunc(navigator.hardwareConcurrency || 0) : 0;
+    if (cores >= 12) return 32;
+    if (cores >= 8) return 24;
+    if (cores >= 4) return 16;
+    return 8;
+  })();
 
 	  const {
 	    shareToken = null,
@@ -94,6 +109,11 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Key: "x,y,width,height" string, Value: highest frame sequence rendered/queued for that region
   // This is the industrial-standard fix for async image decode race conditions
   const blockVersionRef = useRef(new Map());
+  // Async bitmap decode queue: keep only the newest tile per region and decode
+  // with bounded concurrency to prevent runaway "stale" backlogs.
+  const pendingBitmapBlocksRef = useRef(new Map()); // posKey -> task
+  const bitmapDecodeInFlightRef = useRef(0);
+  const bitmapPumpRafRef = useRef(0);
   // CRITICAL: Track if we've received resolution to avoid rendering frames on 0x0 canvas
   // Frames arriving before resolution are discarded, then a full frame is requested
   const hasResolutionRef = useRef(false);
@@ -161,6 +181,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     pingTimersRef.current = { server: 0, device: 0 };
     // Clear block version tracking on cleanup to ensure fresh state on reconnect
     blockVersionRef.current.clear();
+    pendingBitmapBlocksRef.current.clear();
+    bitmapDecodeInFlightRef.current = 0;
+    if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function' && bitmapPumpRafRef.current) {
+      window.cancelAnimationFrame(bitmapPumpRafRef.current);
+    }
+    bitmapPumpRafRef.current = 0;
     blockStatsRef.current = { rendered: 0, failed: 0, skipped: 0, stale: 0 };
     // Reset resolution tracking - critical for proper frame buffering on reconnect
     hasResolutionRef.current = false;
@@ -307,6 +333,89 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     }
   }, [canvasRef]);
 
+  // Pump queued bitmap decodes with a bounded concurrency window. This reduces
+  // scanline-like progressive updates under high-resolution/high-motion streams
+  // and avoids decoding tiles that will be superseded before paint.
+  const pumpBitmapDecodeQueue = useCallback(() => {
+    if (!mountedRef.current) return;
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+
+    while (bitmapDecodeInFlightRef.current < MAX_BITMAP_DECODE_IN_FLIGHT) {
+      const next = pendingBitmapBlocksRef.current.entries().next();
+      if (next.done) break;
+      const [posKey, task] = next.value;
+      pendingBitmapBlocksRef.current.delete(posKey);
+
+      const capturedSeq = task?.frameSeq || 0;
+      const latestVersion = blockVersionRef.current.get(posKey) || 0;
+      if (capturedSeq < latestVersion) {
+        blockStatsRef.current.stale++;
+        continue;
+      }
+
+      const { data, it, dx, dy, bw, bh } = task || {};
+      if (!data || data.byteLength === 0 || !bw || !bh) {
+        blockStatsRef.current.skipped++;
+        continue;
+      }
+
+      const ctxAtStart = ctx;
+      bitmapDecodeInFlightRef.current += 1;
+
+      createImageBitmap(new Blob([data]), {
+        premultiplyAlpha: 'none',
+        colorSpaceConversion: 'none'
+      }).then((ib) => {
+        bitmapDecodeInFlightRef.current -= 1;
+
+        if (!mountedRef.current || ctxAtStart !== ctxRef.current) {
+          blockStatsRef.current.skipped++;
+          if (typeof ib.close === 'function') ib.close();
+          pumpBitmapDecodeQueue();
+          return;
+        }
+
+        const latest = blockVersionRef.current.get(posKey) || 0;
+        if (capturedSeq < latest) {
+          blockStatsRef.current.stale++;
+          if (typeof ib.close === 'function') ib.close();
+          pumpBitmapDecodeQueue();
+          return;
+        }
+
+        blockVersionRef.current.set(posKey, capturedSeq);
+        ctxAtStart.drawImage(ib, 0, 0, ib.width || bw, ib.height || bh, dx, dy, bw, bh);
+        blockStatsRef.current.rendered++;
+        if (typeof ib.close === 'function') ib.close();
+
+        pumpBitmapDecodeQueue();
+      }).catch((err) => {
+        bitmapDecodeInFlightRef.current -= 1;
+        blockStatsRef.current.failed++;
+        if (mountedRef.current) {
+          log('warn', 'createImageBitmap failed', { error: err?.message, it, bw, bh, dx, dy, frameSeq: capturedSeq });
+        }
+        pumpBitmapDecodeQueue();
+      });
+    }
+  }, [log, MAX_BITMAP_DECODE_IN_FLIGHT]);
+
+  const scheduleBitmapDecodePump = useCallback(() => {
+    if (!mountedRef.current) return;
+    if (bitmapPumpRafRef.current) return;
+
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      pumpBitmapDecodeQueue();
+      return;
+    }
+
+    bitmapPumpRafRef.current = window.requestAnimationFrame(() => {
+      bitmapPumpRafRef.current = 0;
+      pumpBitmapDecodeQueue();
+    });
+  }, [pumpBitmapDecodeQueue]);
+
   // Render a single image block (raw RGBA or compressed) with version tracking
   //
   // INDUSTRIAL BEST PRACTICE: Versioned Block Rendering
@@ -347,55 +456,23 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       return;
     }
 
-    // Compressed (JPEG/WebP/AVIF/VPx/H.264/PNG) - async rendering with version check
-    // PNG (type 7) is lossless, best for text/terminals/diagrams
-    // Capture the frame sequence at decode start time
-    const capturedSeq = currentSeq;
-
-    createImageBitmap(new Blob([data]), {
-      premultiplyAlpha: 'none',
-      colorSpaceConversion: 'none'
-    }).then((ib) => {
-      // Guard 1: Check component mount state and context validity
-      if (!mountedRef.current || ctx !== ctxRef.current) {
-        blockStatsRef.current.skipped++;
-        if (typeof ib.close === 'function') {
-          ib.close();
-        }
-        return;
-      }
-
-      // Guard 2: VERSION CHECK - Skip if a newer block has already rendered here
-      // This is the critical fix for the async race condition
-      const latestVersion = blockVersionRef.current.get(posKey) || 0;
-      if (capturedSeq < latestVersion) {
-        // This block is stale - a newer frame's block already rendered at this position
-        blockStatsRef.current.stale++;
-        if (typeof ib.close === 'function') {
-          ib.close();
-        }
-        return;
-      }
-
-      // Update version and render
-      blockVersionRef.current.set(posKey, capturedSeq);
-      // Always scale to the declared block size; some agents may encode blocks at
-      // a different intrinsic size (e.g., adaptive downscale) while keeping the
-      // destination rect in the header.
-      ctx.drawImage(ib, 0, 0, ib.width || bw, ib.height || bh, dx, dy, bw, bh);
-      blockStatsRef.current.rendered++;
-
-      if (typeof ib.close === 'function') {
-        ib.close();
-      }
-    }).catch((err) => {
-      blockStatsRef.current.failed++;
-      // Only log if component is still mounted (avoid noise during cleanup)
-      if (mountedRef.current) {
-        log('warn', 'createImageBitmap failed', { error: err?.message, it, bw, bh, dx, dy, frameSeq: capturedSeq });
-      }
+    // Compressed (JPEG/PNG/WebP/AVIF) - queue decode and keep only the latest tile per region.
+    const existing = pendingBitmapBlocksRef.current.get(posKey);
+    if (existing && (existing.frameSeq || 0) < currentSeq) {
+      // Superseded while still queued (avoid wasting a decode).
+      blockStatsRef.current.stale++;
+    }
+    pendingBitmapBlocksRef.current.set(posKey, {
+      data,
+      it,
+      dx,
+      dy,
+      bw,
+      bh,
+      frameSeq: currentSeq,
     });
-  }, [log]);
+    scheduleBitmapDecodePump();
+  }, [log, scheduleBitmapDecodePump]);
 
   const renderBlocks = useCallback((buffer, payloadOffset, frameSeq) => {
     const canvas = canvasRef.current;

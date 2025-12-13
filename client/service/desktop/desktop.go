@@ -86,6 +86,7 @@ const (
 const (
 	fpsDefault             = 30               // Default frames per second (increased from 24 for smoother experience)
 	blockSize              = 64               // Pixel block size for delta encoding (64x64 matches noVNC/industry standard)
+	keyframeBlockSize      = 128              // Larger blocks for full-frame sync (reduces decode overhead and "scanline" painting)
 	frameBuffer            = 3                // Max queued frames before dropping
 	imageQuality           = 50               // JPEG quality (0-100) - balanced quality and performance
 	sessionMetricsInterval = 15 * time.Second // Interval for per-session telemetry snapshots
@@ -1944,8 +1945,12 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 	rect := img.Rect
 	imgWidth := rect.Dx()
 	imgHeight := rect.Dy()
-	blocksX := (imgWidth + blockSize - 1) / blockSize
-	blocksY := (imgHeight + blockSize - 1) / blockSize
+	tileSize := keyframeBlockSize
+	if tileSize <= 0 {
+		tileSize = blockSize
+	}
+	blocksX := (imgWidth + tileSize - 1) / tileSize
+	blocksY := (imgHeight + tileSize - 1) / tileSize
 	result := make([]*[]byte, 0, blocksX*blocksY)
 
 	// Store origin offset for coordinate normalization
@@ -1964,31 +1969,44 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 		})
 	}
 
-	for y := rect.Min.Y; y < rect.Max.Y; y += blockSize {
-		// Calculate block height, clamping to image boundary
-		blockH := blockSize
-		if y+blockSize > rect.Max.Y {
-			blockH = rect.Max.Y - y
-		}
-		for x := rect.Min.X; x < rect.Max.X; x += blockSize {
-			// Calculate block width, clamping to image boundary
-			blockW := blockSize
-			if x+blockSize > rect.Max.X {
-				blockW = rect.Max.X - x
+	// Keyframe ordering: checkerboard pass to avoid perceptual "top-to-bottom scanline" filling.
+	// This improves startup smoothness on large resolutions when decoding/drawing is slower than the network.
+	for pass := 0; pass < 2; pass++ {
+		blockY := 0
+		for y := rect.Min.Y; y < rect.Max.Y; y += tileSize {
+			// Calculate block height, clamping to image boundary
+			blockH := tileSize
+			if y+tileSize > rect.Max.Y {
+				blockH = rect.Max.Y - y
 			}
+			blockX := 0
+			for x := rect.Min.X; x < rect.Max.X; x += tileSize {
+				// Calculate block width, clamping to image boundary
+				blockW := tileSize
+				if x+tileSize > rect.Max.X {
+					blockW = rect.Max.X - x
+				}
 
-			// Source rectangle in image coordinates (for pixel extraction)
-			srcRect := image.Rect(x, y, x+blockW, y+blockH)
+				if (blockX+blockY)%2 != pass {
+					blockX++
+					continue
+				}
 
-			// Destination rectangle normalized to (0,0) origin (for browser canvas)
-			// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
-			normalizedX := x - originX
-			normalizedY := y - originY
-			dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
+				// Source rectangle in image coordinates (for pixel extraction)
+				srcRect := image.Rect(x, y, x+blockW, y+blockH)
 
-			block, blockCodecType := getImageBlock(img, srcRect)
-			block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
-			result = append(result, &block)
+				// Destination rectangle normalized to (0,0) origin (for browser canvas)
+				// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
+				normalizedX := x - originX
+				normalizedY := y - originY
+				dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
+
+				block, blockCodecType := getImageBlock(img, srcRect)
+				block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
+				result = append(result, &block)
+				blockX++
+			}
+			blockY++
 		}
 	}
 	return result
