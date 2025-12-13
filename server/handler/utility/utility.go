@@ -9,6 +9,7 @@ import (
 	"Rocket/server/storage"
 	"Rocket/utils"
 	"Rocket/utils/melody"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -379,14 +380,27 @@ func CheckUpdate(ctx *gin.Context) {
 	ctx.Header(`Accept-Ranges`, `none`)
 	ctx.Header(`Content-Transfer-Encoding`, `binary`)
 	ctx.Header(`Content-Type`, `application/octet-stream`)
+	ctx.Header(`Vary`, `Accept-Encoding`)
 	trailer := clientcfg.BuildTrailerFooter(body)
-	if stat, err := tpl.Stat(); err == nil {
+
+	var out io.Writer = ctx.Writer
+	acceptEncoding := strings.ToLower(ctx.GetHeader(`Accept-Encoding`))
+	userAgent := ctx.GetHeader(`User-Agent`)
+	// Some reverse proxies strip Accept-Encoding from upstream requests; fall back
+	// to detecting Rocket clients by User-Agent.
+	if strings.Contains(acceptEncoding, `gzip`) || strings.HasPrefix(userAgent, `SPARK COMMIT:`) {
+		ctx.Header(`Content-Encoding`, `gzip`)
+		gz := gzip.NewWriter(ctx.Writer)
+		defer gz.Close()
+		out = gz
+	} else if stat, err := tpl.Stat(); err == nil {
 		total := stat.Size() + int64(len(body)) + int64(clientcfg.TrailerFooterSize)
 		ctx.Header(`Content-Length`, strconv.FormatInt(total, 10))
 	}
-	io.Copy(ctx.Writer, tpl)
-	ctx.Writer.Write(body)
-	ctx.Writer.Write(trailer)
+
+	io.Copy(out, tpl)
+	out.Write(body)
+	out.Write(trailer)
 }
 
 // ExecDeviceCmd execute command on device.

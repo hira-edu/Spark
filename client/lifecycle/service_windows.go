@@ -51,6 +51,8 @@ var (
 	errNoInteractiveSession = errors.New("no interactive user sessions available")
 )
 
+const bridgeEnsureRestartCooldown = 5 * time.Second
+
 // getServiceInstallPath returns the service install path in a thread-safe manner
 func getServiceInstallPath() string {
 	serviceInstallPathMu.RLock()
@@ -149,6 +151,7 @@ func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, c
 
 	// Enable Session 0 mode for desktop relay
 	desktop.SetSession0Mode(true)
+	desktop.SetBridgeEnsureFunc(ensureDesktopBridge)
 
 	// Start core application in Session 0 (WebSocket connection)
 	go func() {
@@ -217,6 +220,41 @@ func (rs *resilientService) Execute(args []string, r <-chan svc.ChangeRequest, c
 	cancel()
 	terminateAllSessions()
 	return false, 0
+}
+
+func ensureDesktopBridge(sessionID uint32, reason string) {
+	telemetry.LogSessionEvent("desktop bridge ensure requested", sessionID, map[string]interface{}{
+		"reason": reason,
+	})
+
+	// sessionID==0: ask the session manager to rescan and reconcile.
+	if sessionID == 0 {
+		go reconcileAllSessions()
+		return
+	}
+
+	// Always keep a desired active UI bridge for this session when explicitly requested.
+	setSessionDesiredState(sessionID, "active")
+	desktop.SetActiveSessionID(sessionID)
+
+	// If the UI process is marked running but the relay can't connect to the pipe,
+	// restart it (with a small cooldown to avoid thrashing during normal startup).
+	var shouldRestart bool
+	var lastLaunch time.Time
+	sessionStateMu.RLock()
+	if state, ok := sessionStates[sessionID]; ok && state != nil {
+		lastLaunch = state.lastLaunchTime
+		shouldRestart = state.actual == "running" && state.process != nil && isProcessRunning(state.process)
+	}
+	sessionStateMu.RUnlock()
+
+	if shouldRestart && strings.Contains(reason, "relay") && time.Since(lastLaunch) > bridgeEnsureRestartCooldown {
+		terminateUIInSession(sessionID)
+	}
+
+	// Allow retrying launches after transient failures.
+	resetSessionLaunchAttempts(sessionID)
+	go reconcileSession(sessionID)
 }
 
 // handleSessionChangeEvent processes Windows session change notifications

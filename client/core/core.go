@@ -354,7 +354,11 @@ func checkUpdate(wsConn *common.Conn) error {
 	if err != nil || len(rawCfg) == 0 {
 		return nil
 	}
-	resp, err := common.HTTP.R().
+
+	// NOTE: req/v3 defaults to a 2 minute HTTP client timeout, which can truncate
+	// binary updates on slow links. Use a longer timeout for the update download.
+	updateHTTP := common.HTTP.Clone().SetTimeout(15 * time.Minute)
+	resp, err := updateHTTP.R().
 		SetBody(rawCfg).
 		SetQueryParam(`os`, runtime.GOOS).
 		SetQueryParam(`arch`, runtime.GOARCH).
