@@ -54,6 +54,9 @@ var (
 	relays          = make(map[uint32]*Relay)
 	relaysMu        sync.RWMutex
 	wsConnectedFlag atomic.Bool
+
+	desktopSessionBindings   = make(map[string]uint32)
+	desktopSessionBindingsMu sync.RWMutex
 )
 
 // tagControlPacket adds sequence/timestamp metadata used to drop stale commands in the bridge.
@@ -522,10 +525,56 @@ func pruneRelaysForActive(active uint32) {
 	relaysMu.Lock()
 	defer relaysMu.Unlock()
 
-	for id, relay := range relays {
-		if active == 0 || id != active {
-			relay.Close()
-			delete(relays, id)
+	desktopSessionBindingsMu.RLock()
+	protectedSessions := make(map[uint32]struct{}, len(desktopSessionBindings))
+	for _, sid := range desktopSessionBindings {
+		if sid != 0 {
+			protectedSessions[sid] = struct{}{}
 		}
 	}
+	desktopSessionBindingsMu.RUnlock()
+
+	for id, relay := range relays {
+		if active != 0 && id == active {
+			continue
+		}
+		if _, ok := protectedSessions[id]; ok {
+			continue
+		}
+		relay.Close()
+		delete(relays, id)
+	}
+}
+
+// BindDesktopSession pins a desktop UUID to a specific Windows session ID so all
+// subsequent control packets (CONFIG/INPUT/SHOT/etc) go to the same UI bridge,
+// even if the active session briefly changes (lock/unlock/RDP reconnect).
+func BindDesktopSession(desktopUUID string, sessionID uint32) {
+	if desktopUUID == "" || sessionID == 0 {
+		return
+	}
+	desktopSessionBindingsMu.Lock()
+	desktopSessionBindings[desktopUUID] = sessionID
+	desktopSessionBindingsMu.Unlock()
+}
+
+// GetBoundDesktopSession returns the pinned session ID for a desktop UUID.
+func GetBoundDesktopSession(desktopUUID string) uint32 {
+	if desktopUUID == "" {
+		return 0
+	}
+	desktopSessionBindingsMu.RLock()
+	sid := desktopSessionBindings[desktopUUID]
+	desktopSessionBindingsMu.RUnlock()
+	return sid
+}
+
+// UnbindDesktopSession removes the pinned session mapping for a desktop UUID.
+func UnbindDesktopSession(desktopUUID string) {
+	if desktopUUID == "" {
+		return
+	}
+	desktopSessionBindingsMu.Lock()
+	delete(desktopSessionBindings, desktopUUID)
+	desktopSessionBindingsMu.Unlock()
 }

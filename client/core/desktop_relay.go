@@ -27,6 +27,16 @@ func waitForActiveSessionID() uint32 {
 	return desktop.WaitForActiveSession(desktopRelayWaitForSessionTimeout)
 }
 
+func desktopUUIDFromPack(pack modules.Packet) string {
+	if pack.Data == nil {
+		return ""
+	}
+	if v, ok := pack.Data["desktop"].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func connectRelayWithRetry(sessionID uint32, timeout time.Duration) (*desktop.Relay, uint32, error) {
 	if sessionID == 0 {
 		sessionID = waitForActiveSessionID()
@@ -70,6 +80,7 @@ func connectRelayWithRetry(sessionID uint32, timeout time.Duration) (*desktop.Re
 func initDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	// If running in Session 0 (service mode), relay to user session
 	if desktop.IsSession0Mode() {
+		desktopUUID := desktopUUIDFromPack(pack)
 		sessionID := waitForActiveSessionID()
 		if sessionID == 0 {
 			wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: `${i18n|DESKTOP.NO_USER_SESSION}`}, pack)
@@ -90,6 +101,11 @@ func initDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 			}
 			wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INIT`, Code: 1, Msg: msg}, pack)
 			return
+		}
+		// Pin this desktop UUID to the session that actually accepted the init so subsequent
+		// CONFIG/INPUT/SHOT/KILL packets are routed consistently even if active session changes.
+		if desktopUUID != "" && actualSessionID != 0 {
+			desktop.BindDesktopSession(desktopUUID, actualSessionID)
 		}
 		// DO NOT send success response here - wait for Session 1's actual response via IPC
 		// The response will come through relay.handlePacket → sendDesktopPacket → WebSocket
@@ -112,6 +128,9 @@ func initDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 func pingDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
 		sessionID := desktop.GetActiveSessionID()
+		if bound := desktop.GetBoundDesktopSession(desktopUUIDFromPack(pack)); bound != 0 {
+			sessionID = bound
+		}
 		if sessionID == 0 {
 			sessionID = waitForActiveSessionID()
 			if sessionID == 0 {
@@ -133,8 +152,15 @@ func pingDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 // killDesktopWithRelay handles DESKTOP_KILL with Session 0 relay support
 func killDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
+		desktopUUID := desktopUUIDFromPack(pack)
 		sessionID := desktop.GetActiveSessionID()
+		if bound := desktop.GetBoundDesktopSession(desktopUUID); bound != 0 {
+			sessionID = bound
+		}
 		if sessionID == 0 {
+			if desktopUUID != "" {
+				desktop.UnbindDesktopSession(desktopUUID)
+			}
 			return
 		}
 		relay := desktop.GetOrCreateRelay(sessionID)
@@ -143,6 +169,9 @@ func killDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 			if relay2, _, connErr := connectRelayWithRetry(sessionID, desktopRelayControlConnectTimeout); connErr == nil {
 				_ = relay2.SendKill(pack)
 			}
+		}
+		if desktopUUID != "" {
+			desktop.UnbindDesktopSession(desktopUUID)
 		}
 		return
 	}
@@ -153,6 +182,9 @@ func killDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 func getDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
 		sessionID := desktop.GetActiveSessionID()
+		if bound := desktop.GetBoundDesktopSession(desktopUUIDFromPack(pack)); bound != 0 {
+			sessionID = bound
+		}
 		if sessionID == 0 {
 			return
 		}
@@ -171,7 +203,11 @@ func getDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 // inputDesktopWithRelay handles DESKTOP_INPUT with Session 0 relay support
 func inputDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
+		desktopUUID := desktopUUIDFromPack(pack)
 		sessionID := desktop.GetActiveSessionID()
+		if bound := desktop.GetBoundDesktopSession(desktopUUID); bound != 0 {
+			sessionID = bound
+		}
 		if sessionID == 0 {
 			wsConn.SendCallback(modules.Packet{Act: `DESKTOP_INPUT`, Code: 1, Msg: `${i18n|DESKTOP.NO_USER_SESSION}`}, pack)
 			return
@@ -204,7 +240,11 @@ func inputDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 // configDesktopWithRelay handles DESKTOP_CONFIG with Session 0 relay support
 func configDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
+		desktopUUID := desktopUUIDFromPack(pack)
 		sessionID := desktop.GetActiveSessionID()
+		if bound := desktop.GetBoundDesktopSession(desktopUUID); bound != 0 {
+			sessionID = bound
+		}
 		if sessionID == 0 {
 			wsConn.SendCallback(modules.Packet{Act: `DESKTOP_CONFIG`, Code: 1, Msg: `${i18n|DESKTOP.NO_USER_SESSION}`}, pack)
 			return
