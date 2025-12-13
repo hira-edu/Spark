@@ -99,6 +99,12 @@ function post(url, data, ext) {
 // Resolve a translation key from the static English bundle to avoid runtime lookups
 function resolveEnKey(path) {
 	if (typeof path !== 'string') return path;
+	// Locale dictionaries are stored as flat "DOT.PATH" keys (not nested objects).
+	// Fast-path those lookups first, then fall back to legacy nested traversal.
+	if (Object.prototype.hasOwnProperty.call(en, path)) {
+		const val = en[path];
+		return typeof val === 'string' ? val : path;
+	}
 	const parts = path.split('.');
 	let cur = en;
 	for (let i = 0; i < parts.length; i += 1) {
