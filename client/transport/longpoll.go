@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,17 +20,17 @@ import (
 // LongPollingTransport implements HTTP long polling transport
 // Falls back when WebSocket is blocked
 type LongPollingTransport struct {
-	client      *http.Client
-	baseURL     string
-	uuid        string
-	key         string
-	secret      []byte
-	ctx         context.Context
-	cancel      context.CancelFunc
-	sendQueue   chan []byte // Already encrypted data from adapter
-	recvQueue   chan []byte // Encrypted data to adapter
-	mu          sync.Mutex
-	connected   bool
+	client    *http.Client
+	baseURL   string
+	uuid      string
+	key       string
+	secret    []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	sendQueue chan []byte // Already encrypted data from adapter
+	recvQueue chan []byte // Encrypted data to adapter
+	mu        sync.Mutex
+	connected bool
 }
 
 // NewLongPollingTransport creates a new long polling transport
@@ -61,12 +62,16 @@ func (t *LongPollingTransport) Connect(ctx context.Context, cfg *Config) (*commo
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Parse base URL - strip any path from ServerURL (e.g., /ws) since long polling uses /api/longpoll
+	// Parse base URL. Preserve any base-path prefix (reverse proxies commonly mount Rocket under /foo).
 	parsedURL, err := url.Parse(cfg.ServerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid server URL: %w", err)
 	}
-	baseURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+	basePath := strings.TrimSuffix(parsedURL.Path, "/")
+	if basePath == "/" {
+		basePath = ""
+	}
+	baseURL := fmt.Sprintf("%s://%s%s", parsedURL.Scheme, parsedURL.Host, basePath)
 	pollPath := cfg.LongPollPath
 	if pollPath == "" {
 		pollPath = "/api/longpoll"
@@ -84,10 +89,10 @@ func (t *LongPollingTransport) Connect(ctx context.Context, cfg *Config) (*commo
 				InsecureSkipVerify: cfg.InsecureSkipVerify,
 				MinVersion:         tls.VersionTLS12,
 			},
-			MaxIdleConns:        10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
-			DisableKeepAlives:   false,
+			MaxIdleConns:       10,
+			IdleConnTimeout:    90 * time.Second,
+			DisableCompression: false,
+			DisableKeepAlives:  false,
 		},
 	}
 

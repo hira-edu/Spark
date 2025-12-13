@@ -35,14 +35,16 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const CLIPBOARD_CHAR_LIMIT = 64 * 1024; // Bound clipboard payload to ~64KB
   const FILE_DROP_LIMIT = 5;
 
-  const {
-    shareToken = null,
-    shareSecret = null,
-    onStatusChange,
-    allowControl = true,
-    controlChannel = null,
-    keyframeIntervalMs = 30000,
-  } = options;
+	  const {
+	    shareToken = null,
+	    shareSecret = null,
+	    onStatusChange,
+	    allowControl = true,
+	    controlChannel = null,
+	    keyframeIntervalMs = 30000,
+	    onJSONMessage = null,
+	    suppressFrames = false,
+	  } = options;
   const deviceId = device?.id || null;
 
   const [status, setStatus] = useState('disconnected');
@@ -58,6 +60,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
   const log = useCallback((level, msg, extra = {}) => {
     const payload = { ...extra, device: deviceId || 'unknown' };
+    if (level === 'debug') {
+      const debugEnabled = typeof window !== 'undefined' && window.__rocketDesktopDebug?.enabled === true;
+      if (!debugEnabled) return;
+      console.debug('[desktop]', msg, payload);
+      return;
+    }
     if (level === 'error') {
       console.error('[desktop]', msg, payload);
     } else if (level === 'warn') {
@@ -93,6 +101,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Ref to hold sendControl function for use in deferred callbacks
   const sendControlRef = useRef(null);
   const lastShotRequestAtRef = useRef(0);
+  const shotFallbackTimerRef = useRef(null);
   // Track approximate keyframe coverage after a DESKTOP_SHOT request.
   // Some agents (or lossy transport) can deliver incomplete tiles; this enables
   // bounded retries to recover a full screen.
@@ -106,6 +115,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const tickerRef = useRef(null);
   const pingTimersRef = useRef({ server: 0, device: 0 }); // Track server vs device RTT
   const controlChannelRef = useRef(controlChannel);
+  const onJSONMessageRef = useRef(onJSONMessage);
+  const suppressFramesRef = useRef(!!suppressFrames);
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttemptRef = useRef(0);
   const shouldReconnectRef = useRef(true);
@@ -125,6 +136,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     if (clearReconnect && reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
+    }
+    if (shotFallbackTimerRef.current) {
+      clearTimeout(shotFallbackTimerRef.current);
+      shotFallbackTimerRef.current = null;
     }
     const ws = wsRef.current;
     if (ws) {
@@ -173,6 +188,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     controlChannelRef.current = controlChannel;
   }, [controlChannel]);
 
+  useEffect(() => {
+    onJSONMessageRef.current = onJSONMessage;
+  }, [onJSONMessage]);
+
+  useEffect(() => {
+    suppressFramesRef.current = !!suppressFrames;
+  }, [suppressFrames]);
+
   // Update external status callback
   useEffect(() => {
     if (onStatusChange) {
@@ -195,6 +218,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   }, []);
 
   const requestFullFrame = useCallback((reason = '') => {
+    if (suppressFramesRef.current) return;
     if (!sendControlRef.current) return;
     const now = Date.now();
     const prev = keyframeCoverageRef.current || { requestedAt: 0, attempt: 0 };
@@ -203,6 +227,26 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     incrementShotCounter(reason);
     sendControlRef.current({ act: 'DESKTOP_SHOT' });
   }, [incrementShotCounter]);
+
+  // Request a full frame only if the stream appears stalled (no frames arrive within a short window).
+  // This avoids redundant DESKTOP_SHOT bursts during startup (device already sends an initial keyframe after DESKTOP_INIT).
+  const scheduleShotIfStalled = useCallback((reason = '', timeoutMs = 1200) => {
+    if (suppressFramesRef.current) return;
+    if (shotFallbackTimerRef.current) {
+      clearTimeout(shotFallbackTimerRef.current);
+      shotFallbackTimerRef.current = null;
+    }
+
+    const startFrames = statsRef.current.frames || 0;
+    shotFallbackTimerRef.current = setTimeout(() => {
+      shotFallbackTimerRef.current = null;
+      if (!mountedRef.current) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if ((statsRef.current.frames || 0) !== startFrames) return;
+      requestFullFrame(reason || 'stalled');
+    }, Math.max(0, timeoutMs));
+  }, [requestFullFrame]);
 
   // Viewport resize (including DevTools dock changes) can expose latent "missing tiles"
   // if a full sync frame was dropped earlier. Debounce a fresh shot on resize.
@@ -256,7 +300,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
     ctxRef.current = canvas.getContext('2d', {
       alpha: false,
-      willReadFrequently: true
+      desynchronized: true
     });
     if (ctxRef.current) {
       ctxRef.current.imageSmoothingEnabled = false;
@@ -278,8 +322,9 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // This is the same pattern used by VNC/noVNC and other professional remote
   // desktop implementations to handle async tile/block updates.
   //
-  const updateImage = useCallback((ab, it, dx, dy, bw, bh, ctx, frameSeq) => {
+  const updateImage = useCallback((data, it, dx, dy, bw, bh, ctx, frameSeq) => {
     if (!ctx || bw === 0 || bh === 0) return;
+    if (!data || data.byteLength === 0) return;
 
     // Create position key for version tracking (include block dimensions for safety)
     const posKey = `${dx},${dy},${bw},${bh}`;
@@ -289,14 +334,15 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
     if (it === 0) { // Raw RGBA - synchronous rendering, always safe
       try {
+        const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
         ctx.putImageData(
-          new ImageData(new Uint8ClampedArray(ab), bw, bh),
+          new ImageData(clamped, bw, bh),
           dx, dy, 0, 0, bw, bh
         );
         blockStatsRef.current.rendered++;
       } catch (err) {
         blockStatsRef.current.failed++;
-        log('error', 'ImageData put failed', { error: err?.message, len: ab?.byteLength, bw, bh, dx, dy });
+        log('error', 'ImageData put failed', { error: err?.message, len: data?.byteLength, bw, bh, dx, dy });
       }
       return;
     }
@@ -306,7 +352,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     // Capture the frame sequence at decode start time
     const capturedSeq = currentSeq;
 
-    createImageBitmap(new Blob([ab]), {
+    createImageBitmap(new Blob([data]), {
       premultiplyAlpha: 'none',
       colorSpaceConversion: 'none'
     }).then((ib) => {
@@ -364,6 +410,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     }
 
     const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
     let offset = payloadOffset;
     let blockCount = 0;
     let parseErrors = 0;
@@ -415,7 +462,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       }
 
       // Pass chunk frame sequence for versioned block tracking
-      updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, ctx, frameSeq);
+      updateImage(bytes.subarray(dataStart, dataEnd), it, dx, dy, bw, bh, ctx, frameSeq);
       offset = dataEnd;
       blockCount++;
     }
@@ -498,38 +545,45 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     // CRITICAL: Mark that we now have resolution
     hasResolutionRef.current = true;
 
-    const shouldRequestFullFrame = (isFirstResolution || wasResized) && sendControlRef.current;
-    if (shouldRequestFullFrame) {
-      log('info', 'requesting full frame after resolution update', { width, height, isFirstResolution, wasResized });
-      requestFullFrame('resolution_update');
+    if (isFirstResolution || wasResized) {
+      scheduleShotIfStalled('resolution_update', 800);
     }
 
     setResolution({ width, height });
     flushPendingFrames();
-  }, [canvasRef, log, flushPendingFrames, requestFullFrame]);
+  }, [canvasRef, log, flushPendingFrames, scheduleShotIfStalled]);
 
   // Handle incoming JSON messages
-  const handleJSON = useCallback(async (ab) => {
+  const handleJSON = useCallback(async (payload) => {
+    const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
     let data;
     try {
       // No decryption - parse JSON directly
-      const text = ua2str(new Uint8Array(ab));
+      const text = ua2str(bytes);
       data = JSON.parse(text);
     } catch (err) {
       log('error', 'JSON parse failed', {
         error: err?.message,
-        byteLength: ab?.byteLength,
-        preview: ab?.byteLength > 0 ? ua2str(new Uint8Array(ab.slice(0, Math.min(100, ab.byteLength)))) : ''
+        byteLength: bytes?.byteLength,
+        preview: bytes?.byteLength > 0 ? ua2str(bytes.subarray(0, Math.min(100, bytes.byteLength))) : ''
       });
       return;
     }
 
-    log('info', 'json message', {
+    log('debug', 'json message', {
       act: data?.act,
       code: data?.code,
       msg: data?.msg,
       hasData: !!data?.data,
     });
+
+    if (onJSONMessageRef.current) {
+      try {
+        onJSONMessageRef.current(data);
+      } catch (err) {
+        log('warn', 'onJSONMessage handler failed', { error: err?.message });
+      }
+    }
 
     // Handle pong for latency measurement
     if (data?.act === 'DESKTOP_PONG') {
@@ -579,13 +633,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         hasResolutionRef.current = true;
         setResolution({ width, height });
 
-        // CRITICAL FIX: Request full frame after first resolution is received
-        // This ensures we get a complete frame on properly-sized canvas
-        // Without this, the first frame may have arrived on 0x0 canvas and been lost
-        const shouldRequestFullFrame = (isFirstResolution || wasResized) && sendControlRef.current;
-        if (shouldRequestFullFrame) {
-          log('info', 'requesting full frame after DESKTOP_INIT', { width, height, isFirstResolution });
-          requestFullFrame('desktop_init');
+        if (isFirstResolution || wasResized) {
+          scheduleShotIfStalled('desktop_init', 800);
         }
         flushPendingFrames();
       }
@@ -634,7 +683,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
       return;
     }
-  }, [cleanup, flushPendingFrames, requestFullFrame]);
+  }, [cleanup, flushPendingFrames, scheduleShotIfStalled]);
 
   const MAX_EVENT_MAP_SIZE = 64; // Limit event->frame map size to prevent memory leak
 
@@ -678,7 +727,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     // Handle JSON packets (no event id prefix)
     if (op === 3) {
       statsRef.current.bytes += bytes.byteLength;
-      handleJSON(bytes.slice(JSON_BODY_OFFSET));
+      handleJSON(bytes.subarray(JSON_BODY_OFFSET));
       return;
     }
 
@@ -716,6 +765,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       const width = view.getUint16(payloadOffset + 2, false);
       const height = view.getUint16(payloadOffset + 4, false);
       log('info', 'resolution update', { width, height });
+      return;
+    }
+
+    if (suppressFramesRef.current && (op === 0 || op === 1)) {
+      statsRef.current.bytes += bytes.byteLength;
+      if (op === 0) {
+        statsRef.current.frames += 1;
+      }
       return;
     }
 
@@ -863,13 +920,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
     if (!hasResolutionRef.current) {
       // Buffer frame chunks until the canvas is properly sized
-      const frameCopy = bytes.slice();
       if (pendingFramesRef.current.length >= MAX_PENDING_FRAMES) {
         pendingFramesRef.current.shift();
         log('warn', 'pending frame buffer full, dropping oldest', { max: MAX_PENDING_FRAMES });
       }
       pendingFramesRef.current.push({
-        buffer: frameCopy.buffer,
+        buffer,
         payloadOffset,
         frameSeq: chunkFrameSeq,
       });
@@ -941,11 +997,16 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     ws.send(buffer.buffer);
   }, []);
 
+  // Explicit WS-only sender (used for signaling and server-side telemetry).
+  const sendSignal = useCallback(async (payload) => {
+    await sendData(payload);
+  }, [sendData]);
+
   // Control channel: prefer an open DataChannel if provided, fall back to WS
   const sendControl = useCallback(async (payload, channelOverride = null) => {
     const channel = channelOverride || controlChannelRef.current;
     const serialized = JSON.stringify(payload);
-    log('info', 'send control', {
+    log('debug', 'send control', {
       act: payload?.act,
       via: channel ? 'datachannel' : 'websocket',
     });
@@ -1028,8 +1089,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         canvasWidth: canvas.width,
         canvasHeight: canvas.height
       });
-      // Request initial frame
-      requestFullFrame('ws_open');
+      // Device sends an initial keyframe after DESKTOP_INIT; only request a shot if the stream stalls.
+      scheduleShotIfStalled('ws_open', 1200);
     };
 
     ws.onmessage = (e) => {
@@ -1125,7 +1186,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         pingCounter = 0;
         const now = Date.now();
         pingTimersRef.current = { server: now, device: now };
-        sendControl({ act: 'DESKTOP_PING' });
+        sendSignal({ act: 'DESKTOP_PING' });
 
         // Log async block rendering stats every 5 seconds for diagnostics
         const stats = blockStatsRef.current;
@@ -1145,7 +1206,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
 
           // Export browser-side telemetry to server for unified monitoring (DESKTOP_BROWSER_STATS)
           // This allows Prometheus/Grafana to correlate browser rendering issues with server-side metrics
-          sendControl({
+          sendSignal({
             act: 'DESKTOP_BROWSER_STATS',
             data: {
               rendered: stats.rendered,
@@ -1177,7 +1238,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         }
       }
     }, 1000);
-  }, [device, shareToken, shareSecret, canvasRef, initCanvas, parseMessage, sendControl, cleanup, scheduleReconnect, requestFullFrame]);
+  }, [device, shareToken, shareSecret, canvasRef, initCanvas, parseMessage, sendControl, sendSignal, cleanup, scheduleReconnect, requestFullFrame]);
 
   // Public connect function
   const connect = useCallback(() => {
@@ -1269,11 +1330,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     sendConfig,
     sendInput,
     sendClipboard,
-    sendFileDrop,
-    sendAudioControl,
-    sendKill,
-    requestShot,
-  };
+	    sendFileDrop,
+	    sendAudioControl,
+	    sendKill,
+	    requestShot,
+	    sendSignal,
+	  };
 }
 
 export default useDesktopStream;

@@ -817,9 +817,11 @@ func onGuestConnect(session *melody.Session) {
 	// Register event callback for this guest
 	common.AddEvent(guestEventWrapper(guest, desktopUUID), connUUID.(string), desktopUUID)
 
-	// Request desktop init from device
+	// Request desktop init from device (include allowControl so the device can enforce view-only even
+	// when control is carried over direct WebRTC data channels).
 	common.SendPack(modules.Packet{Act: `DESKTOP_INIT`, Data: gin.H{
-		`desktop`: desktopUUID,
+		`desktop`:      desktopUUID,
+		`allowControl`: !viewOnlyBool,
 	}, Event: desktopUUID}, deviceConn)
 
 	common.Info(session, `SHARE_GUEST_WS_CONNECT`, `success`, ``, map[string]any{
@@ -916,11 +918,34 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 
 	case `DESKTOP_CONFIG`:
-		// Forward config (quality, fps, display) to device
+		// Forward a sanitized config payload to the device.
+		// NOTE: share links may be view-only; the server is authoritative for allowControl.
+		payload := gin.H{}
 		if pack.Data != nil {
-			pack.Data[`desktop`] = desktopUUID
-			common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: pack.Data, Event: desktopUUID.(string)}, guest.deviceConn)
+			if fps, ok := pack.Data[`fps`]; ok {
+				payload[`fps`] = fps
+			}
+			if quality, ok := pack.Data[`quality`]; ok {
+				payload[`quality`] = quality
+			}
+			// Accept both "monitor" and "display"; map to "monitor" for the device.
+			if monitor, ok := pack.Data[`monitor`]; ok {
+				payload[`monitor`] = monitor
+			} else if display, ok := pack.Data[`display`]; ok {
+				payload[`monitor`] = display
+			}
+			if codec, ok := pack.Data[`codec`].(string); ok && codec != "" {
+				payload[`codec`] = strings.ToLower(strings.TrimSpace(codec))
+			}
+			if transport, ok := pack.Data[`transport`].(string); ok && transport != "" {
+				payload[`transport`] = strings.ToLower(strings.TrimSpace(transport))
+			}
 		}
+		// The share link (server) is authoritative for control permissions.
+		// Never allow the guest to flip allowControl and then inject input over WebRTC data channels.
+		payload[`allowControl`] = !guest.viewOnly
+		payload[`desktop`] = desktopUUID
+		common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
 		return
 
 	case `DESKTOP_INPUT`:
@@ -1006,15 +1031,40 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 
-	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
-		if guest.viewOnly {
-			common.Warn(session, `[SERVER_SHARE_WEBRTC_BLOCKED]`, ``, `View-only guest attempted WebRTC negotiation`, map[string]any{
-				`share_id`: shareIDStr,
-			})
-			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
-			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
+	case `DESKTOP_WEBRTC_OFFER`:
+		if payload, ok := normalizeSDP(pack.Data); ok {
+			payload[`desktop`] = desktopUUID
+
+			// Provide ICE/TURN config (with ephemeral TURN creds when configured) to the device.
+			// This lets guest WebRTC sessions work reliably without per-agent env config.
+			if servercfg.Config.WebRTC != nil {
+				cfg := servercfg.Config.WebRTC
+				stunServers := cfg.Stun
+				if turnOnlyVal, ok := session.Get(`TurnOnly`); ok {
+					if turnOnly, okBool := turnOnlyVal.(bool); okBool && turnOnly {
+						stunServers = nil
+					}
+				}
+				identifier := "guest"
+				if shareIDStr != "" && len(shareIDStr) >= 8 {
+					identifier = "share:" + shareIDStr[:8]
+				}
+				payload[`ice_servers`] = utility.BuildICEServers(
+					stunServers,
+					cfg.Turn,
+					cfg.TurnSecret,
+					identifier,
+					cfg.TurnCredentialTTL,
+				)
+			}
+
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
 			return
 		}
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+
+	case `DESKTOP_WEBRTC_ANSWER`:
 		if payload, ok := normalizeSDP(pack.Data); ok {
 			payload[`desktop`] = desktopUUID
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
@@ -1024,14 +1074,6 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 
 	case `DESKTOP_WEBRTC_ICE`:
-		if guest.viewOnly {
-			common.Warn(session, `[SERVER_SHARE_WEBRTC_BLOCKED]`, ``, `View-only guest attempted ICE exchange`, map[string]any{
-				`share_id`: shareIDStr,
-			})
-			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
-			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
-			return
-		}
 		if payload, ok := normalizeCandidate(pack.Data); ok {
 			payload[`desktop`] = desktopUUID
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)

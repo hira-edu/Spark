@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
@@ -52,6 +53,7 @@ var defaultTURNServers = []struct {
 
 // ErrVPXUnavailable is returned when the VPX encoder was not built into the binary.
 var ErrVPXUnavailable = errors.New("vpx encoder not built (enable cgo, install libvpx, and build with -tags vpx)")
+var ErrH264Unavailable = errors.New("h264 encoder not available on this platform")
 
 // DesktopWebRTC mirrors the JPEG cadence by emitting samples on a video track and
 // reuses the DESKTOP_INPUT data channel for input forwarding.
@@ -70,27 +72,29 @@ type DesktopWebRTC struct {
 
 type WebRTCConfig struct {
 	Configuration webrtc.Configuration
-	Codec         VPXCodec // VP8 or VP9, defaults to VP8
+	Codec         WebRTCCodec // h264/vp8/vp9 (defaults chosen by caller)
 	OnState       func(webrtc.PeerConnectionState)
 	OnICE         func(*webrtc.ICECandidate)
 	OnInputData   func([]byte)
+	OnKeyFrame    func()
 }
 
-type VPXCodec string
+type WebRTCCodec string
 
 const (
-	VPXCodecVP8 VPXCodec = "vp8"
-	VPXCodecVP9 VPXCodec = "vp9"
+	WebRTCCodecH264 WebRTCCodec = "h264"
+	WebRTCCodecVP8  WebRTCCodec = "vp8"
+	WebRTCCodecVP9  WebRTCCodec = "vp9"
 )
 
-// VPXEncoderConfig carries optional quality settings for VP8/VP9.
-type VPXEncoderConfig struct {
+// WebRTCEncoderConfig carries optional quality settings for the selected codec.
+type WebRTCEncoderConfig struct {
 	BitRate          int // bits per second; defaults to ~900kbps when zero
 	KeyFrameInterval int // keyframe interval in frames; defaults to 60 when zero
 }
 
-// VPXEncoder encodes RGBA frames into WebRTC-ready samples (VP8/VP9).
-type VPXEncoder interface {
+// WebRTCEncoder encodes RGBA frames into WebRTC-ready samples (H.264/VP8/VP9).
+type WebRTCEncoder interface {
 	Encode(img *image.RGBA, duration time.Duration) (media.Sample, error)
 	Close() error
 }
@@ -132,15 +136,24 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 
 	// Use configured codec, default to VP8
 	mimeType := webrtc.MimeTypeVP8
-	if cfg.Codec == VPXCodecVP9 {
-		mimeType = webrtc.MimeTypeVP9
-	}
-
-	// Create video track with optimized RTP codec capability
 	codecCap := webrtc.RTPCodecCapability{
 		MimeType: mimeType,
-		// ClockRate and SDPFmtpLine are auto-configured by Pion for VP8/VP9
 	}
+	switch cfg.Codec {
+	case WebRTCCodecVP9:
+		mimeType = webrtc.MimeTypeVP9
+		codecCap.MimeType = mimeType
+	case WebRTCCodecH264:
+		mimeType = webrtc.MimeTypeH264
+		codecCap = webrtc.RTPCodecCapability{
+			MimeType:     mimeType,
+			ClockRate:    90000,
+			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			RTCPFeedback: nil, // default interceptors add feedback
+		}
+	}
+
+	// Create video track with optimized RTP codec capability.
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		codecCap,
 		"screen",
@@ -150,41 +163,45 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		pc.Close()
 		return nil, err
 	}
-	if _, err = pc.AddTrack(videoTrack); err != nil {
-		pc.Close()
-		return nil, err
-	}
-
-	// Create DataChannel for control and fallback communication (2025 best practices)
-	// DataChannels use SCTP over DTLS for:
-	// - Mouse/keyboard input events (reliable, ordered delivery)
-	// - Control messages (clipboard, file transfer signaling)
-	// - Fallback for video if RTP fails (can send JPEG frames over DC)
-	// - Statistics and telemetry reporting
-	ordered := true
-	inputDC, err := pc.CreateDataChannel("desktop-input", &webrtc.DataChannelInit{
-		Ordered: &ordered, // Guarantee in-order delivery for input events (critical)
-		// MaxRetransmits/MaxPacketLifeTime not set = reliable mode (SCTP will retry)
-		// This ensures no input events are lost, even if network is unstable
-	})
+	sender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		pc.Close()
 		return nil, err
 	}
 
-	// Note: Additional DataChannels can be created for specific purposes:
-	// - "desktop-fallback" (unordered, low-latency) for video fallback
-	// - "desktop-stats" (unreliable) for non-critical telemetry
-	// These would be created on-demand based on network conditions
-
 	w := &DesktopWebRTC{
 		peer:        pc,
 		videoTrack:  videoTrack,
-		inputDC:     inputDC,
 		onState:     cfg.OnState,
 		onICE:       cfg.OnICE,
 		onInputData: cfg.OnInputData,
 	}
+
+	// Drain RTCP packets so Pion can apply feedback, and detect keyframe requests (PLI/FIR).
+	go func() {
+		for {
+			pkts, _, err := sender.ReadRTCP()
+			if err != nil {
+				return
+			}
+			if cfg.OnKeyFrame == nil {
+				continue
+			}
+			needKeyframe := false
+			for _, pkt := range pkts {
+				switch pkt.(type) {
+				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+					needKeyframe = true
+				}
+				if needKeyframe {
+					break
+				}
+			}
+			if needKeyframe {
+				cfg.OnKeyFrame()
+			}
+		}
+	}()
 	// ICE Candidate handler - fires when new candidates are discovered
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -231,23 +248,42 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		// Can be used to show "gathering" status to user
 		// States: new, gathering, complete
 	})
-	inputDC.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if cfg.OnInputData != nil {
-			cfg.OnInputData(msg.Data)
+
+	// DataChannel negotiation: the offerer (browser) creates the DataChannel so the
+	// offer SDP includes an m=application section. As the answerer, we only accept
+	// incoming channels via OnDataChannel.
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc == nil {
+			return
 		}
-	})
-	// Add error/close handlers per WebRTC best practices
-	inputDC.OnError(func(err error) {
-		// Data channel error - connection may be failing
-		if cfg.OnState != nil {
-			cfg.OnState(webrtc.PeerConnectionStateFailed)
+		label := dc.Label()
+		if label != "desktop-input" && label != "desktop-control" {
+			return
 		}
-	})
-	inputDC.OnClose(func() {
-		// Data channel closed - trigger cleanup
-		if cfg.OnState != nil {
-			cfg.OnState(webrtc.PeerConnectionStateClosed)
-		}
+		w.mu.Lock()
+		w.inputDC = dc
+		w.mu.Unlock()
+
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			if cfg.OnInputData != nil {
+				cfg.OnInputData(msg.Data)
+			}
+		})
+		dc.OnError(func(err error) {
+			if cfg.OnState != nil {
+				cfg.OnState(webrtc.PeerConnectionStateFailed)
+			}
+		})
+		dc.OnClose(func() {
+			if cfg.OnState != nil {
+				cfg.OnState(webrtc.PeerConnectionStateClosed)
+			}
+			w.mu.Lock()
+			if w.inputDC == dc {
+				w.inputDC = nil
+			}
+			w.mu.Unlock()
+		})
 	})
 	return w, nil
 }

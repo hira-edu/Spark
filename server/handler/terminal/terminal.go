@@ -373,7 +373,9 @@ func sendPack(pack modules.Packet, session *melody.Session) bool {
 		return false
 	}
 	data = utility.SimpleEncrypt(data, session)
-	err = session.WriteBinary(data)
+	// Match other feature handlers: prepend 6-byte binary header (magic + service + op).
+	// Terminal JSON packets use service=21 and op=BinaryOpTerminalJSON.
+	err = session.WriteBinary(append([]byte{34, 22, 19, 17, 21, utility.BinaryOpTerminalJSON}, data...))
 	return err == nil
 }
 

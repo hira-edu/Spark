@@ -42,11 +42,13 @@ func connectWithFallback(ctx context.Context) (*common.Conn, error) {
 		InsecureSkipVerify: config.Config.InsecureSkipVerify,
 
 		// DNS tunneling config
-		DNSServer: dnsServer,
-		DNSDomain: config.Config.DNSDomain,
+		DNSEnabled: config.Config.EnableDNS,
+		DNSServer:  dnsServer,
+		DNSDomain:  config.Config.DNSDomain,
 
 		// Long polling config
-		LongPollTimeout: 30 * time.Second,
+		LongPollEnabled: config.Config.EnableLongPoll,
+		LongPollTimeout: 35 * time.Second,
 		LongPollPath:    "/api/longpoll",
 
 		// QUIC config

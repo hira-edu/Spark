@@ -21,20 +21,20 @@ import (
 // The encoder is created lazily and reused across frames of the same dimensions.
 // Supports adaptive bitrate based on network conditions.
 type vpxEncoder struct {
-	codec            VPXCodec
+	codec            WebRTCCodec
 	baseBitRate      int // Base bitrate (used when not adaptive)
 	keyFrameInterval int
 	aqm              *AdaptiveQualityManager // Adaptive quality manager (nil = fixed bitrate)
 
 	// Cached encoder state
-	mu               sync.Mutex
-	cachedEnc        codec.ReadCloser
-	cachedWidth      int
-	cachedHeight     int
-	cachedBitRate    int // Bitrate used for cached encoder
-	frameQueue       chan *image.RGBA
-	resultQueue      chan encodeResult
-	closed           bool
+	mu            sync.Mutex
+	cachedEnc     codec.ReadCloser
+	cachedWidth   int
+	cachedHeight  int
+	cachedBitRate int // Bitrate used for cached encoder
+	frameQueue    chan *image.RGBA
+	resultQueue   chan encodeResult
+	closed        bool
 }
 
 type encodeResult struct {
@@ -43,11 +43,11 @@ type encodeResult struct {
 }
 
 // NewVPXEncoder builds a VP8/VP9 encoder backed by libvpx (requires cgo + -tags vpx).
-func NewVPXEncoder(codecType VPXCodec, cfg VPXEncoderConfig) (VPXEncoder, error) {
+func NewVPXEncoder(codecType WebRTCCodec, cfg WebRTCEncoderConfig) (WebRTCEncoder, error) {
 	switch codecType {
-	case "", VPXCodecVP8:
-		codecType = VPXCodecVP8
-	case VPXCodecVP9:
+	case "", WebRTCCodecVP8:
+		codecType = WebRTCCodecVP8
+	case WebRTCCodecVP9:
 	default:
 		return nil, errors.New("unsupported vpx codec")
 	}
@@ -266,7 +266,7 @@ var _ video.Reader = (*streamingFrameReader)(nil)
 
 func (e *vpxEncoder) videoBuilder(bitRate int) (codec.VideoEncoderBuilder, error) {
 	switch e.codec {
-	case VPXCodecVP9:
+	case WebRTCCodecVP9:
 		params, err := vpx.NewVP9Params()
 		if err != nil {
 			return nil, err

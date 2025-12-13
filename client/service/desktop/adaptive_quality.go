@@ -20,18 +20,18 @@ import (
 // - Low:     300 kbps, JPEG quality 50-60
 type AdaptiveQualityManager struct {
 	// Network metrics (atomic for lock-free reads)
-	rttMs            atomic.Int64   // Current RTT in milliseconds
-	packetLossRate   atomic.Uint32  // Packet loss as percentage * 100 (e.g., 150 = 1.5%)
-	queueDepthBytes  atomic.Int64   // Pending bytes in send queue
+	rttMs           atomic.Int64  // Current RTT in milliseconds
+	packetLossRate  atomic.Uint32 // Packet loss as percentage * 100 (e.g., 150 = 1.5%)
+	queueDepthBytes atomic.Int64  // Pending bytes in send queue
 
 	// Quality parameters (atomic for lock-free updates)
-	currentJPEGQuality atomic.Int32  // Current JPEG quality (1-100)
-	currentBitrate     atomic.Int32  // Current bitrate in bps
-	maxFrameSize       atomic.Int64  // Maximum allowed frame size in bytes
+	currentJPEGQuality atomic.Int32 // Current JPEG quality (1-100)
+	currentBitrate     atomic.Int32 // Current bitrate in bps
+	maxFrameSize       atomic.Int64 // Maximum allowed frame size in bytes
 
 	// Adaptation state
-	lastAdjustment   atomic.Int64   // Unix nano timestamp of last quality change
-	adaptationMode   atomic.Int32   // 0=auto, 1=fixed high, 2=fixed low
+	lastAdjustment atomic.Int64 // Unix nano timestamp of last quality change
+	adaptationMode atomic.Int32 // 0=auto, 1=fixed high, 2=fixed low
 
 	// Statistics
 	qualityUpgrades   atomic.Uint64 // Count of quality increases
@@ -52,22 +52,26 @@ const (
 	JPEGQualityLow    = 55
 
 	// Network condition thresholds (based on research)
-	RTTIdealMs      = 50   // <50ms: ideal conditions
-	RTTAcceptableMs = 150  // <150ms: acceptable
-	RTTDegradedMs   = 200  // >200ms: degrade quality
+	RTTIdealMs      = 50  // <50ms: ideal conditions
+	RTTAcceptableMs = 150 // <150ms: acceptable
+	RTTDegradedMs   = 200 // >200ms: degrade quality
 
-	PacketLossIdeal      = 100  // <1% (stored as percentage * 100)
-	PacketLossAcceptable = 500  // <5%
+	PacketLossIdeal      = 100 // <1% (stored as percentage * 100)
+	PacketLossAcceptable = 500 // <5%
 
 	QueueDepthWarning  = 512 * 1024  // 512 KB - start reducing quality
 	QueueDepthCritical = 1024 * 1024 // 1 MB - aggressive reduction
 
 	// Frame size limits (prevent fragmentation)
-	MaxFrameSizeDefault = 256 * 1024  // 256 KB default limit
-	MaxFrameSizeMin     = 64 * 1024   // 64 KB minimum (extreme congestion)
+	// NOTE: Rocket's desktop WS path already chunks frames into ~65KB WebSocket messages.
+	// The max-frame size here is therefore an *aggregate pacing/backpressure* hint (not an MTU limit).
+	// If this is set too low, initial keyframes (DESKTOP_INIT/SHOT) get split into many sub-frames,
+	// which shows up as slow/patchy "tile filling" during startup.
+	MaxFrameSizeDefault = 1024 * 1024 // 1 MB default limit (keyframes should fit without excessive splitting)
+	MaxFrameSizeMin     = 128 * 1024  // 128 KB minimum (extreme congestion)
 
 	// Adaptation timing (prevent oscillation)
-	MinAdaptationInterval = 2 * time.Second  // Don't adjust more frequently than 2s
+	MinAdaptationInterval = 2 * time.Second // Don't adjust more frequently than 2s
 )
 
 // NewAdaptiveQualityManager creates a new quality manager with default settings.

@@ -4,7 +4,7 @@ import { Toolbar } from './components/Toolbar';
 import { DesktopCanvas, InputOverlay } from './components/Canvas';
 import CursorOverlay from './components/Canvas/CursorOverlay';
 import { ControlBar } from './components/Controls';
-import { useDesktopStream, useInputCapture, useFullscreen } from './hooks';
+import { useDesktopStream, useDesktopWebRTC, useInputCapture, useFullscreen } from './hooks';
 import i18n from '../../../locale/locale';
 import './DesktopViewer.css';
 
@@ -24,12 +24,75 @@ const DesktopViewer = ({
   const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const [webrtcIceServers, setWebrtcIceServers] = useState(null);
+  const [webrtcIceLoaded, setWebrtcIceLoaded] = useState(false);
   const deviceId = device?.id || null;
 
   // Refs
   const containerRef = useRef(null);
   const contentRef = useRef(null);
   const canvasRef = useRef(null);
+  const sendSignalRef = useRef(null);
+
+  // Fetch ICE servers from the server config (TURN credentials, TurnOnly policy, etc).
+  useEffect(() => {
+    let cancelled = false;
+    setWebrtcIceServers(null);
+    setWebrtcIceLoaded(false);
+
+    (async () => {
+      try {
+        const url = shareToken
+          ? `/api/share/ice?token=${encodeURIComponent(shareToken)}`
+          : '/api/device/webrtc/config';
+        const res = await fetch(url);
+        const body = await res.json();
+        if (body?.code === 0 && body?.data?.ice) {
+          const ice = body.data.ice;
+          const servers = [];
+
+          if (Array.isArray(ice.ice_servers)) {
+            ice.ice_servers.forEach((s) => {
+              if (s && s.urls) servers.push(s);
+            });
+          }
+
+          if (servers.length === 0) {
+            (ice.stun || []).forEach((u) => servers.push({ urls: u }));
+            (ice.turn || []).forEach((u) => servers.push({ urls: u }));
+          }
+
+          if (servers.length > 0 && !cancelled) {
+            setWebrtcIceServers(servers);
+          }
+        }
+      } catch (_) {
+        // Fall back to the hook defaults (public STUN) when config is unavailable.
+      } finally {
+        if (!cancelled) setWebrtcIceLoaded(true);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [shareToken]);
+
+  const {
+    videoRef: webrtcVideoRef,
+    isActive: webrtcActive,
+    controlChannel: webrtcControlChannel,
+    start: startWebRTC,
+    stop: stopWebRTC,
+    handleSignalMessage,
+  } = useDesktopWebRTC({
+    enabled: true,
+    allowControl,
+    iceServers: webrtcIceServers,
+    sendSignal: useCallback((payload) => {
+      if (sendSignalRef.current) {
+        sendSignalRef.current(payload);
+      }
+    }, []),
+  });
 
   // Desktop stream hook
   const {
@@ -47,7 +110,32 @@ const DesktopViewer = ({
     sendClipboard,
     sendFileDrop,
     requestShot,
-  } = useDesktopStream(device, canvasRef, { shareToken, shareSecret, allowControl });
+    sendSignal,
+  } = useDesktopStream(device, canvasRef, {
+    shareToken,
+    shareSecret,
+    allowControl,
+    controlChannel: webrtcControlChannel,
+    onJSONMessage: handleSignalMessage,
+    suppressFrames: webrtcActive,
+  });
+
+  // Wire WS-only sendSignal into the WebRTC hook.
+  useEffect(() => {
+    sendSignalRef.current = sendSignal || null;
+  }, [sendSignal]);
+
+  // Start WebRTC after the desktop session is initialized (resolution known).
+  useEffect(() => {
+    if (!webrtcIceLoaded) return;
+    if (status !== 'connected') {
+      stopWebRTC();
+      return;
+    }
+    if (resolution?.width > 0 && resolution?.height > 0) {
+      startWebRTC();
+    }
+  }, [webrtcIceLoaded, status, resolution?.width, resolution?.height, startWebRTC, stopWebRTC]);
 
   // Input capture hook
   const {
@@ -87,12 +175,36 @@ const DesktopViewer = ({
     }
   }, [quality, targetFps, selectedMonitor, status, sendConfig]);
 
+  // When WebRTC video is active, suppress the WS tile/canvas stream for this session.
+  useEffect(() => {
+    if (status === 'connected') {
+      sendConfig({ transport: webrtcActive ? 'webrtc' : 'tiles' });
+    }
+  }, [status, webrtcActive, sendConfig]);
+
   // Handle screenshot
   const handleScreenshot = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
     try {
+      // When WebRTC is active, the canvas may be transparent; capture the <video> frame instead.
+      if (webrtcActive && webrtcVideoRef.current && webrtcVideoRef.current.videoWidth > 0) {
+        const video = webrtcVideoRef.current;
+        const snap = document.createElement('canvas');
+        snap.width = video.videoWidth;
+        snap.height = video.videoHeight;
+        const ctx = snap.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, snap.width, snap.height);
+          const link = document.createElement('a');
+          link.download = `screenshot_${device?.hostname || 'remote'}_${Date.now()}.png`;
+          link.href = snap.toDataURL('image/png');
+          link.click();
+          message.success(i18n.t('COMMON.SUCCESS'));
+          return;
+        }
+      }
+
+      const canvas = canvasRef.current;
+      if (!canvas) return;
       const link = document.createElement('a');
       link.download = `screenshot_${device?.hostname || 'remote'}_${Date.now()}.png`;
       link.href = canvas.toDataURL('image/png');
@@ -102,7 +214,7 @@ const DesktopViewer = ({
       console.error('Screenshot failed:', err);
       message.error(i18n.t('COMMON.UNKNOWN_ERROR'));
     }
-  }, [device]);
+  }, [device, webrtcActive, webrtcVideoRef]);
 
   // Handle clipboard sync
   const handleClipboardSync = useCallback(async () => {
@@ -212,10 +324,20 @@ const DesktopViewer = ({
 
       {/* Canvas Container */}
       <div className="desktop-viewer-content" ref={contentRef}>
+        <div className={`desktop-webrtc-layer ${webrtcActive ? 'desktop-webrtc-layer--active' : ''}`}>
+          <video
+            ref={webrtcVideoRef}
+            className="desktop-webrtc-video"
+            autoPlay
+            playsInline
+            muted
+          />
+        </div>
         <DesktopCanvas
           ref={canvasRef}
           pointerLocked={pointerLocked}
           onCanvasClick={handleCanvasClick}
+          className={webrtcActive ? 'desktop-canvas-wrapper--webrtc' : ''}
         />
 
         {/* Overlays */}

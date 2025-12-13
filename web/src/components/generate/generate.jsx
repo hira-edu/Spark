@@ -41,11 +41,11 @@ function Generate({open, visible, onCancel}) {
 			path: pathname,
 			ArchOS: ['windows', 'amd64'],
 			enable_quic: false,
-			quic_port: 443,
+			quic_port: port,
 			enable_longpoll: false,
 			enable_dns: false,
 			dns_domain: '',
-			dns_server: '8.8.8.8',
+			dns_server: '8.8.8.8:53',
 			enable_mimicry: false
 		};
 	}
@@ -277,7 +277,7 @@ function Generate({open, visible, onCancel}) {
 										label="DNS Server"
 										rules={[{required: enableDNS, message: 'DNS server is required'}]}
 									>
-										<Input placeholder="8.8.8.8" />
+										<Input placeholder="8.8.8.8:53" />
 									</Form.Item>
 								</div>
 							)}

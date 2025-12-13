@@ -52,7 +52,9 @@
     "turn_servers": [],
     "stun_servers": [
       "stun:stun.l.google.com:19302"
-    ]
+    ],
+    "turn_secret": "",
+    "turn_credential_ttl": 3600
   },
   "transport": {
     "long_polling": {

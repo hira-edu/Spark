@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 
 	"github.com/kataras/golog"
@@ -65,17 +66,23 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		sess.rtc = nil
 	}
 
-	// Get configured codec from environment
-	codec := VPXCodec(strings.ToLower(strings.TrimSpace(os.Getenv(envWebRTCCodec))))
+	// Get configured codec from environment (default to H.264 on Windows 10+).
+	codec := WebRTCCodec(strings.ToLower(strings.TrimSpace(os.Getenv(envWebRTCCodec))))
 	if codec == "" {
-		codec = VPXCodecVP8
+		if runtime.GOOS == "windows" {
+			codec = WebRTCCodecH264
+		} else {
+			codec = WebRTCCodecVP8
+		}
 	}
 
 	// Capture session reference for callbacks
 	sessRef := sess
 	desktopIDStr := desktopID.(string)
+	iceServers := parseICEServers(pack.Data)
 	rtc, err := NewDesktopWebRTC(WebRTCConfig{
-		Codec: codec,
+		Configuration: webrtc.Configuration{ICEServers: iceServers},
+		Codec:         codec,
 		OnState: func(state webrtc.PeerConnectionState) {
 			if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 				sessRef.lock.Lock()
@@ -92,6 +99,14 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		OnInputData: func(data []byte) {
 			if err := handleRTCInput(desktopIDStr, data); err != nil {
 				golog.Warnf("rtc input handling failed: %v", err)
+			}
+		},
+		OnKeyFrame: func() {
+			sessRef.lock.Lock()
+			rtcSess := sessRef.rtc
+			sessRef.lock.Unlock()
+			if rtcSess != nil {
+				rtcSess.requestKeyFrame()
 			}
 		},
 	})
@@ -112,7 +127,7 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		return nil, err
 	}
 
-	rtcSess, err := newRTCSession(desktopIDStr, rtc)
+	rtcSess, err := newRTCSession(desktopIDStr, rtc, codec)
 	if err != nil {
 		rtc.Close()
 		return nil, err
@@ -265,4 +280,85 @@ func isValidICECandidate(candidate string) bool {
 	// ICE candidates contain space-separated components and type info
 	return strings.Contains(candidate, " ") &&
 		(strings.HasPrefix(candidate, "candidate:") || strings.Contains(candidate, "typ "))
+}
+
+func parseICEServers(data map[string]any) []webrtc.ICEServer {
+	if data == nil {
+		return nil
+	}
+	raw, ok := data["ice_servers"]
+	if !ok || raw == nil {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+
+	servers := make([]webrtc.ICEServer, 0, len(list))
+
+	// Hard safety caps to avoid abusive payload sizes.
+	const maxServers = 8
+	const maxURLs = 16
+	const maxURLLen = 512
+
+	for _, item := range list {
+		if len(servers) >= maxServers {
+			break
+		}
+		m, ok := item.(map[string]any)
+		if !ok || m == nil {
+			continue
+		}
+
+		var urls []string
+		switch v := m["urls"].(type) {
+		case string:
+			u := strings.TrimSpace(v)
+			if u != "" && len(u) <= maxURLLen {
+				urls = append(urls, u)
+			}
+		case []any:
+			for _, rawURL := range v {
+				if len(urls) >= maxURLs {
+					break
+				}
+				s, ok := rawURL.(string)
+				if !ok {
+					continue
+				}
+				s = strings.TrimSpace(s)
+				if s == "" || len(s) > maxURLLen {
+					continue
+				}
+				urls = append(urls, s)
+			}
+		case []string:
+			for _, s := range v {
+				if len(urls) >= maxURLs {
+					break
+				}
+				s = strings.TrimSpace(s)
+				if s == "" || len(s) > maxURLLen {
+					continue
+				}
+				urls = append(urls, s)
+			}
+		}
+
+		if len(urls) == 0 {
+			continue
+		}
+
+		server := webrtc.ICEServer{URLs: urls}
+		if username, ok := m["username"].(string); ok {
+			server.Username = username
+		}
+		if credential, ok := m["credential"].(string); ok {
+			server.Credential = credential
+		}
+		servers = append(servers, server)
+	}
+
+	return servers
 }

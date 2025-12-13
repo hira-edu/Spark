@@ -60,6 +60,15 @@ func Offer(ctx *gin.Context) {
 	if form.Retry > 0 {
 		payload[`retry`] = form.Retry
 	}
+	if cfg := servercfg.Config.WebRTC; cfg != nil {
+		payload[`ice_servers`] = utility.BuildICEServers(
+			cfg.Stun,
+			cfg.Turn,
+			cfg.TurnSecret,
+			"webrtc",
+			cfg.TurnCredentialTTL,
+		)
+	}
 	if !common.SendPackByUUID(modules.Packet{Act: `DESKTOP_WEBRTC_OFFER`, Data: payload, Event: trigger}, target) {
 		ctx.AbortWithStatusJSON(http.StatusBadGateway, modules.Packet{Code: 1, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`})
 		return

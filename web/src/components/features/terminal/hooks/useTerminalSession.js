@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { message } from 'antd';
-import { encrypt, decrypt, genRandHex, getBaseURL, hex2ua, str2hex, ua2hex, ua2str, translate } from '../../../../utils/utils';
+import { encrypt, decrypt, genRandHex, getBaseURL, hex2ua, ua2hex, ua2str, translate } from '../../../../utils/utils';
 import i18n from '../../../../locale/locale';
 
 /**
@@ -38,7 +38,8 @@ export function useTerminalSession(device, options = {}) {
     const bodyArray = body instanceof Uint8Array ? body : new Uint8Array(body);
     const bodyLength = bodyArray.length;
     const buffer = new Uint8Array(bodyLength + 8);
-    buffer.set(new Uint8Array([34, 22, 19, 17, 20, 3]), 0);
+    // Terminal JSON command: magic(4) + service(21) + op(1) + length(2) + payload
+    buffer.set(new Uint8Array([34, 22, 19, 17, 21, 1]), 0);
     buffer.set(new Uint8Array([bodyLength >> 8, bodyLength & 0xFF]), 6);
     buffer.set(bodyArray, 8);
     ws.send(buffer);
@@ -51,8 +52,12 @@ export function useTerminalSession(device, options = {}) {
 
     data = new Uint8Array(data);
 
+    const isMagic = data[0] === 34 && data[1] === 22 && data[2] === 19 && data[3] === 17;
+    const service = isMagic ? data[4] : null;
+    const op = isMagic ? data[5] : null;
+
     // Check for raw output (binary header: magic[4] + service + op + event[16] + length[2])
-    if (data[0] === 34 && data[1] === 22 && data[2] === 19 && data[3] === 17 && data[4] === 21 && data[5] === 0) {
+    if (isMagic && service === 21 && op === 0) {
       // Binary protocol: 4-byte magic + 1-byte service + 1-byte op + 16-byte event + 2-byte length + payload
       // Skip 24-byte header to get actual terminal output
       const output = ua2str(data.slice(24));
@@ -62,7 +67,39 @@ export function useTerminalSession(device, options = {}) {
       return;
     }
 
-    // Decrypt and parse JSON message
+    // Server-to-browser JSON packets for terminal use a 6-byte header (magic + service + op),
+    // matching the pattern used by other Rocket feature handlers.
+    if (isMagic && ((service === 21 && op === 1) || (service === 20 && op === 3))) {
+      try {
+        const decrypted = await decrypt(data.slice(6), secret);
+        const parsed = JSON.parse(decrypted);
+        if (parsed?.act === 'TERMINAL_OUTPUT') {
+          const output = hex2ua(parsed?.data?.output);
+          if (onOutput) {
+            onOutput(ua2str(output));
+          }
+          return;
+        }
+        if (parsed?.act === 'WARN') {
+          message.warning(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+          return;
+        }
+        if (parsed?.act === 'QUIT') {
+          message.warning(parsed.msg ? translate(parsed.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+          disconnect();
+          return;
+        }
+        if (parsed?.act === 'TERMINAL_INFO') {
+          if (parsed.data?.shell) setShell(parsed.data.shell);
+          if (parsed.data?.cwd) setCwd(parsed.data.cwd);
+        }
+      } catch (err) {
+        console.error('Failed to parse headered JSON message:', err);
+      }
+      return;
+    }
+
+    // Decrypt and parse legacy/unframed JSON message
     try {
       const decrypted = await decrypt(data, secret);
       const parsed = JSON.parse(decrypted);
@@ -170,14 +207,19 @@ export function useTerminalSession(device, options = {}) {
 
   // Send input to terminal
   const sendInput = useCallback((input) => {
-    const isWindows = device?.os?.toLowerCase().includes('windows');
-    sendData({
-      act: 'TERMINAL_INPUT',
-      data: {
-        input: str2hex(input),
-      },
-    });
-  }, [device, sendData]);
+    const ws = wsRef.current;
+    const secret = secretRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !secret) return;
+
+    // Low-latency raw input: service=21, op=0 (server injects terminal event UUID).
+    const payload = new TextEncoder().encode(input);
+    const payloadLength = payload.length;
+    const buffer = new Uint8Array(payloadLength + 8);
+    buffer.set(new Uint8Array([34, 22, 19, 17, 21, 0]), 0);
+    buffer.set(new Uint8Array([payloadLength >> 8, payloadLength & 0xFF]), 6);
+    buffer.set(payload, 8);
+    ws.send(buffer);
+  }, []);
 
   // Resize terminal
   const resize = useCallback((cols, rows) => {

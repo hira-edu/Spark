@@ -299,6 +299,8 @@ For remote desktop streaming peer-to-peer connections.
 |-------|------|----------|---------|-------------|
 | `webrtc.stun_servers` | []string | No | Google STUN | STUN servers for NAT traversal |
 | `webrtc.turn_servers` | []string | No | - | TURN relay servers |
+| `webrtc.turn_secret` | string | No | - | Coturn `static-auth-secret` for RFC 8656 ephemeral TURN creds |
+| `webrtc.turn_credential_ttl` | int | No | `3600` | Ephemeral TURN credential lifetime (seconds) |
 
 ```json
 "webrtc": {
@@ -308,7 +310,9 @@ For remote desktop streaming peer-to-peer connections.
   ],
   "turn_servers": [
     "turn:turn.example.com:3478?transport=udp"
-  ]
+  ],
+  "turn_secret": "your-coturn-static-auth-secret",
+  "turn_credential_ttl": 3600
 }
 ```
 
@@ -319,7 +323,9 @@ turn:HOST:PORT?transport=tcp
 turns:HOST:PORT (TLS)
 ```
 
-Clients can also use environment variables:
+**Best practice (recommended):** Configure TURN/STUN on the Rocket server and use coturn in `use-auth-secret` mode. The web viewer fetches ICE config from the server and Rocket injects `ice_servers` into WebRTC offers so desktop agents don’t need per-agent TURN env configuration.
+
+Desktop agents can still use environment variables (override / legacy):
 - `SPARK_WEBRTC_STUN` - Comma-separated STUN URLs
 - `SPARK_WEBRTC_TURN` - Comma-separated TURN URLs
 - `SPARK_WEBRTC_TURN_USERNAME` - TURN username

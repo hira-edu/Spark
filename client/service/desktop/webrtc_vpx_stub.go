@@ -25,7 +25,7 @@ func (noopVPXEncoder) Close() error {
 }
 
 // NewVPXEncoder returns a stub when libvpx is not compiled in.
-func NewVPXEncoder(_ VPXCodec, _ VPXEncoderConfig) (VPXEncoder, error) {
+func NewVPXEncoder(_ WebRTCCodec, _ WebRTCEncoderConfig) (WebRTCEncoder, error) {
 	warnVPXOnce.Do(func() {
 		telemetry.LogStructured("WARN", "[WEBRTC_CODEC_DISABLED]", map[string]interface{}{
 			"codec":   "vpx",

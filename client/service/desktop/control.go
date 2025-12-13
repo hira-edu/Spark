@@ -67,6 +67,28 @@ func HandleConfig(pack modules.Packet) error {
 		}
 	}
 
+	// Update transport preference (per-session). When set to "webrtc", the device will stop
+	// sending WS tile/canvas frames for this session (WebRTC <video> becomes the primary path).
+	if transportVal, ok := pack.Data["transport"]; ok {
+		transport, okStr := transportVal.(string)
+		if !okStr {
+			errors = append(errors, "transport: invalid type")
+		} else if desktopID, okID := pack.GetData("desktop", reflect.String); okID {
+			if sess, ok := sessions.Get(desktopID.(string)); ok {
+				switch strings.ToLower(strings.TrimSpace(transport)) {
+				case "", "tiles", "ws", "websocket", "canvas":
+					sess.wsFramesSuppressed.Store(false)
+					updated = append(updated, "transport")
+				case "webrtc", "video":
+					sess.wsFramesSuppressed.Store(true)
+					updated = append(updated, "transport")
+				default:
+					warnings = append(warnings, "transport: unsupported")
+				}
+			}
+		}
+	}
+
 	// Update FPS (if provided)
 	if fpsVal, ok := pack.Data["fps"]; ok {
 		var fps int32

@@ -4,6 +4,7 @@ import (
 	"Rocket/client/common"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,15 +22,15 @@ import (
 // QUIC is a modern, encrypted, multiplexed transport protocol built on UDP
 // Provides better performance and is harder to block than TCP-based protocols
 type QUICTransport struct {
-	conn        *quic.Conn
-	stream      *quic.Stream
-	secret      []byte
-	ctx         context.Context
-	cancel      context.CancelFunc
-	sendQueue   chan []byte // Already encrypted data from adapter
-	recvQueue   chan []byte // Encrypted data to adapter
-	mu          sync.Mutex
-	connected   bool
+	conn      *quic.Conn
+	stream    *quic.Stream
+	secret    []byte
+	ctx       context.Context
+	cancel    context.CancelFunc
+	sendQueue chan []byte // Already encrypted data from adapter
+	recvQueue chan []byte // Encrypted data to adapter
+	mu        sync.Mutex
+	connected bool
 }
 
 // NewQUICTransport creates a new QUIC transport
@@ -72,7 +73,7 @@ func (t *QUICTransport) Connect(ctx context.Context, cfg *Config) (*common.Conn,
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		NextProtos:         []string{"rocket-quic", "h3"}, // ALPN
-		MinVersion:         tls.VersionTLS13, // QUIC requires TLS 1.3
+		MinVersion:         tls.VersionTLS13,              // QUIC requires TLS 1.3
 	}
 
 	// Apply protocol mimicry
@@ -170,8 +171,8 @@ func (t *QUICTransport) handshake(ctx context.Context, cfg *Config) ([]byte, err
 		return nil, err
 	}
 
-	// Write handshake
-	if _, err := t.stream.Write(data); err != nil {
+	// Write handshake frame (QUIC streams are byte streams; we must frame messages)
+	if err := writeQUICFrame(t.stream, data); err != nil {
 		return nil, err
 	}
 
@@ -179,16 +180,14 @@ func (t *QUICTransport) handshake(ctx context.Context, cfg *Config) ([]byte, err
 	t.stream.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer t.stream.SetReadDeadline(time.Time{})
 
-	// Read response length (4 bytes)
-	buf := make([]byte, 4096)
-	n, err := t.stream.Read(buf)
+	respPayload, err := readQUICFrame(t.stream, 4096)
 	if err != nil {
 		return nil, err
 	}
 
 	// Parse response
 	var response map[string]string
-	if err := json.Unmarshal(buf[:n], &response); err != nil {
+	if err := json.Unmarshal(respPayload, &response); err != nil {
 		return nil, err
 	}
 
@@ -207,8 +206,6 @@ func (t *QUICTransport) handshake(ctx context.Context, cfg *Config) ([]byte, err
 
 // readLoop continuously reads encrypted bytes from QUIC stream
 func (t *QUICTransport) readLoop() {
-	buf := make([]byte, 65536) // 64KB buffer
-
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -216,9 +213,9 @@ func (t *QUICTransport) readLoop() {
 		default:
 		}
 
-		// Read with timeout
+		// Read framed message with timeout
 		t.stream.SetReadDeadline(time.Now().Add(90 * time.Second))
-		n, err := t.stream.Read(buf)
+		payload, err := readQUICFrame(t.stream, common.MaxMessageSize)
 		t.stream.SetReadDeadline(time.Time{})
 
 		if err != nil {
@@ -229,16 +226,8 @@ func (t *QUICTransport) readLoop() {
 			continue
 		}
 
-		if n == 0 {
-			continue
-		}
-
-		// Queue encrypted bytes as-is (common.Conn will decrypt)
-		encData := make([]byte, n)
-		copy(encData, buf[:n])
-
 		select {
-		case t.recvQueue <- encData:
+		case t.recvQueue <- payload:
 		case <-t.ctx.Done():
 			return
 		}
@@ -266,12 +255,11 @@ func (t *QUICTransport) sendLoop() {
 
 // send sends encrypted bytes over QUIC stream
 func (t *QUICTransport) send(encData []byte) error {
-	// Write encrypted data as-is (already encrypted by common.Conn)
+	// Write framed data as-is (common.Conn will handle JSON/binary payloads)
 	t.stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	defer t.stream.SetWriteDeadline(time.Time{})
 
-	_, err := t.stream.Write(encData)
-	return err
+	return writeQUICFrame(t.stream, encData)
 }
 
 // createConnWrapper creates a common.Conn wrapper for QUIC
@@ -304,5 +292,41 @@ func (t *QUICTransport) Close() error {
 		t.conn.CloseWithError(0, "client disconnect")
 	}
 
+	return nil
+}
+
+func readQUICFrame(r io.Reader, maxSize int) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n == 0 || n > uint32(maxSize) {
+		return nil, fmt.Errorf("invalid frame size: %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func writeQUICFrame(w io.Writer, payload []byte) error {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeAll(w, lenBuf[:]); err != nil {
+		return err
+	}
+	return writeAll(w, payload)
+}
+
+func writeAll(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
 	return nil
 }

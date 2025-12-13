@@ -18,16 +18,31 @@ import (
 
 // WebSocketTransport implements WebSocket (WS/WSS) transport
 type WebSocketTransport struct {
-	secure bool // true = WSS, false = WS
-	conn   *ws.Conn
+	secure   bool // true = WSS, false = WS
+	priority int
+	conn     *ws.Conn
 }
 
 // NewWebSocketTransport creates a new WebSocket transport
 // secure: true for WSS, false for WS
 func NewWebSocketTransport(secure bool) *WebSocketTransport {
-	return &WebSocketTransport{
-		secure: secure,
+	priority := 10
+	if secure {
+		priority = 15
 	}
+	return &WebSocketTransport{
+		secure:   secure,
+		priority: priority,
+	}
+}
+
+// NewWebSocketTransportWithPriority allows callers to override priority ordering.
+func NewWebSocketTransportWithPriority(secure bool, priority int) *WebSocketTransport {
+	t := NewWebSocketTransport(secure)
+	if priority > 0 {
+		t.priority = priority
+	}
+	return t
 }
 
 // Name returns the transport name
@@ -40,10 +55,7 @@ func (t *WebSocketTransport) Name() string {
 
 // Priority returns the priority level
 func (t *WebSocketTransport) Priority() int {
-	if t.secure {
-		return 15 // WSS is preferred over WS
-	}
-	return 10 // WS is tried first (fastest)
+	return t.priority
 }
 
 // IsAvailable checks if WebSocket transport is available

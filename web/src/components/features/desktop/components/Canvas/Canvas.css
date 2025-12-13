@@ -10,6 +10,15 @@
   cursor: none; /* Hide local cursor over entire wrapper area */
 }
 
+/* When WebRTC <video> is active, keep the canvas for input capture but make it transparent. */
+.desktop-canvas-wrapper--webrtc {
+  background: transparent;
+}
+
+.desktop-canvas-wrapper--webrtc .desktop-canvas {
+  opacity: 0;
+}
+
 /* Canvas */
 .desktop-canvas {
   /* NOTE: object-fit does NOT work on canvas elements!

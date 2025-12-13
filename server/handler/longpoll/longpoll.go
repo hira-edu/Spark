@@ -103,6 +103,11 @@ func (sm *SessionManager) cleanup() {
 
 // createSession creates a new long polling session
 func (sm *SessionManager) createSession(uuid string, secret []byte) *Session {
+	// Ensure we don't leak an existing session for the same UUID.
+	if _, exists := sm.sessions.Get(uuid); exists {
+		sm.removeSession(uuid)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	session := &Session{
@@ -158,12 +163,20 @@ func (s *Session) updateLastSeen() {
 }
 
 // queueMessage queues a message for delivery
-func (s *Session) queueMessage(msg *modules.Packet) error {
+func (s *Session) queueMessage(msg *modules.Packet) (err error) {
+	// A send to a closed channel panics; guard so a race during session teardown
+	// doesn't crash the server.
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.New("session closed")
+		}
+	}()
+
 	select {
-	case s.MessageQueue <- msg:
-		return nil
 	case <-s.ctx.Done():
 		return errors.New("session closed")
+	case s.MessageQueue <- msg:
+		return nil
 	default:
 		return errors.New("queue full")
 	}
@@ -276,32 +289,24 @@ func Poll(ctx *gin.Context) {
 	pollCtx, cancel := context.WithTimeout(ctx.Request.Context(), defaultPollTimeout)
 	defer cancel()
 
-	var messages []*modules.Packet
-
+	var msg *modules.Packet
 	select {
 	case <-pollCtx.Done():
 		// Timeout - return 204 No Content
 		ctx.Status(http.StatusNoContent)
 		return
 
-	case msg := <-session.MessageQueue:
-		// Got a message
-		messages = append(messages, msg)
-
-		// Collect additional messages if available (batch)
-		for len(messages) < 10 {
-			select {
-			case msg := <-session.MessageQueue:
-				messages = append(messages, msg)
-			default:
-				goto send
-			}
+	case received, ok := <-session.MessageQueue:
+		// Got a message (or the queue was closed)
+		if !ok || received == nil {
+			ctx.Status(http.StatusNoContent)
+			return
 		}
+		msg = received
 	}
 
-send:
-	// Marshal messages
-	data, err := json.Marshal(messages)
+	// Marshal single message (WebSocket/QUIC/DNS transports are message-oriented; keep parity)
+	data, err := json.Marshal(msg)
 	if err != nil {
 		ctx.AbortWithStatus(http.StatusInternalServerError)
 		span.RecordError(err)
@@ -314,7 +319,7 @@ send:
 
 	span.SetAttributes(
 		attribute.String("longpoll.uuid", uuid),
-		attribute.Int("longpoll.message_count", len(messages)),
+		attribute.Int("longpoll.message_count", 1),
 		attribute.Int("longpoll.data_size", len(data)),
 	)
 }
@@ -518,13 +523,9 @@ func validateCredentials(uuidHex, keyHex string) (string, error) {
 		return "", errors.New("uuid/key mismatch")
 	}
 
-	// Check device and register if needed - return connection UUID
-	connUUID, ok := common.CheckDevice(uuidHex, "")
-	if !ok {
-		return "", errors.New("device registration failed")
-	}
-
-	return connUUID, nil
+	// For long-polling, the client UUID acts as the session identifier.
+	// Device registration happens on DEVICE_UP (same flow as WebSocket).
+	return uuidHex, nil
 }
 
 // bytesEqual compares two byte slices in constant time

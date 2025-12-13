@@ -30,7 +30,7 @@ func startWebcamTrack(rtc *DesktopWebRTC) (func(), error) {
 		return nil, err
 	}
 
-	enc, err := NewVPXEncoder(VPXCodecVP8, VPXEncoderConfig{
+	enc, err := NewVPXEncoder(WebRTCCodecVP8, WebRTCEncoderConfig{
 		BitRate:          400_000,
 		KeyFrameInterval: 60,
 	})

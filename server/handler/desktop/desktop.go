@@ -629,7 +629,8 @@ func onDesktopConnect(session *melody.Session) {
 	})
 
 	if !common.SendPack(modules.Packet{Act: `DESKTOP_INIT`, Data: gin.H{
-		`desktop`: desktopUUID,
+		`desktop`:      desktopUUID,
+		`allowControl`: allowControlEnabled(session),
 	}, Event: desktopUUID}, deviceConn) {
 		common.Warn(session, `[SERVER_DESKTOP_INIT_SEND_FAILED]`, ``, `Failed to send DESKTOP_INIT to device`, map[string]any{
 			`desktop_uuid`: desktopUUID[:8] + `...`,
@@ -867,11 +868,33 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		}
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
-	case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`:
-		if !allowControlEnabled(session) {
-			blockControlAction(session, desktop, pack.Act)
+	case `DESKTOP_WEBRTC_OFFER`:
+		if payload, ok := normalizeSDP(pack.Data); ok {
+			payload[`desktop`] = desktop.uuid
+
+			// Provide ICE/TURN config to the device so it can gather relay candidates even
+			// when the desktop agent isn't configured via env vars.
+			if servercfg.Config.WebRTC != nil {
+				cfg := servercfg.Config.WebRTC
+				identifier := "device"
+				if len(desktop.device) >= 8 {
+					identifier = "device:" + desktop.device[:8]
+				}
+				payload[`ice_servers`] = utility.BuildICEServers(
+					cfg.Stun,
+					cfg.Turn,
+					cfg.TurnSecret,
+					identifier,
+					cfg.TurnCredentialTTL,
+				)
+			}
+
+			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
 			return
 		}
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		return
+	case `DESKTOP_WEBRTC_ANSWER`:
 		if payload, ok := normalizeSDP(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -880,10 +903,6 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
 		return
 	case `DESKTOP_WEBRTC_ICE`:
-		if !allowControlEnabled(session) {
-			blockControlAction(session, desktop, pack.Act)
-			return
-		}
 		if payload, ok := normalizeCandidate(pack.Data); ok {
 			payload[`desktop`] = desktop.uuid
 			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
@@ -1322,6 +1341,9 @@ func normalizeConfig(data map[string]any) (gin.H, bool) {
 
 	if codec, ok := data[`codec`].(string); ok && len(codec) > 0 {
 		payload[`codec`] = strings.ToLower(strings.TrimSpace(codec))
+	}
+	if transport, ok := data[`transport`].(string); ok && len(transport) > 0 {
+		payload[`transport`] = strings.ToLower(strings.TrimSpace(transport))
 	}
 	if allow, ok := data[`allowControl`].(bool); ok {
 		payload[`allowControl`] = allow

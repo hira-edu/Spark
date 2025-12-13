@@ -11,14 +11,38 @@ const defaultIceServers = [
 
 const MAGIC_PREFIX = [34, 22, 19, 17];
 const SERVICE_IDS = [20, 21];
-const BASE_HEADER_LENGTH = MAGIC_PREFIX.length + 2;
+const SERVICE_OP_LENGTH = 2; // service + op
 const EVENT_ID_LENGTH = 16;
-const FRAME_HEADER_LENGTH = BASE_HEADER_LENGTH + EVENT_ID_LENGTH;
+const FRAME_META_LENGTH = 8; // frameSeq(4) + chunkIndex(2) + chunkTotal(2)
+const LEGACY_FRAME_HEADER_LENGTH = MAGIC_PREFIX.length + SERVICE_OP_LENGTH + EVENT_ID_LENGTH; // 22 bytes
+const FRAME_HEADER_LENGTH = LEGACY_FRAME_HEADER_LENGTH + FRAME_META_LENGTH; // 30 bytes
+const JSON_BODY_OFFSET = MAGIC_PREFIX.length + SERVICE_OP_LENGTH; // 6 bytes
+
+function preferH264Codec(transceiver) {
+	if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
+	if (typeof RTCRtpReceiver === 'undefined' || typeof RTCRtpReceiver.getCapabilities !== 'function') return;
+
+	const caps = RTCRtpReceiver.getCapabilities('video');
+	const codecs = caps?.codecs || [];
+	if (!Array.isArray(codecs) || codecs.length === 0) return;
+
+	const h264 = codecs.filter((c) => (c?.mimeType || '').toLowerCase() === 'video/h264');
+	if (h264.length === 0) return;
+
+	const rest = codecs.filter((c) => (c?.mimeType || '').toLowerCase() !== 'video/h264');
+	try {
+		transceiver.setCodecPreferences([...h264, ...rest]);
+	} catch (_) {
+		// Best-effort only.
+	}
+}
 
 function Guest() {
 	const canvasRef = useRef(null);
 	const videoRef = useRef(null);
 	const wsRef = useRef(null);
+	const headerLenRef = useRef(FRAME_HEADER_LENGTH);
+	const messageQueueRef = useRef(Promise.resolve());
 	const secretRef = useRef(null);
 	const pcRef = useRef(null);
 	const dcRef = useRef(null);
@@ -96,12 +120,19 @@ function Guest() {
 			const body = await res.json();
 			if (body?.data?.ice) {
 				const ice = body.data.ice;
-				const servers = [];
-				(ice.stun || []).forEach((url) => servers.push({urls: url}));
-				(ice.turn || []).forEach((url) => servers.push({urls: url}));
-				if (servers.length > 0) {
-					iceServersRef.current = servers;
-					setIceLabel(servers.map((s) => Array.isArray(s.urls) ? s.urls.join(',') : s.urls).join(', '));
+				const headerServers = Array.isArray(ice.ice_servers) ? ice.ice_servers : [];
+				if (headerServers.length > 0) {
+					iceServersRef.current = headerServers;
+					setIceLabel(headerServers.map((s) => Array.isArray(s.urls) ? s.urls.join(',') : s.urls).join(', '));
+					return;
+				}
+
+				const legacyServers = [];
+				(ice.stun || []).forEach((url) => legacyServers.push({urls: url}));
+				(ice.turn || []).forEach((url) => legacyServers.push({urls: url}));
+				if (legacyServers.length > 0) {
+					iceServersRef.current = legacyServers;
+					setIceLabel(legacyServers.map((s) => Array.isArray(s.urls) ? s.urls.join(',') : s.urls).join(', '));
 					return;
 				}
 			}
@@ -142,6 +173,7 @@ function Guest() {
 		ctx.imageSmoothingEnabled = false;
 		const ws = new WebSocket(getBaseURL(true, `api/share/desktop?token=${encodeURIComponent(token)}&secret=${encodeURIComponent(secretHex.toLowerCase())}`));
 		ws.binaryType = 'arraybuffer';
+		messageQueueRef.current = Promise.resolve();
 		wsRef.current = ws;
 		ws.onopen = () => {
 			setStatus('streaming');
@@ -153,7 +185,11 @@ function Guest() {
 				startWebRTC();
 			}
 		};
-		ws.onmessage = (e) => parseBlocks(e.data, canvas, ctx);
+		ws.onmessage = (e) => {
+			messageQueueRef.current = messageQueueRef.current
+				.then(() => parseBlocks(e.data, canvas, ctx))
+				.catch(() => {});
+		};
 		ws.onclose = () => {
 			stopInput();
 			stopWebRTC();
@@ -179,7 +215,7 @@ function Guest() {
 		if (!buffer) return;
 
 		const bytes = new Uint8Array(buffer);
-		if (bytes.length < BASE_HEADER_LENGTH) return;
+		if (bytes.length < JSON_BODY_OFFSET) return;
 		for (let i = 0; i < MAGIC_PREFIX.length; i++) {
 			if (bytes[i] !== MAGIC_PREFIX[i]) return;
 		}
@@ -192,13 +228,71 @@ function Guest() {
 		}
 
 		if (op === 3) {
-			await handleJSON(bytes.slice(BASE_HEADER_LENGTH));
+			await handleJSON(bytes.slice(JSON_BODY_OFFSET));
 			return;
 		}
 
-		if (bytes.length < FRAME_HEADER_LENGTH) return;
-		const payloadOffset = FRAME_HEADER_LENGTH;
+		if (bytes.length < LEGACY_FRAME_HEADER_LENGTH) return;
 		const view = new DataView(buffer);
+
+		let headerLen = headerLenRef.current || FRAME_HEADER_LENGTH;
+		const tryResolutionHeader = (candidateLen) => {
+			if (bytes.length < candidateLen + 6) return false;
+			const bodyLength = view.getUint16(candidateLen, false);
+			return bodyLength === 4 && candidateLen + 2 + bodyLength <= bytes.length;
+		};
+
+		const hasPlausibleV2Meta = () => {
+			if (bytes.length < FRAME_HEADER_LENGTH) return false;
+			const chunkIndex = view.getUint16(LEGACY_FRAME_HEADER_LENGTH + 4, false);
+			const chunkTotal = view.getUint16(LEGACY_FRAME_HEADER_LENGTH + 6, false);
+			if (chunkTotal === 0 || chunkTotal > 4096) return false;
+			if (chunkIndex >= chunkTotal) return false;
+			return true;
+		};
+
+		const isPlausibleBlockHeader = (candidateOffset) => {
+			if (bytes.length < candidateOffset + 12) return false;
+			const bodyLen = view.getUint16(candidateOffset, false);
+			const imageType = view.getUint16(candidateOffset + 2, false);
+			const bw = view.getUint16(candidateOffset + 8, false);
+			const bh = view.getUint16(candidateOffset + 10, false);
+			if (bodyLen < 10) return false;
+			if (candidateOffset + 2 + bodyLen > bytes.length) return false;
+			if (imageType > 16) return false;
+			if (bw === 0 || bh === 0) return false;
+			if (bw > 8192 || bh > 8192) return false;
+			return true;
+		};
+
+		if (op === 2) {
+			if (tryResolutionHeader(FRAME_HEADER_LENGTH)) {
+				headerLen = FRAME_HEADER_LENGTH;
+			} else if (tryResolutionHeader(LEGACY_FRAME_HEADER_LENGTH)) {
+				headerLen = LEGACY_FRAME_HEADER_LENGTH;
+			} else {
+				return;
+			}
+			headerLenRef.current = headerLen;
+		} else if (op === 0 || op === 1) {
+			const v2Candidate = bytes.length >= FRAME_HEADER_LENGTH && hasPlausibleV2Meta() && isPlausibleBlockHeader(FRAME_HEADER_LENGTH);
+			const legacyCandidate = isPlausibleBlockHeader(LEGACY_FRAME_HEADER_LENGTH);
+			if (v2Candidate && !legacyCandidate) {
+				headerLen = FRAME_HEADER_LENGTH;
+			} else if (legacyCandidate && !v2Candidate) {
+				headerLen = LEGACY_FRAME_HEADER_LENGTH;
+			} else if (v2Candidate) {
+				headerLen = FRAME_HEADER_LENGTH;
+			} else if (legacyCandidate) {
+				headerLen = LEGACY_FRAME_HEADER_LENGTH;
+			} else {
+				return;
+			}
+			headerLenRef.current = headerLen;
+		}
+
+		if (bytes.length < headerLen) return;
+		const payloadOffset = headerLen;
 
 		if (op === 2) {
 			const bodyLength = view.getUint16(payloadOffset + 0, false);
@@ -231,21 +325,26 @@ function Guest() {
 			if (il < 0 || dataEnd > view.byteLength) {
 				break;
 			}
-			updateImage(buffer.slice(dataStart, dataEnd), it, dx, dy, bw, bh, canvasCtx);
+			updateImage(bytes.subarray(dataStart, dataEnd), it, dx, dy, bw, bh, canvasCtx);
 			offset = dataEnd;
 		}
 	}
 
-	function updateImage(ab, it, dx, dy, bw, bh, canvasCtx) {
+	function updateImage(data, it, dx, dy, bw, bh, canvasCtx) {
+		if (!data || data.byteLength === 0) return;
 		if (it === 0) {
-			canvasCtx.putImageData(new ImageData(new Uint8ClampedArray(ab), bw, bh), dx, dy, 0, 0, bw, bh);
+			const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
+			canvasCtx.putImageData(new ImageData(clamped, bw, bh), dx, dy, 0, 0, bw, bh);
 			return;
 		}
-		createImageBitmap(new Blob([ab]), 0, 0, bw, bh, {
+		createImageBitmap(new Blob([data]), {
 			premultiplyAlpha: 'none',
 			colorSpaceConversion: 'none'
 		}).then((ib) => {
-			canvasCtx.drawImage(ib, 0, 0, bw, bh, dx, dy, bw, bh);
+			canvasCtx.drawImage(ib, 0, 0, ib.width || bw, ib.height || bh, dx, dy, bw, bh);
+			if (typeof ib.close === 'function') {
+				ib.close();
+			}
 		}).catch(() => {});
 	}
 
@@ -310,7 +409,7 @@ function Guest() {
 		ws.send(buffer);
 	}
 
-	function startWebRTC() {
+	async function startWebRTC() {
 		const ws = wsRef.current;
 		if (!ws || ws.readyState !== WebSocket.OPEN) {
 			return;
@@ -319,6 +418,20 @@ function Guest() {
 		setWebrtcState('connecting');
 		const pc = new RTCPeerConnection({iceServers: iceServersRef.current});
 		pcRef.current = pc;
+
+		const transceiver = pc.addTransceiver('video', {direction: 'recvonly'});
+		preferH264Codec(transceiver);
+
+		// Offerer-created data channel so the SDP includes m=application.
+		const dc = pc.createDataChannel('desktop-input', {ordered: true});
+		dcRef.current = dc;
+		dc.onclose = () => {
+			if (dcRef.current === dc) {
+				dcRef.current = null;
+			}
+		};
+		dc.onerror = (err) => console.error('guest data channel', err);
+
 		pc.onicecandidate = (e) => {
 			if (e.candidate) {
 				sendData({
@@ -335,20 +448,11 @@ function Guest() {
 			const state = pc.connectionState;
 			if (state === 'connected') {
 				setWebrtcState('connected');
+				sendData({act: 'DESKTOP_CONFIG', data: {transport: 'webrtc'}});
 			}
 			if (state === 'failed' || state === 'disconnected' || state === 'closed') {
 				stopWebRTC();
 			}
-		};
-		pc.ondatachannel = (e) => {
-			const dc = e.channel;
-			dcRef.current = dc;
-			dc.onclose = () => {
-				if (dcRef.current === dc) {
-					dcRef.current = null;
-				}
-			};
-			dc.onerror = (err) => console.error('guest data channel', err);
 		};
 		pc.ontrack = (e) => {
 			const target = videoRef.current;
@@ -356,11 +460,17 @@ function Guest() {
 			const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
 			if (target.srcObject !== stream) {
 				target.srcObject = stream;
+				const p = target.play?.();
+				if (p && typeof p.catch === 'function') {
+					p.catch(() => {});
+				}
 			}
 		};
-		pc.createOffer().then((offer) => {
-			pc.setLocalDescription(offer);
-			sendData({
+
+		try {
+			const offer = await pc.createOffer();
+			await pc.setLocalDescription(offer);
+			await sendData({
 				act: 'DESKTOP_WEBRTC_OFFER',
 				data: {
 					sdp: offer.sdp,
@@ -368,14 +478,15 @@ function Guest() {
 					role: 'guest'
 				}
 			});
-		}).catch((err) => {
+		} catch (err) {
 			console.error('guest offer failed', err);
 			stopWebRTC();
-		});
+		}
 	}
 
 	function stopWebRTC() {
 		setWebrtcState('off');
+		sendData({act: 'DESKTOP_CONFIG', data: {transport: 'tiles'}});
 		if (dcRef.current) {
 			try { dcRef.current.close(); } catch (_) {}
 		}

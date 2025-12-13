@@ -37,6 +37,8 @@ type session struct {
 	rtc              *rtcSession
 	// Per-session control flag (view-only support)
 	allowControl atomic.Bool
+	// When true, suppress WS tile frames for this session (WebRTC <video> active).
+	wsFramesSuppressed atomic.Bool
 
 	// Backpressure metrics (atomic for thread-safety)
 	framesDropped    atomic.Uint64 // Total frames dropped due to backpressure
@@ -779,140 +781,147 @@ func worker() {
 				prev = prevVal.(*image.RGBA)
 			}
 
-			// Delta detection with performance tracking
-			isKeyframe := prev == nil
-			diff := imageCompare(img, prev, compress)
+			// WS tile/canvas encoding is CPU-intensive; skip it when every active viewer has
+			// switched to WebRTC (<video>) and explicitly requested suppression.
+			if anySessionNeedsWSFrames() {
+				// Delta detection with performance tracking
+				isKeyframe := prev == nil
+				diff := imageCompare(img, prev, compress)
 
-			// Track metrics for performance monitoring
-			if prev == nil {
-				fullFrameCount++
-			} else if len(diff) == 0 {
-				identicalCount++
+				// Track metrics for performance monitoring
+				if prev == nil {
+					fullFrameCount++
+				} else if len(diff) == 0 {
+					identicalCount++
+				} else {
+					deltaFrameCount++
+					totalBlocksSent += uint64(len(diff))
+
+					// Estimate skipped blocks (for 1920x1080: ~20x12 = 240 blocks total)
+					bounds := img.Rect
+					totalBlocks := ((bounds.Dx() + blockSize - 1) / blockSize) * ((bounds.Dy() + blockSize - 1) / blockSize)
+					totalBlocksSkipped += uint64(totalBlocks - len(diff))
+				}
+
+				// Log performance metrics every 300 frames (~12 seconds at 24fps)
+				if frameCount%300 == 0 {
+					compressionRatio := float64(0)
+					if totalBlocksSent > 0 {
+						compressionRatio = float64(totalBlocksSkipped) / float64(totalBlocksSent+totalBlocksSkipped) * 100
+					}
+
+					// Calculate buffer pool efficiency
+					blockGets := poolStats.blockBufferGets.Load()
+					blockPuts := poolStats.blockBufferPuts.Load()
+					jpegGets := poolStats.jpegBufferGets.Load()
+					jpegPuts := poolStats.jpegBufferPuts.Load()
+					headerGets := poolStats.headerBufferGets.Load()
+					headerPuts := poolStats.headerBufferPuts.Load()
+
+					poolEfficiency := float64(0)
+					totalGets := blockGets + jpegGets + headerGets
+					totalPuts := blockPuts + jpegPuts + headerPuts
+					if totalGets > 0 {
+						poolEfficiency = float64(totalPuts) / float64(totalGets) * 100
+					}
+
+					// Get codec stats
+					codecStatsMap := GetCodecStats()
+
+					// Get chunking stats
+					totalChunks := chunkStats.totalChunks.Load()
+					totalChunkBlocks := chunkStats.totalBlocks.Load()
+					totalChunkBytes := chunkStats.totalBytes.Load()
+					multiChunkFrames := chunkStats.multiChunkFrames.Load()
+					maxChunks := chunkStats.maxChunksInFrame.Load()
+					chunkGets := poolStats.chunkBufferGets.Load()
+					chunkPuts := poolStats.chunkBufferPuts.Load()
+
+					avgChunkSize := uint64(0)
+					avgBlocksPerChunk := float64(0)
+					if totalChunks > 0 {
+						avgChunkSize = totalChunkBytes / totalChunks
+						avgBlocksPerChunk = float64(totalChunkBlocks) / float64(totalChunks)
+					}
+
+					// Get backpressure stats
+					totalDropped := backpressureStats.totalFramesDropped.Load()
+					totalDelivered := backpressureStats.totalFramesDelivered.Load()
+					sessionsWithDrops := backpressureStats.sessionsWithDrops.Load()
+					peakUtil := backpressureStats.peakUtilization.Load()
+
+					globalDeliveryRate := float64(100.0)
+					if totalDropped+totalDelivered > 0 {
+						globalDeliveryRate = float64(totalDelivered) / float64(totalDropped+totalDelivered) * 100
+					}
+
+					telemetry.LogStructured("INFO", "desktop: performance metrics", map[string]interface{}{
+						// Delta detection
+						"frames_total":      frameCount,
+						"frames_full":       fullFrameCount,
+						"frames_delta":      deltaFrameCount,
+						"frames_identical":  identicalCount,
+						"blocks_sent":       totalBlocksSent,
+						"blocks_skipped":    totalBlocksSkipped,
+						"compression_ratio": compressionRatio,
+
+						// Resolution tracking
+						"resolution_changes": resolutionChanges,
+						"current_width":      currentBounds.Dx(),
+						"current_height":     currentBounds.Dy(),
+
+						// Codec metrics
+						"codec_active":        codecStatsMap["active_codec"],
+						"codec_type":          codecStatsMap["codec_type"],
+						"codec_quality":       codecStatsMap["codec_quality"],
+						"codec_hardware":      codecStatsMap["hardware_accel"],
+						"codec_encode_count":  codecStatsMap["encode_count"],
+						"codec_encoded_bytes": codecStatsMap["encoded_bytes"],
+						"codec_errors":        codecStatsMap["encode_errors"],
+						"codec_switches":      codecStatsMap["codec_switches"],
+
+						// Chunking metrics
+						"chunk_total_chunks":        totalChunks,
+						"chunk_total_blocks":        totalChunkBlocks,
+						"chunk_total_bytes":         totalChunkBytes,
+						"chunk_multi_chunk_frames":  multiChunkFrames,
+						"chunk_max_chunks_in_frame": maxChunks,
+						"chunk_avg_size":            avgChunkSize,
+						"chunk_avg_blocks":          avgBlocksPerChunk,
+
+						// Backpressure metrics
+						"backpressure_frames_dropped":    totalDropped,
+						"backpressure_frames_delivered":  totalDelivered,
+						"backpressure_sessions_affected": sessionsWithDrops,
+						"backpressure_peak_utilization":  peakUtil,
+						"backpressure_delivery_rate":     globalDeliveryRate,
+
+						// Buffer pool metrics
+						"pool_block_gets":  blockGets,
+						"pool_block_puts":  blockPuts,
+						"pool_jpeg_gets":   jpegGets,
+						"pool_jpeg_puts":   jpegPuts,
+						"pool_header_gets": headerGets,
+						"pool_header_puts": headerPuts,
+						"pool_chunk_gets":  chunkGets,
+						"pool_chunk_puts":  chunkPuts,
+						"pool_efficiency":  poolEfficiency,
+
+						// Adaptive quality metrics
+						"aqm_jpeg_quality":   adaptiveQualityManager.GetCurrentJPEGQuality(),
+						"aqm_bitrate_bps":    adaptiveQualityManager.GetCurrentBitrate(),
+						"aqm_max_frame_size": adaptiveQualityManager.GetMaxFrameSize(),
+					})
+				}
+
+				if diff != nil && len(diff) > 0 {
+					// Store new frame atomically
+					prevDesktop.Store(img)
+					sendImageDiff(diff, isKeyframe)
+				}
 			} else {
-				deltaFrameCount++
-				totalBlocksSent += uint64(len(diff))
-
-				// Estimate skipped blocks (for 1920x1080: ~20x12 = 240 blocks total)
-				bounds := img.Rect
-				totalBlocks := ((bounds.Dx() + blockSize - 1) / blockSize) * ((bounds.Dy() + blockSize - 1) / blockSize)
-				totalBlocksSkipped += uint64(totalBlocks - len(diff))
-			}
-
-			// Log performance metrics every 300 frames (~12 seconds at 24fps)
-			if frameCount%300 == 0 {
-				compressionRatio := float64(0)
-				if totalBlocksSent > 0 {
-					compressionRatio = float64(totalBlocksSkipped) / float64(totalBlocksSent+totalBlocksSkipped) * 100
-				}
-
-				// Calculate buffer pool efficiency
-				blockGets := poolStats.blockBufferGets.Load()
-				blockPuts := poolStats.blockBufferPuts.Load()
-				jpegGets := poolStats.jpegBufferGets.Load()
-				jpegPuts := poolStats.jpegBufferPuts.Load()
-				headerGets := poolStats.headerBufferGets.Load()
-				headerPuts := poolStats.headerBufferPuts.Load()
-
-				poolEfficiency := float64(0)
-				totalGets := blockGets + jpegGets + headerGets
-				totalPuts := blockPuts + jpegPuts + headerPuts
-				if totalGets > 0 {
-					poolEfficiency = float64(totalPuts) / float64(totalGets) * 100
-				}
-
-				// Get codec stats
-				codecStatsMap := GetCodecStats()
-
-				// Get chunking stats
-				totalChunks := chunkStats.totalChunks.Load()
-				totalChunkBlocks := chunkStats.totalBlocks.Load()
-				totalChunkBytes := chunkStats.totalBytes.Load()
-				multiChunkFrames := chunkStats.multiChunkFrames.Load()
-				maxChunks := chunkStats.maxChunksInFrame.Load()
-				chunkGets := poolStats.chunkBufferGets.Load()
-				chunkPuts := poolStats.chunkBufferPuts.Load()
-
-				avgChunkSize := uint64(0)
-				avgBlocksPerChunk := float64(0)
-				if totalChunks > 0 {
-					avgChunkSize = totalChunkBytes / totalChunks
-					avgBlocksPerChunk = float64(totalChunkBlocks) / float64(totalChunks)
-				}
-
-				// Get backpressure stats
-				totalDropped := backpressureStats.totalFramesDropped.Load()
-				totalDelivered := backpressureStats.totalFramesDelivered.Load()
-				sessionsWithDrops := backpressureStats.sessionsWithDrops.Load()
-				peakUtil := backpressureStats.peakUtilization.Load()
-
-				globalDeliveryRate := float64(100.0)
-				if totalDropped+totalDelivered > 0 {
-					globalDeliveryRate = float64(totalDelivered) / float64(totalDropped+totalDelivered) * 100
-				}
-
-				telemetry.LogStructured("INFO", "desktop: performance metrics", map[string]interface{}{
-					// Delta detection
-					"frames_total":      frameCount,
-					"frames_full":       fullFrameCount,
-					"frames_delta":      deltaFrameCount,
-					"frames_identical":  identicalCount,
-					"blocks_sent":       totalBlocksSent,
-					"blocks_skipped":    totalBlocksSkipped,
-					"compression_ratio": compressionRatio,
-
-					// Resolution tracking
-					"resolution_changes": resolutionChanges,
-					"current_width":      currentBounds.Dx(),
-					"current_height":     currentBounds.Dy(),
-
-					// Codec metrics
-					"codec_active":        codecStatsMap["active_codec"],
-					"codec_type":          codecStatsMap["codec_type"],
-					"codec_quality":       codecStatsMap["codec_quality"],
-					"codec_hardware":      codecStatsMap["hardware_accel"],
-					"codec_encode_count":  codecStatsMap["encode_count"],
-					"codec_encoded_bytes": codecStatsMap["encoded_bytes"],
-					"codec_errors":        codecStatsMap["encode_errors"],
-					"codec_switches":      codecStatsMap["codec_switches"],
-
-					// Chunking metrics
-					"chunk_total_chunks":        totalChunks,
-					"chunk_total_blocks":        totalChunkBlocks,
-					"chunk_total_bytes":         totalChunkBytes,
-					"chunk_multi_chunk_frames":  multiChunkFrames,
-					"chunk_max_chunks_in_frame": maxChunks,
-					"chunk_avg_size":            avgChunkSize,
-					"chunk_avg_blocks":          avgBlocksPerChunk,
-
-					// Backpressure metrics
-					"backpressure_frames_dropped":    totalDropped,
-					"backpressure_frames_delivered":  totalDelivered,
-					"backpressure_sessions_affected": sessionsWithDrops,
-					"backpressure_peak_utilization":  peakUtil,
-					"backpressure_delivery_rate":     globalDeliveryRate,
-
-					// Buffer pool metrics
-					"pool_block_gets":  blockGets,
-					"pool_block_puts":  blockPuts,
-					"pool_jpeg_gets":   jpegGets,
-					"pool_jpeg_puts":   jpegPuts,
-					"pool_header_gets": headerGets,
-					"pool_header_puts": headerPuts,
-					"pool_chunk_gets":  chunkGets,
-					"pool_chunk_puts":  chunkPuts,
-					"pool_efficiency":  poolEfficiency,
-
-					// Adaptive quality metrics
-					"aqm_jpeg_quality":   adaptiveQualityManager.GetCurrentJPEGQuality(),
-					"aqm_bitrate_bps":    adaptiveQualityManager.GetCurrentBitrate(),
-					"aqm_max_frame_size": adaptiveQualityManager.GetMaxFrameSize(),
-				})
-			}
-
-			if diff != nil && len(diff) > 0 {
-				// Store new frame atomically
-				prevDesktop.Store(img)
-				sendImageDiff(diff, isKeyframe)
+				// If the WS tile pipeline gets re-enabled later, force a full resync.
+				prevDesktop.Store((*image.RGBA)(nil))
 			}
 
 			// Publish GPU-backed frames to hardware encoder listeners.
@@ -1328,16 +1337,19 @@ func packFrameIntoChunks(rawEvent []byte, frameSeq uint32, blocks *[]*[]byte, ke
 		})
 
 		batch := make([]*[]byte, 0, 64)
-		batchBytes := int64(headerSize)
+		batchTotalBytes := int64(0)            // Bytes of finalized WS chunks in this batch
+		currentChunkBytes := int64(headerSize) // Bytes in the in-progress WS chunk
 
 		flush := func() {
 			if len(batch) == 0 {
 				return
 			}
 			// Each batch is sent as its own frame (opFirstFrame/opRestFrame sequence).
-			packFrameIntoChunks(rawEvent, frameSeq, &batch, false)
+			// Preserve keyframe semantics so split keyframes are never partially dropped.
+			packFrameIntoChunks(rawEvent, frameSeq, &batch, keyframe)
 			batch = make([]*[]byte, 0, 64)
-			batchBytes = int64(headerSize)
+			batchTotalBytes = 0
+			currentChunkBytes = int64(headerSize)
 		}
 
 		for _, blockPtr := range *blocks {
@@ -1345,12 +1357,32 @@ func packFrameIntoChunks(rawEvent []byte, frameSeq uint32, blocks *[]*[]byte, ke
 				continue
 			}
 			blockLen := int64(len(*blockPtr))
-			if len(batch) > 0 && batchBytes+blockLen > targetFrameBytes {
+			if blockLen <= 0 {
+				continue
+			}
+
+			// Estimate the total bytes if we add this block, including WS chunk headers.
+			nextTotal := batchTotalBytes
+			nextChunk := currentChunkBytes
+			if nextChunk+blockLen >= int64(maxChunkSize) && nextChunk > int64(headerSize) {
+				nextTotal += nextChunk
+				nextChunk = int64(headerSize)
+			}
+			nextChunk += blockLen
+			nextFrameBytes := nextTotal + nextChunk
+
+			// Always add at least one block per batch; otherwise, flush once we exceed the target.
+			if len(batch) > 0 && nextFrameBytes > targetFrameBytes {
 				flush()
 			}
-			// Always add at least one block per batch.
+
+			// Maintain a running estimate of chunk boundaries to keep batches <= targetFrameBytes.
+			if currentChunkBytes+blockLen >= int64(maxChunkSize) && currentChunkBytes > int64(headerSize) {
+				batchTotalBytes += currentChunkBytes
+				currentChunkBytes = int64(headerSize)
+			}
 			batch = append(batch, blockPtr)
-			batchBytes += blockLen
+			currentChunkBytes += blockLen
 		}
 		flush()
 		return
@@ -1555,6 +1587,21 @@ func broadcastResolutionChange(newBounds image.Rectangle) {
 	})
 }
 
+func anySessionNeedsWSFrames() bool {
+	needed := false
+	sessions.IterCb(func(_ string, desktop *session) bool {
+		if desktop == nil || desktop.escape.Load() {
+			return true
+		}
+		if desktop.wsFramesSuppressed.Load() {
+			return true
+		}
+		needed = true
+		return false
+	})
+	return needed
+}
+
 // sendImageDiff delivers frame data to all active sessions with backpressure management.
 //
 // Backpressure strategy (per-session):
@@ -1585,6 +1632,12 @@ func sendImageDiff(diff []*[]byte, keyframe bool) {
 		defer desktop.lock.Unlock()
 
 		if desktop.channel == nil {
+			return true
+		}
+
+		// When WebRTC is active, the browser can ask us to suppress WS tile frames
+		// (keeps WS for signaling/control acks, but removes heavy canvas traffic).
+		if desktop.wsFramesSuppressed.Load() {
 			return true
 		}
 
@@ -1874,10 +1927,10 @@ func imageCompare(img, prev *image.RGBA, compress int) []*[]byte {
 			rect.Max.Y+originY,
 		)
 
-		block := getImageBlock(img, srcRect, compress)
+		block, blockCodecType := getImageBlock(img, srcRect)
 		// makeImageBlock receives the 0-based rect for browser canvas coordinates
 		// (browser canvas always starts at 0,0)
-		block = makeImageBlock(block, rect, compress)
+		block = makeImageBlock(block, rect, blockCodecType)
 		result = append(result, &block)
 	}
 
@@ -1933,8 +1986,8 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 			normalizedY := y - originY
 			dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
 
-			block := getImageBlock(img, srcRect, compress)
-			block = makeImageBlock(block, dstRect, compress) // Use normalized coords for header
+			block, blockCodecType := getImageBlock(img, srcRect)
+			block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
 			result = append(result, &block)
 		}
 	}
@@ -1959,7 +2012,7 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 // - Reuses buffers from sync.Pool (zero allocations after warmup)
 // - Copies data row-by-row to handle non-standard strides
 // - Uses codec interface for flexible encoding
-func getImageBlock(img *image.RGBA, rect image.Rectangle, codecType int) []byte {
+func getImageBlock(img *image.RGBA, rect image.Rectangle) ([]byte, int) {
 	width := rect.Dx()
 	height := rect.Dy()
 	blockBytes := width * height * 4
@@ -2005,13 +2058,13 @@ func getImageBlock(img *image.RGBA, rect image.Rectangle, codecType int) []byte 
 			"height": height,
 		})
 
-		// Fallback to raw RGBA on error
+		// Fallback to raw RGBA on error (ensure header advertises raw so the browser decodes correctly).
 		result := make([]byte, blockBytes)
 		copy(result, buf)
-		return result
+		return result, CodecTypeRaw
 	}
 
-	return encoded
+	return encoded, codec.Type()
 }
 
 // makeImageBlock prepends block metadata header to image data.
@@ -2032,13 +2085,9 @@ func makeImageBlock(block []byte, rect image.Rectangle, codecType int) []byte {
 	headerPtr := headerBufferPool.Get().(*[]byte)
 	header := *headerPtr
 
-	// Get active codec type (may differ from compress parameter for backwards compat)
-	codec := GetCodec()
-	actualCodecType := codec.Type()
-
-	// Build header with actual codec type
+	// Build header with per-block codec type (critical when falling back to raw on encode errors).
 	binary.BigEndian.PutUint16(header[0:2], uint16(len(block)+10))
-	binary.BigEndian.PutUint16(header[2:4], uint16(actualCodecType))
+	binary.BigEndian.PutUint16(header[2:4], uint16(codecType))
 	binary.BigEndian.PutUint16(header[4:6], uint16(rect.Min.X))
 	binary.BigEndian.PutUint16(header[6:8], uint16(rect.Min.Y))
 	binary.BigEndian.PutUint16(header[8:10], uint16(rect.Size().X))
@@ -2261,7 +2310,12 @@ func InitDesktop(pack modules.Packet) error {
 		lock:        &sync.Mutex{},
 		metricsStop: make(chan struct{}),
 	}
-	desktop.allowControl.Store(true)
+	// Default to allowControl=true for legacy servers, but honor explicit policy from the server.
+	allowControl := true
+	if allowVal, ok := pack.GetData(`allowControl`, reflect.Bool); ok {
+		allowControl = allowVal.(bool)
+	}
+	desktop.allowControl.Store(allowControl)
 	atomic.StoreInt64(&desktop.lastPack, utils.Unix)
 
 	// FIXED: Get and store display bounds atomically (Issue #3)
@@ -2317,51 +2371,39 @@ func InitDesktop(pack modules.Packet) error {
 		"event":        pack.Event,
 	})
 
-	// Add session to map BEFORE starting goroutines to avoid race conditions
+	// CRITICAL: Queue resolution BEFORE exposing the session to the capture worker.
+	// The capture worker can enqueue delta frames at any time; if those hit the channel
+	// before a resolution packet, the browser will buffer/flush frames and may show
+	// progressive/blocked rendering at startup. Enqueueing the resolution first ensures
+	// the browser sizes its canvas deterministically before any tiles arrive.
+	select {
+	case desktop.channel <- message{t: 2}:
+	default:
+		// Should never happen for a new session (buffer=5), but keep non-blocking semantics.
+	}
+
+	// Queue an initial keyframe BEFORE the session is visible to the capture worker.
+	// This guarantees the first paint is a full sync frame, and deltas only apply after.
+	if prevVal := prevDesktop.Load(); prevVal != nil {
+		prev := prevVal.(*image.RGBA)
+		img := splitFullImage(prev, compress)
+		if img != nil {
+			initialFrameSeq := globalFrameSeq.Add(1)
+			select {
+			case desktop.channel <- message{t: 0, frame: &img, keyframe: true, frameSeq: initialFrameSeq}:
+			default:
+				// Should never happen for a new session; don't block init.
+			}
+		}
+	}
+
+	// Now expose the session to other goroutines (capture worker, cursor updates, etc.).
 	sessions.Set(uuid, desktop)
 	desktop.startMetricsReporter(uuid)
 	startSessionMetricsReporter(uuid, desktop)
 
 	// Start capture worker (worker guards itself with CAS to avoid duplicates)
 	startCaptureWorker()
-
-	// CRITICAL: Send resolution message FIRST, before any frame data.
-	// This ensures browser canvas is sized correctly before blocks are rendered.
-	// Without this, blocks may render on wrong-sized canvas causing partial display.
-	desktop.lock.Lock()
-	select {
-	case desktop.channel <- message{t: 2}:
-	default:
-		// Channel full, skip resolution (will be sent later)
-	}
-	desktop.lock.Unlock()
-
-	// Send initial frame if worker is already running (AFTER resolution)
-	if atomic.LoadInt32(&working) == 1 {
-		prevVal := prevDesktop.Load()
-		if prevVal != nil {
-			prev := prevVal.(*image.RGBA)
-			img := splitFullImage(prev, compress)
-			if img != nil {
-				desktop.lock.Lock()
-				select {
-				case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
-				default:
-					// Channel full: drop oldest queued message and retry once.
-					select {
-					case <-desktop.channel:
-					default:
-					}
-					select {
-					case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
-					default:
-						// Still full, skip initial frame
-					}
-				}
-				desktop.lock.Unlock()
-			}
-		}
-	}
 
 	// Start cursor capture loop (Windows only)
 	// Fixed: Re-enabled with proper thread handling (see cursor_windows.go)
@@ -2480,12 +2522,13 @@ func GetDesktop(pack modules.Packet) {
 		return
 	}
 
+	shotFrameSeq := globalFrameSeq.Add(1)
 	desktop.lock.Lock()
 	defer desktop.lock.Unlock()
 
 	if desktop.channel != nil {
 		select {
-		case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+		case desktop.channel <- message{t: 0, frame: &img, keyframe: true, frameSeq: shotFrameSeq}:
 			telemetry.LogStructured("DEBUG", "GetDesktop: full frame sent", map[string]interface{}{
 				"uuid":   uuid,
 				"blocks": len(img),
@@ -2497,7 +2540,7 @@ func GetDesktop(pack modules.Packet) {
 			default:
 			}
 			select {
-			case desktop.channel <- message{t: 0, frame: &img, keyframe: true}:
+			case desktop.channel <- message{t: 0, frame: &img, keyframe: true, frameSeq: shotFrameSeq}:
 				telemetry.LogStructured("DEBUG", "GetDesktop: full frame sent after drop", map[string]interface{}{
 					"uuid":   uuid,
 					"blocks": len(img),

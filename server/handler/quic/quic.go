@@ -13,6 +13,7 @@ import (
 	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -52,6 +53,7 @@ type QUICSession struct {
 	Stream      *quic.Stream
 	LastSeen    time.Time
 	RateLimiter *rate.Limiter // Per-UUID rate limiter
+	writeMu     sync.Mutex    // Serializes writes to Stream (framed protocol)
 	mu          sync.RWMutex
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -88,6 +90,20 @@ func init() {
 func NewQUICServer(addr string, tlsConfig *tls.Config) (*QUICServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	if tlsConfig == nil {
+		cancel()
+		return nil, errors.New("tls config is required for QUIC")
+	}
+
+	// Clone and harden TLS config for QUIC:
+	// - QUIC requires TLS 1.3
+	// - Ensure ALPN contains our protocol and common HTTP/3 tokens
+	clonedTLS := tlsConfig.Clone()
+	if clonedTLS.MinVersion < tls.VersionTLS13 {
+		clonedTLS.MinVersion = tls.VersionTLS13
+	}
+	clonedTLS.NextProtos = appendUniqueStrings(clonedTLS.NextProtos, "rocket-quic", "h3", "h3-29", "h3-28", "h3-27")
+
 	// Generate server HMAC key material for handshake authentication
 	hmacKey := make([]byte, 32)
 	if _, err := io.ReadFull(cryptoRand.Reader, hmacKey); err != nil {
@@ -97,7 +113,7 @@ func NewQUICServer(addr string, tlsConfig *tls.Config) (*QUICServer, error) {
 
 	server := &QUICServer{
 		addr:      addr,
-		tlsConfig: tlsConfig,
+		tlsConfig: clonedTLS,
 		sessions:  cmap.New[*QUICSession](),
 		hmacKey:   hmacKey,
 		ctx:       ctx,
@@ -244,19 +260,18 @@ func (s *QUICServer) handleConnection(conn *quic.Conn) {
 
 // handshake performs QUIC handshake
 func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *quic.Stream) (*QUICSession, error) {
-	// Read handshake message with timeout
+	// Read handshake frame with timeout (QUIC streams are byte streams; we must frame messages)
 	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	defer stream.SetReadDeadline(time.Time{})
 
-	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
+	payload, err := readQUICFrame(stream, 4096)
 	if err != nil {
 		return nil, fmt.Errorf("read handshake failed: %w", err)
 	}
 
 	// Parse handshake
 	var handshake map[string]string
-	if err := json.Unmarshal(buf[:n], &handshake); err != nil {
+	if err := json.Unmarshal(payload, &handshake); err != nil {
 		return nil, fmt.Errorf("parse handshake failed: %w", err)
 	}
 
@@ -326,7 +341,7 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 	stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	defer stream.SetWriteDeadline(time.Time{})
 
-	if _, err := stream.Write(respData); err != nil {
+	if err := writeQUICFrame(stream, respData); err != nil {
 		cancel()
 		return nil, fmt.Errorf("write response failed: %w", err)
 	}
@@ -336,8 +351,6 @@ func (s *QUICServer) handshake(ctx context.Context, conn *quic.Conn, stream *qui
 
 // handleSession handles messages for a QUIC session
 func (s *QUICServer) handleSession(session *QUICSession) {
-	buf := make([]byte, maxMessageSize)
-
 	for {
 		select {
 		case <-session.ctx.Done():
@@ -345,9 +358,9 @@ func (s *QUICServer) handleSession(session *QUICSession) {
 		default:
 		}
 
-		// Read message with timeout
+		// Read next framed message with timeout
 		session.Stream.SetReadDeadline(time.Now().Add(defaultReadTimeout))
-		n, err := session.Stream.Read(buf)
+		payload, err := readQUICFrame(session.Stream, maxMessageSize)
 		session.Stream.SetReadDeadline(time.Time{})
 
 		if err != nil {
@@ -355,19 +368,6 @@ func (s *QUICServer) handleSession(session *QUICSession) {
 				return
 			}
 			common.Warn(nil, "QUIC_READ_ERROR", session.UUID, err.Error(), nil)
-			return
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		// Enforce per-message size guard (prevent oversized messages before decrypt)
-		if n > maxMessageSize {
-			common.Warn(nil, "QUIC_MESSAGE_TOO_LARGE", session.UUID, "", map[string]any{
-				"message_size": n,
-				"max_size":     maxMessageSize,
-			})
 			return
 		}
 
@@ -387,7 +387,7 @@ func (s *QUICServer) handleSession(session *QUICSession) {
 
 		// Unmarshal packet
 		var packet modules.Packet
-		if err := json.Unmarshal(buf[:n], &packet); err != nil {
+		if err := json.Unmarshal(payload, &packet); err != nil {
 			common.Warn(nil, "QUIC_UNMARSHAL_ERROR", session.UUID, err.Error(), nil)
 			continue
 		}
@@ -480,11 +480,14 @@ func (s *QUICServer) SendToQUICClient(uuid string, packet *modules.Packet) bool 
 		return false
 	}
 
-	// Write to stream with timeout
+	// Write framed message to stream with timeout (serialize writes)
+	session.writeMu.Lock()
+	defer session.writeMu.Unlock()
+
 	session.Stream.SetWriteDeadline(time.Now().Add(defaultWriteTimeout))
 	defer session.Stream.SetWriteDeadline(time.Time{})
 
-	if _, err := session.Stream.Write(data); err != nil {
+	if err := writeQUICFrame(session.Stream, data); err != nil {
 		common.Warn(nil, "QUIC_WRITE_ERROR", uuid, err.Error(), nil)
 		return false
 	}
@@ -548,6 +551,58 @@ func SendPacketToQUIC(uuid string, packet *modules.Packet) bool {
 		return quicServer.SendToQUICClient(uuid, packet)
 	}
 	return false
+}
+
+func appendUniqueStrings(existing []string, values ...string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(values))
+	for _, v := range existing {
+		seen[v] = struct{}{}
+	}
+	out := append([]string(nil), existing...)
+	for _, v := range values {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func readQUICFrame(r io.Reader, maxSize int) ([]byte, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n == 0 || n > uint32(maxSize) {
+		return nil, fmt.Errorf("invalid frame size: %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func writeQUICFrame(w io.Writer, payload []byte) error {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(payload)))
+	if err := writeAll(w, lenBuf[:]); err != nil {
+		return err
+	}
+	return writeAll(w, payload)
+}
+
+func writeAll(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
 }
 
 // validateCredentials verifies UUID/Key (encryption removed, TLS provides security)
