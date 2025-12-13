@@ -113,10 +113,18 @@ func pingDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 	if desktop.IsSession0Mode() {
 		sessionID := desktop.GetActiveSessionID()
 		if sessionID == 0 {
-			return
+			sessionID = waitForActiveSessionID()
+			if sessionID == 0 {
+				return
+			}
 		}
 		relay := desktop.GetOrCreateRelay(sessionID)
-		relay.SendPing(pack)
+		if err := relay.SendPing(pack); err != nil {
+			desktop.EnsureBridge(sessionID, "relay_ping_send_failed")
+			if relay2, _, connErr := connectRelayWithRetry(sessionID, desktopRelayControlConnectTimeout); connErr == nil {
+				_ = relay2.SendPing(pack)
+			}
+		}
 		return
 	}
 	desktop.PingDesktop(pack)
@@ -130,7 +138,12 @@ func killDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 			return
 		}
 		relay := desktop.GetOrCreateRelay(sessionID)
-		relay.SendKill(pack)
+		if err := relay.SendKill(pack); err != nil {
+			desktop.EnsureBridge(sessionID, "relay_kill_send_failed")
+			if relay2, _, connErr := connectRelayWithRetry(sessionID, desktopRelayControlConnectTimeout); connErr == nil {
+				_ = relay2.SendKill(pack)
+			}
+		}
 		return
 	}
 	desktop.KillDesktop(pack)
@@ -144,7 +157,12 @@ func getDesktopWithRelay(pack modules.Packet, wsConn *common.Conn) {
 			return
 		}
 		relay := desktop.GetOrCreateRelay(sessionID)
-		relay.SendShot(pack)
+		if err := relay.SendShot(pack); err != nil {
+			desktop.EnsureBridge(sessionID, "relay_shot_send_failed")
+			if relay2, _, connErr := connectRelayWithRetry(sessionID, desktopRelayControlConnectTimeout); connErr == nil {
+				_ = relay2.SendShot(pack)
+			}
+		}
 		return
 	}
 	desktop.GetDesktop(pack)
