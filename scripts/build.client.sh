@@ -31,7 +31,9 @@ build_linux() {
   export GOARCH=386
   export CGO_ENABLED=0
   unset CC CXX
-  go build -ldflags "-s -w -X 'Rocket/client/config.Commit=$COMMIT'" -o "${OUT_DIR}/linux_i386" Rocket/client
+  go build -ldflags "-s -w -X 'Rocket/client/config.Commit=$COMMIT'" -o "${OUT_DIR}/linux_386" Rocket/client
+  # Backward-compatible alias (some tooling refers to i386)
+  cp -f "${OUT_DIR}/linux_386" "${OUT_DIR}/linux_i386"
 
   export GOARCH=arm64
   export CGO_ENABLED="${CGO_ENABLED_CROSS}"
@@ -62,7 +64,7 @@ build_windows() {
     export CC=i686-w64-mingw32-gcc
     export CXX=i686-w64-mingw32-g++
   fi
-  go build -ldflags "-s -w -H=windowsgui -X 'Rocket/client/config.Commit=$COMMIT'" -o "${OUT_DIR}/windows_i386.exe" Rocket/client
+  go build -ldflags "-s -w -H=windowsgui -X 'Rocket/client/config.Commit=$COMMIT'" -o "${OUT_DIR}/windows_386.exe" Rocket/client
 
   export GOARCH=amd64
   export CGO_ENABLED="${CGO_ENABLED_CROSS}"
@@ -81,9 +83,13 @@ build_windows() {
   go build -ldflags "-s -w -H=windowsgui -X 'Rocket/client/config.Commit=$COMMIT'" -o "${OUT_DIR}/windows_arm64.exe" Rocket/client
 
   # Server looks for binaries without .exe extension.
-  cp -f "${OUT_DIR}/windows_i386.exe" "${OUT_DIR}/windows_i386"
+  cp -f "${OUT_DIR}/windows_386.exe" "${OUT_DIR}/windows_386"
   cp -f "${OUT_DIR}/windows_amd64.exe" "${OUT_DIR}/windows_amd64"
   cp -f "${OUT_DIR}/windows_arm64.exe" "${OUT_DIR}/windows_arm64"
+
+  # Backward-compatible aliases (some tooling refers to i386)
+  cp -f "${OUT_DIR}/windows_386.exe" "${OUT_DIR}/windows_i386.exe"
+  cp -f "${OUT_DIR}/windows_386" "${OUT_DIR}/windows_i386"
 }
 
 build_linux

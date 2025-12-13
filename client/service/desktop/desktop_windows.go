@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/kbinani/screenshot"
 	"github.com/kirides/go-d3d"
 	"github.com/kirides/go-d3d/d3d11"
 	"github.com/kirides/go-d3d/dxgi"
@@ -192,6 +193,32 @@ type ScreenGDI struct {
 	hmem           winGDI.HGLOBAL
 	memptr         unsafe.Pointer
 }
+
+// ScreenScreenshot is a last-resort fallback that uses github.com/kbinani/screenshot
+// to capture pixels when all Windows-specific backends fail to initialize.
+//
+// This is slower than DXGI, but prevents "0 FPS / black screen" regressions when
+// the bridge is running in a constrained session environment.
+type ScreenScreenshot struct {
+	rect         image.Rectangle
+	displayIndex uint
+}
+
+func (s *ScreenScreenshot) Init(displayIndex uint, rect image.Rectangle) error {
+	s.displayIndex = displayIndex
+	s.rect = rect
+	return nil
+}
+
+func (s *ScreenScreenshot) Capture() (*CaptureFrame, error) {
+	img, err := screenshot.CaptureRect(s.rect)
+	if err != nil {
+		return nil, err
+	}
+	return &CaptureFrame{Image: img}, nil
+}
+
+func (s *ScreenScreenshot) Release() {}
 
 type dxgiAdapterDesc1 struct {
 	Description           [128]uint16
@@ -559,6 +586,9 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 		}
 	}()
 
+	// Reset active backend state for this initialization attempt.
+	setActiveCaptureBackend("unknown")
+
 	desired := getConfiguredCaptureBackend()
 	order := backendPreferenceOrder(desired)
 	var (
@@ -656,6 +686,21 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 		}
 	}
 
+	// Last-resort fallback: use screenshot library if all optimized backends fail.
+	if !initSuccess {
+		ss := &ScreenScreenshot{}
+		if err := ss.Init(displayIndex, rect); err == nil {
+			s.screen = ss
+			setActiveCaptureBackend("screenshot")
+			initSuccess = true
+			telemetry.LogStructured("WARN", "Falling back to screenshot capture backend", map[string]interface{}{
+				"display":           displayIndex,
+				"rect":              rect.String(),
+				"requested_backend": captureBackendName(desired),
+			})
+		}
+	}
+
 	if initSuccess && s.screen != nil {
 		testStart := time.Now()
 		testFrame, testErr := s.screen.Capture()
@@ -687,6 +732,17 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 }
 
 func (s *Screen) Capture() (*CaptureFrame, error) {
+	if s.screen == nil {
+		captureCount.Add(1)
+		captureErrors.Add(1)
+		if captureErrors.Load()%10 == 1 {
+			telemetry.LogStructured("ERROR", "Capture called with no initialized backend", map[string]interface{}{
+				"backend": getActiveCaptureBackend(),
+			})
+		}
+		return nil, errors.New("capture backend not initialized")
+	}
+
 	start := time.Now()
 	frame, err := s.screen.Capture()
 	latency := time.Since(start)

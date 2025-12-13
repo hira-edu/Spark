@@ -23,6 +23,7 @@ type Relay struct {
 	state     relayState
 	backoff   time.Duration
 	nextRetry time.Time
+	lastErr   error
 	mu        sync.Mutex
 }
 
@@ -344,19 +345,25 @@ func (r *Relay) ensureConnectedLocked() error {
 		r.state = relayStateActive
 		r.backoff = 0
 		r.nextRetry = time.Time{}
+		r.lastErr = nil
 		return nil
 	}
 
 	now := time.Now()
 	if !r.nextRetry.IsZero() && now.Before(r.nextRetry) {
+		if r.lastErr != nil {
+			return r.lastErr
+		}
 		return fmt.Errorf("backing off until %s", r.nextRetry.Format(time.RFC3339Nano))
 	}
 
 	r.state = relayStateConnecting
 	client := ipc.NewClient(r.sessionID, r.handleMessage)
 	if err := client.Connect(); err != nil {
+		r.lastErr = err
 		r.state = relayStateDegraded
 		r.scheduleRetryLocked()
+		EnsureBridge(r.sessionID, "relay_connect_failed")
 		telemetry.LogStructured("WARN", "Desktop relay connect failed", map[string]interface{}{
 			"session_id": r.sessionID,
 			"pipe":       ipc.GetPipeName(r.sessionID),
@@ -373,6 +380,7 @@ func (r *Relay) ensureConnectedLocked() error {
 	r.state = relayStateActive
 	r.backoff = minRelayBackoff
 	r.nextRetry = time.Time{}
+	r.lastErr = nil
 
 	telemetry.LogStructured("INFO", "Desktop relay connected", map[string]interface{}{
 		"session_id": r.sessionID,

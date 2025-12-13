@@ -373,9 +373,14 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			// Binary protocol header is 24 bytes: magic(4) + service(1) + op(1) + event(16) + length(2)
 			data = data[24:]
 			data = utility.SimpleDecrypt(data, device)
-			if utils.JSON.Unmarshal(data, &pack) != nil {
+			// IMPORTANT: pack currently holds RAW_DATA_ARRIVE with pack.Data["data"] pointing to the
+			// binary buffer. If we unmarshal into that same struct, encoding/json will merge into the
+			// existing non-nil map and leak the raw bytes into forwarded control packets.
+			var inner modules.Packet
+			if utils.JSON.Unmarshal(data, &inner) != nil {
 				return
 			}
+			pack = inner
 		}
 
 		switch pack.Act {
