@@ -132,8 +132,8 @@ func UpdateRTT(rttMs int64) {
 }
 
 func clampFPSValue(fps int32) int32 {
-	if fps < 15 {
-		return 15 // Minimum 15 FPS for usable experience
+	if fps < 5 {
+		return 5
 	}
 	if fps > 60 {
 		return 60

@@ -1167,6 +1167,8 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 				}
 			}
 			sendGuestPack(modules.Packet{Act: `DESKTOP_PONG`, Code: pack.Code, Data: payload}, guest.srcConn)
+		case `DESKTOP_CONFIG_ACK`:
+			sendGuestPack(modules.Packet{Act: `DESKTOP_CONFIG_ACK`, Code: pack.Code, Data: pack.Data, Msg: pack.Msg}, guest.srcConn)
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
 			if pack.Code != 0 {
 				sendGuestPack(pack, guest.srcConn)

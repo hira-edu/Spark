@@ -94,6 +94,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Ensure WS messages are processed in arrival order even when `Blob.arrayBuffer()`
   // introduces async gaps that can otherwise interleave frame chunks.
   const messageQueueRef = useRef(Promise.resolve());
+  // Latest connect routine (used by reconnect timer without capturing stale closures).
+  const connectInternalRef = useRef(null);
   const ctxRef = useRef(null);
   const mountedRef = useRef(true); // Track component mount state for async safety
   const blockStatsRef = useRef({ rendered: 0, failed: 0, skipped: 0, stale: 0 }); // Track async block outcomes
@@ -133,6 +135,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     seenKeys: new Set(),
   });
   const tickerRef = useRef(null);
+  const lastQuitNoticeRef = useRef({ at: 0, msg: '' });
   const pingTimersRef = useRef({ server: 0, device: 0 }); // Track server vs device RTT
   const controlChannelRef = useRef(controlChannel);
   const onJSONMessageRef = useRef(onJSONMessage);
@@ -747,10 +750,57 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       return;
     }
 
+    // Device acknowledged config changes (fps/quality/monitor/codec/etc.)
+    if (data?.act === 'DESKTOP_CONFIG_ACK') {
+      const ack = data.data || {};
+      log('info', 'DESKTOP_CONFIG_ACK received', ack);
+
+      // Keep monitor list in sync (useful after hotplug / monitor switch).
+      if (Array.isArray(ack.monitors)) {
+        setMonitors(ack.monitors);
+      }
+
+      // Some devices include bounds in the ACK; treat it as a resolution hint.
+      const width = Number(ack.width || 0);
+      const height = Number(ack.height || 0);
+      if (width > 0 && height > 0) {
+        const canvas = canvasRef.current;
+        const ctx = ctxRef.current;
+        const wasResized = canvas && (canvas.width !== width || canvas.height !== height);
+        const isFirstResolution = !hasResolutionRef.current;
+
+        if (canvas && ctx && wasResized) {
+          canvas.width = width;
+          canvas.height = height;
+          ctx.imageSmoothingEnabled = false;
+          blockVersionRef.current.clear();
+          log('info', 'canvas resized from DESKTOP_CONFIG_ACK', { width, height });
+        }
+
+        if (isFirstResolution || wasResized) {
+          hasResolutionRef.current = true;
+          setResolution({ width, height });
+          scheduleShotIfStalled('config_ack', 800);
+          flushPendingFrames();
+        }
+      }
+      return;
+    }
+
     // Server/device terminated session
     if (data?.act === 'QUIT') {
-      message.warning(data.msg ? translate(data.msg) : i18n.t('DESKTOP.SESSION_CLOSED'));
-      cleanup();
+      const msg = data.msg ? translate(data.msg) : i18n.t('DESKTOP.SESSION_CLOSED');
+      const now = Date.now();
+      const last = lastQuitNoticeRef.current || { at: 0, msg: '' };
+      // Avoid toast spam if the session repeatedly closes/reconnects in a short window.
+      if (!(last.msg === msg && now - last.at < 3000)) {
+        message.warning(msg);
+        lastQuitNoticeRef.current = { at: now, msg };
+      }
+
+      // Treat explicit QUIT as terminal until the user clicks reconnect.
+      shouldReconnectRef.current = false;
+      cleanup(true);
       setStatus('disconnected');
       return;
     }
@@ -1122,9 +1172,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     setStatus('reconnecting');
     reconnectTimeoutRef.current = setTimeout(() => {
       log('info', 'Attempting reconnect', { attempt: reconnectAttemptRef.current });
-      connectInternal();
+      if (!shouldReconnectRef.current) return;
+      if (typeof connectInternalRef.current === 'function') {
+        connectInternalRef.current();
+      }
     }, delay);
-  }, []);
+  }, [log]);
 
   // Internal connect function (used for initial connect and reconnects)
   const connectInternal = useCallback(() => {
@@ -1315,7 +1368,10 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         }
       }
     }, 1000);
-  }, [device, shareToken, shareSecret, canvasRef, initCanvas, parseMessage, sendControl, sendSignal, cleanup, scheduleReconnect, requestFullFrame]);
+  }, [deviceId, shareToken, shareSecret, canvasRef, initCanvas, parseMessage, sendSignal, cleanup, scheduleReconnect, scheduleShotIfStalled]);
+
+  // Keep latest connect routine in a ref so timers don't capture stale closures.
+  connectInternalRef.current = connectInternal;
 
   // Public connect function
   const connect = useCallback(() => {

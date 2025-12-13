@@ -472,6 +472,10 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 
 			common.Info(nil, `[SERVER_DESKTOP_STATS]`, ``, `Desktop session metrics snapshot received`, payload)
 			sendPack(modules.Packet{Act: `DESKTOP_STATS`, Code: 0, Data: payload}, desktop.srcConn)
+		case `DESKTOP_CONFIG_ACK`:
+			// Forward config acknowledgements so the browser can reflect applied values
+			// (e.g., FPS clamping, monitor bounds, codec fallbacks).
+			sendPack(modules.Packet{Act: `DESKTOP_CONFIG_ACK`, Code: pack.Code, Data: pack.Data, Msg: pack.Msg}, desktop.srcConn)
 		case `DESKTOP_INPUT`:
 			if pack.Code != 0 {
 				sendPack(pack, desktop.srcConn)
