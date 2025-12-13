@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -250,10 +251,17 @@ func connectWS() (*common.Conn, error) {
 	golog.Infof("core: Connecting to WebSocket: %s", wsURL)
 	golog.Infof("core: UUID: %s", config.Config.UUID)
 
+	// Extract hostname from baseURL for SNI
+	var serverName string
+	if u, err := url.Parse(baseURL); err == nil && u.Hostname() != "" {
+		serverName = u.Hostname()
+	}
+
 	// Create custom dialer with TLS config for self-signed certificates
 	dialer := &ws.Dialer{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // Accept self-signed certificates
+			ServerName:         serverName, // Required for SNI when connecting via IP
+			InsecureSkipVerify: true,       // Accept self-signed certificates
 		},
 	}
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -30,12 +31,19 @@ func SendLogsToServer(serverURL, secret string, logs []LogEntry) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Secret", secret)
 
+	// Extract hostname from serverURL for SNI
+	var serverName string
+	if u, err := url.Parse(serverURL); err == nil && u.Hostname() != "" {
+		serverName = u.Hostname()
+	}
+
 	// Send request with timeout (accept self-signed certs)
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Accept self-signed certificates
+				ServerName:         serverName, // Required for SNI when connecting via IP
+				InsecureSkipVerify: true,       // Accept self-signed certificates
 			},
 		},
 	}

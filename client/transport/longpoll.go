@@ -81,11 +81,18 @@ func (t *LongPollingTransport) Connect(ctx context.Context, cfg *Config) (*commo
 	t.uuid = cfg.UUID
 	t.key = cfg.Key
 
+	// Extract hostname from ServerURL for SNI
+	var serverName string
+	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Hostname() != "" {
+		serverName = u.Hostname()
+	}
+
 	// Create HTTP client with TLS config
 	t.client = &http.Client{
 		Timeout: cfg.LongPollTimeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
+				ServerName:         serverName, // Required for SNI when connecting via IP
 				InsecureSkipVerify: cfg.InsecureSkipVerify,
 				MinVersion:         tls.VersionTLS12,
 			},

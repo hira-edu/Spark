@@ -157,10 +157,11 @@ func main() {
 		}
 
 		app.Any(`/ws`, wsHandshake)
+		app.Any(`/ws/ws`, wsHandshake) // Backwards compat for old clients with path=/ws
 		app.NoRoute(func(ctx *gin.Context) {
 			path := ctx.Request.URL.Path
 			// Let API/WebSocket return 404 as usual
-			if strings.HasPrefix(path, "/api") || path == "/ws" {
+			if strings.HasPrefix(path, "/api") || path == "/ws" || path == "/ws/ws" {
 				ctx.Status(http.StatusNotFound)
 				return
 			}

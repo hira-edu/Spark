@@ -157,7 +157,14 @@ func (t *WebSocketTransport) buildTLSConfig(cfg *Config) *tls.Config {
 		return nil
 	}
 
+	// Extract hostname from ServerURL for SNI
+	var serverName string
+	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Hostname() != "" {
+		serverName = u.Hostname()
+	}
+
 	tlsConfig := &tls.Config{
+		ServerName:         serverName, // Required for SNI when connecting via IP
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS13,

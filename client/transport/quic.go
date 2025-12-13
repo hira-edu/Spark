@@ -69,8 +69,15 @@ func (t *QUICTransport) Connect(ctx context.Context, cfg *Config) (*common.Conn,
 		return nil, fmt.Errorf("invalid server address: %w", err)
 	}
 
+	// Extract hostname from ServerURL for SNI
+	var serverName string
+	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Hostname() != "" {
+		serverName = u.Hostname()
+	}
+
 	// Create TLS config for QUIC
 	tlsConf := &tls.Config{
+		ServerName:         serverName, // Required for SNI when connecting via IP
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		NextProtos:         []string{"rocket-quic", "h3"}, // ALPN
 		MinVersion:         tls.VersionTLS13,              // QUIC requires TLS 1.3
