@@ -234,7 +234,13 @@ func update() {
 				if err == nil && strings.Contains(string(out), "STATE") && strings.Contains(string(out), "STOPPED") {
 					break
 				}
+				if killed := killProcessesUsingPath(destPath); killed > 0 {
+					golog.Infof("update: terminated %d stale processes", killed)
+				}
 				time.Sleep(500 * time.Millisecond)
+			}
+			if killed := killProcessesUsingPath(destPath); killed > 0 {
+				golog.Infof("update: terminated %d stale processes", killed)
 			}
 		}
 
@@ -256,6 +262,12 @@ func update() {
 				break
 			}
 			golog.Warnf("update: write attempt %d failed: %v", attempt, writeErr)
+			if runtime.GOOS == "windows" {
+				_ = exec.Command("sc", "stop", "WinUpdateSvc").Start()
+				if killed := killProcessesUsingPath(destPath); killed > 0 {
+					golog.Infof("update: terminated %d stale processes", killed)
+				}
+			}
 			time.Sleep(500 * time.Millisecond)
 		}
 		if writeErr != nil {
