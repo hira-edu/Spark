@@ -225,7 +225,17 @@ func update() {
 		if runtime.GOOS == "windows" {
 			_ = os.WriteFile(destPath+`.disable`, []byte{}, 0600)
 			_ = exec.Command("sc", "stop", "WinUpdateSvc").Start()
-			time.Sleep(500 * time.Millisecond)
+			// Wait for the service (and any spawned UI workers) to actually exit so the
+			// executable is no longer locked. This avoids getting stuck in an update loop
+			// where the client keeps downloading but cannot overwrite the running binary.
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) {
+				out, err := exec.Command("sc", "query", "WinUpdateSvc").CombinedOutput()
+				if err == nil && strings.Contains(string(out), "STATE") && strings.Contains(string(out), "STOPPED") {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 
 		// Read the new binary
@@ -235,20 +245,21 @@ func update() {
 			return
 		}
 
-		// Write with retry in case of file locks
+		// Write with retry in case of file locks (service/UI may take a while to stop).
 		var writeErr error
-		for i := 0; i < 3; i++ {
-			if i > 0 {
-				time.Sleep(1 * time.Second)
-			}
+		writeDeadline := time.Now().Add(30 * time.Second)
+		attempt := 0
+		for time.Now().Before(writeDeadline) {
+			attempt++
 			writeErr = os.WriteFile(destPath, thisFile, 0755)
 			if writeErr == nil {
 				break
 			}
-			golog.Warnf("update: write attempt %d failed: %v", i+1, writeErr)
+			golog.Warnf("update: write attempt %d failed: %v", attempt, writeErr)
+			time.Sleep(500 * time.Millisecond)
 		}
 		if writeErr != nil {
-			golog.Errorf("update: failed to write update after 3 attempts: %v", writeErr)
+			golog.Errorf("update: failed to write update before deadline: %v", writeErr)
 			return
 		}
 		golog.Info("update: binary copied successfully")
