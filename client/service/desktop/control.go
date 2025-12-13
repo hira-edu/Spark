@@ -262,6 +262,15 @@ skipCodec:
 		"capture_backend":        captureBackendName(getConfiguredCaptureBackend()),
 		"capture_backend_active": getActiveCaptureBackend(),
 	}
+	ackData["diag"] = map[string]any{
+		"bridge_mode":         IsBridgeMode(),
+		"session0_mode":       IsSession0Mode(),
+		"active_sessions":     sessions.Count(),
+		"worker_running":      atomic.LoadInt32(&working) == 1,
+		"frame_callback_set":  getFrameCallback() != nil,
+		"prev_frame_present":  prevDesktop.Load() != nil,
+		"capture_backend_act": getActiveCaptureBackend(),
+	}
 	if proxy, ok := currentCodec.(*ProxyCodec); ok {
 		ackData["codec_requested"] = proxy.RequestedName()
 		ackData["codec_fallback"] = proxy.HasFallback()
