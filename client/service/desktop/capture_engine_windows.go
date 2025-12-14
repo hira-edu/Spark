@@ -7,6 +7,7 @@ import (
 	"image"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -49,6 +50,12 @@ func (e *desktopCaptureEngine) run() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// Some GDI/DXGI capture paths can hang on threads that are not attached to the
+	// interactive input desktop. Attach this worker thread early (best-effort).
+	if cleanup, err := attachToInputDesktop(); err == nil && cleanup != nil {
+		defer cleanup()
+	}
+
 	var screen Screen
 	screen.overrideBackend = e.override
 	screen.Init(e.displayIndex, e.rect)
@@ -77,6 +84,43 @@ func (e *desktopCaptureEngine) run() {
 			}
 		}
 	}
+}
+
+// Desktop access flags (winuser.h)
+const (
+	desktopReadObjects   = 0x0001
+	desktopWriteObjects  = 0x0080
+	desktopSwitchDesktop = 0x0100
+)
+
+var (
+	procOpenInputDesktop = user32.NewProc("OpenInputDesktop")
+	procSetThreadDesktop = user32.NewProc("SetThreadDesktop")
+	procCloseDesktop     = user32.NewProc("CloseDesktop")
+)
+
+func attachToInputDesktop() (func(), error) {
+	desired := desktopReadObjects | desktopWriteObjects | desktopSwitchDesktop
+	hd, _, callErr := procOpenInputDesktop.Call(0, 0, uintptr(desired))
+	if hd == 0 {
+		if callErr != syscall.Errno(0) {
+			return nil, callErr
+		}
+		return nil, errors.New("OpenInputDesktop returned null handle")
+	}
+
+	ok, _, callErr := procSetThreadDesktop.Call(hd)
+	if ok == 0 {
+		_, _, _ = procCloseDesktop.Call(hd)
+		if callErr != syscall.Errno(0) {
+			return nil, callErr
+		}
+		return nil, errors.New("SetThreadDesktop failed")
+	}
+
+	return func() {
+		_, _, _ = procCloseDesktop.Call(hd)
+	}, nil
 }
 
 func (e *desktopCaptureEngine) Stop() {
