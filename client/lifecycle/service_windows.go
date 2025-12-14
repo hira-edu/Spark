@@ -51,8 +51,6 @@ var (
 	errNoInteractiveSession = errors.New("no interactive user sessions available")
 )
 
-const bridgeEnsureRestartCooldown = 5 * time.Second
-
 // getServiceInstallPath returns the service install path in a thread-safe manner
 func getServiceInstallPath() string {
 	serviceInstallPathMu.RLock()
@@ -237,20 +235,10 @@ func ensureDesktopBridge(sessionID uint32, reason string) {
 	setSessionDesiredState(sessionID, "active")
 	desktop.SetActiveSessionID(sessionID)
 
-	// If the UI process is marked running but the relay can't connect to the pipe,
-	// restart it (with a small cooldown to avoid thrashing during normal startup).
-	var shouldRestart bool
-	var lastLaunch time.Time
-	sessionStateMu.RLock()
-	if state, ok := sessionStates[sessionID]; ok && state != nil {
-		lastLaunch = state.lastLaunchTime
-		shouldRestart = state.actual == "running" && state.process != nil && isProcessRunning(state.process)
-	}
-	sessionStateMu.RUnlock()
-
-	if shouldRestart && strings.Contains(reason, "relay") && time.Since(lastLaunch) > bridgeEnsureRestartCooldown {
-		terminateUIInSession(sessionID)
-	}
+	// Avoid aggressive UI restarts on relay connectivity issues.
+	// In the field this can create a tight restart loop (0 FPS / black screen) when
+	// the IPC pipe is temporarily unavailable or when the service mis-detects liveness.
+	// We still reconcile below (launch if stopped), and crashes are handled by monitorProcess.
 
 	// Allow retrying launches after transient failures.
 	resetSessionLaunchAttempts(sessionID)
