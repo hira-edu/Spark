@@ -88,7 +88,7 @@ const (
 	blockSize              = 64               // Pixel block size for delta encoding (64x64 matches noVNC/industry standard)
 	keyframeBlockSize      = 128              // Larger blocks for full-frame sync (reduces decode overhead and "scanline" painting)
 	frameBuffer            = 3                // Max queued frames before dropping
-	imageQuality           = 50               // JPEG quality (0-100) - balanced quality and performance
+	imageQuality           = 75               // JPEG quality (0-100) - better text readability by default
 	sessionMetricsInterval = 15 * time.Second // Interval for per-session telemetry snapshots
 )
 

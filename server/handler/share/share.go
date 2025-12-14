@@ -933,6 +933,13 @@ func onGuestMessage(session *melody.Session, data []byte) {
 			if quality, ok := pack.Data[`quality`]; ok {
 				payload[`quality`] = quality
 			}
+			// Allow toggling device-side adaptive JPEG quality (AQM).
+			// Accept both camelCase and snake_case from the guest UI.
+			if auto, ok := pack.Data[`quality_auto`].(bool); ok {
+				payload[`quality_auto`] = auto
+			} else if auto, ok := pack.Data[`qualityAuto`].(bool); ok {
+				payload[`quality_auto`] = auto
+			}
 			// Accept both "monitor" and "display"; map to "monitor" for the device.
 			if monitor, ok := pack.Data[`monitor`]; ok {
 				payload[`monitor`] = monitor

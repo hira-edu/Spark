@@ -1355,6 +1355,13 @@ func normalizeConfig(data map[string]any) (gin.H, bool) {
 	if quality, ok := coerceNumber(data[`quality`]); ok {
 		payload[`quality`] = quality
 	}
+	// Allow toggling device-side adaptive JPEG quality (AQM).
+	// Accept both camelCase and snake_case from the web UI.
+	if auto, ok := data[`quality_auto`].(bool); ok {
+		payload[`quality_auto`] = auto
+	} else if auto, ok := data[`qualityAuto`].(bool); ok {
+		payload[`quality_auto`] = auto
+	}
 
 	// Accept both "monitor" and "display" keys; map to monitor for the device
 	if monitor, ok := coerceNumber(data[`monitor`]); ok {

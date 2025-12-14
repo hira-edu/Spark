@@ -1,16 +1,22 @@
 import React, { useCallback } from 'react';
-import { Slider, Tooltip } from 'antd';
+import { Slider, Switch, Tooltip } from 'antd';
 import './Controls.css';
 
 /**
  * QualitySlider - Adjusts the stream quality (JPEG/WebP compression)
  */
-const QualitySlider = ({ value, onChange, disabled = false }) => {
+const QualitySlider = ({ value, onChange, auto = false, onAutoChange, disabled = false }) => {
   const handleChange = useCallback((val) => {
     if (onChange) {
       onChange(val);
     }
   }, [onChange]);
+
+  const handleAutoChange = useCallback((checked) => {
+    if (onAutoChange) {
+      onAutoChange(checked);
+    }
+  }, [onAutoChange]);
 
   const getQualityLabel = (val) => {
     if (val >= 90) return 'Ultra';
@@ -22,8 +28,18 @@ const QualitySlider = ({ value, onChange, disabled = false }) => {
 
   return (
     <div className="quality-slider">
-      <Tooltip title={`Quality: ${getQualityLabel(value)}`}>
+      <Tooltip title={auto ? 'Quality: Auto' : `Quality: ${getQualityLabel(value)}`}>
         <span className="control-label">Quality</span>
+      </Tooltip>
+      <Tooltip title={auto ? 'Adaptive quality enabled' : 'Fixed quality'}>
+        <Switch
+          size="small"
+          checked={auto}
+          onChange={handleAutoChange}
+          disabled={disabled}
+          checkedChildren="Auto"
+          unCheckedChildren="Fixed"
+        />
       </Tooltip>
       <Slider
         className="quality-slider-input"
@@ -32,10 +48,10 @@ const QualitySlider = ({ value, onChange, disabled = false }) => {
         step={5}
         value={value}
         onChange={handleChange}
-        disabled={disabled}
+        disabled={disabled || auto}
         tooltip={{ formatter: (val) => `${val}%` }}
       />
-      <span className="control-value">{value}%</span>
+      <span className="control-value">{auto ? 'Auto' : `${value}%`}</span>
     </div>
   );
 };

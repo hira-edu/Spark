@@ -19,7 +19,9 @@ const DesktopViewer = ({
   onClose,
 }) => {
   // State
-  const [quality, setQuality] = useState(50); // Balanced quality and performance
+  const [codec, setCodec] = useState('jpeg');
+  const [qualityAuto, setQualityAuto] = useState(true);
+  const [quality, setQuality] = useState(75); // Used when Auto quality is off
   const [targetFps, setTargetFps] = useState(30);
   const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
@@ -167,13 +169,23 @@ const DesktopViewer = ({
   // Send config when settings change
   useEffect(() => {
     if (status === 'connected') {
-      sendConfig({
-        quality,
+      const config = {
         fps: targetFps,
         display: selectedMonitor,
-      });
+        codec,
+      };
+
+      // Adaptive quality only applies to JPEG tiles.
+      if (codec === 'jpeg') {
+        config.qualityAuto = qualityAuto;
+        if (!qualityAuto) {
+          config.quality = quality;
+        }
+      }
+
+      sendConfig(config);
     }
-  }, [quality, targetFps, selectedMonitor, status, sendConfig]);
+  }, [codec, qualityAuto, quality, targetFps, selectedMonitor, status, sendConfig]);
 
   // When WebRTC video is active, suppress the WS tile/canvas stream for this session.
   useEffect(() => {
@@ -360,10 +372,15 @@ const DesktopViewer = ({
 
       {/* Bottom Control Bar */}
       <ControlBar
+        codec={codec}
+        onCodecChange={setCodec}
         quality={quality}
         onQualityChange={setQuality}
+        qualityAuto={qualityAuto}
+        onQualityAutoChange={setQualityAuto}
         targetFps={targetFps}
         onFpsChange={setTargetFps}
+        allowControl={allowControl}
         mouseEnabled={mouseEnabled}
         onMouseToggle={() => setMouseEnabled(!mouseEnabled)}
         keyboardEnabled={keyboardEnabled}
@@ -375,7 +392,7 @@ const DesktopViewer = ({
         monitors={monitors}
         selectedMonitor={selectedMonitor}
         onMonitorSelect={handleMonitorSelect}
-        disabled={!isConnected || !allowControl}
+        disabled={!isConnected}
       />
     </div>
   );

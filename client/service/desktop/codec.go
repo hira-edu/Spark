@@ -84,7 +84,7 @@ const (
 // Default codec configuration
 var defaultCodecConfig = CodecConfig{
 	PreferredCodec: CodecTypeJPEG,
-	Quality:        40,
+	Quality:        75,
 	NetworkType:    NetworkTypeLAN,
 	EnableHardware: true,
 }
@@ -401,37 +401,23 @@ func (c *JPEGCodec) IsHardwareAccelerated() bool { return false }
 
 // ==================== WEBP CODEC ====================
 
-// WebPCodec provides CPU-based WebP compression (better than JPEG)
-type WebPCodec struct {
-	quality int
-	pool    *sync.Pool
-}
-
-func NewWebPCodec(quality int) *WebPCodec {
-	if quality < 1 || quality > 100 {
-		quality = 75
+func NewWebPCodec(quality int) Codec {
+	// WebP encoding is not available in the default build (CGO/libwebp required).
+	// Use a proxy wrapper so the wire header advertises the *actual* codec type
+	// (JPEG) while config acks can still surface the requested codec + fallback.
+	fallback := Codec(NewJPEGCodec(quality))
+	if fallback == nil {
+		fallback = NewJPEGCodec(quality)
 	}
-
-	return &WebPCodec{
-		quality: quality,
-		pool: &sync.Pool{
-			New: func() interface{} {
-				return &bytes.Buffer{}
-			},
-		},
+	proxy := &ProxyCodec{
+		requestedName: CodecNameWebP,
+		requestedType: CodecTypeWebP,
+		quality:       quality,
+		inner:         fallback,
 	}
+	proxy.logFallback("webp codec requires CGO/libwebp; using JPEG fallback")
+	return proxy
 }
-
-func (c *WebPCodec) Encode(img *image.RGBA) ([]byte, error) {
-	// WebP disabled - requires CGO, fallback to JPEG
-	jpegCodec := NewJPEGCodec(c.quality)
-	return jpegCodec.Encode(img)
-}
-
-func (c *WebPCodec) Name() string                { return CodecNameWebP }
-func (c *WebPCodec) Type() int                   { return CodecTypeWebP }
-func (c *WebPCodec) Quality() int                { return c.quality }
-func (c *WebPCodec) IsHardwareAccelerated() bool { return false }
 
 // ==================== AVIF / PROXY CODECS ====================
 

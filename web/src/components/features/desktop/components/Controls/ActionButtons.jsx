@@ -9,6 +9,7 @@ import './Controls.css';
 const ActionButtons = ({
   onScreenshot,
   onClipboard,
+  clipboardDisabled = false,
   isFullscreen,
   onFullscreen,
   disabled = false,
@@ -25,7 +26,7 @@ const ActionButtons = ({
         icon={<CopyOutlined />}
         tooltip="Sync Clipboard"
         onClick={onClipboard}
-        disabled={disabled}
+        disabled={disabled || clipboardDisabled}
       />
       <IconButton
         icon={isFullscreen ? <FullscreenExitOutlined /> : <FullscreenOutlined />}

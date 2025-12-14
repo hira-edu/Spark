@@ -30,11 +30,8 @@
   max-height: 100%;
   /* Ensure the canvas maintains its aspect ratio by not stretching in flexbox */
   flex-shrink: 0;
-  /* Use nearest-neighbor for crisp pixels when upscaling (especially for text) */
-  image-rendering: -moz-crisp-edges;
-  image-rendering: -webkit-crisp-edges;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
+  /* Prefer smooth scaling for readability when the browser downsizes the canvas. */
+  image-rendering: auto;
   cursor: none !important; /* Hide local cursor - remote cursor will be rendered as overlay */
   outline: none;
 }

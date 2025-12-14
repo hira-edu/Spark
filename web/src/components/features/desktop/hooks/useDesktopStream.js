@@ -132,6 +132,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     requestedAt: 0,
     attempt: 0,
     seenArea: 0,
+    lastProgressAt: 0,
     seenKeys: new Set(),
   });
   const tickerRef = useRef(null);
@@ -196,7 +197,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     pendingFramesRef.current = [];
     // Clear event-to-frame mapping to prevent stale data on reconnect
     eventFrameMapRef.current.clear();
-    keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, seenKeys: new Set() };
+    keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, lastProgressAt: 0, seenKeys: new Set() };
     // Reset message processing chain to avoid holding old closures/data
     messageQueueRef.current = Promise.resolve();
     setFps(0);
@@ -252,7 +253,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     const now = Date.now();
     const prev = keyframeCoverageRef.current || { requestedAt: 0, attempt: 0 };
     const nextAttempt = prev.requestedAt > 0 && now - prev.requestedAt < 15000 ? (prev.attempt || 0) + 1 : 1;
-    keyframeCoverageRef.current = { active: true, requestedAt: now, attempt: nextAttempt, seenArea: 0, seenKeys: new Set() };
+    keyframeCoverageRef.current = { active: true, requestedAt: now, attempt: nextAttempt, seenArea: 0, lastProgressAt: now, seenKeys: new Set() };
     incrementShotCounter(reason);
     sendControlRef.current({ act: 'DESKTOP_SHOT' });
   }, [incrementShotCounter]);
@@ -498,6 +499,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     let minY = Number.POSITIVE_INFINITY;
     let maxX = 0;
     let maxY = 0;
+    let coverageProgressed = false;
 
     while (offset + 12 <= view.byteLength) {
       const bl = view.getUint16(offset + 0, false); // body length
@@ -538,6 +540,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         if (!coverage.seenKeys.has(key)) {
           coverage.seenKeys.add(key);
           coverage.seenArea += bw * bh;
+          coverageProgressed = true;
         }
       }
 
@@ -554,12 +557,19 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     if (coverage?.active && coverageRatio !== null) {
       const now = Date.now();
       const elapsed = now - (coverage.requestedAt || now);
+      if (coverageProgressed) {
+        coverage.lastProgressAt = now;
+      }
+      const progressAgeMs = now - (coverage.lastProgressAt || coverage.requestedAt || now);
       // If a shot doesn't fill most of the screen quickly, retry a few times.
-      if (elapsed > 3000 && coverageRatio < 0.5 && (coverage.attempt || 0) < 3) {
-        log('warn', 'low keyframe coverage; retrying DESKTOP_SHOT', { coverageRatio, elapsedMs: elapsed, attempt: coverage.attempt });
+      // Only retry when coverage growth stalls. High-resolution keyframes can take a few seconds
+      // to arrive/render; retrying while they're still progressing wastes bandwidth and increases
+      // "stale" blocks due to superseded async decodes.
+      if (elapsed > 3000 && coverageRatio < 0.5 && (coverage.attempt || 0) < 3 && progressAgeMs > 1200) {
+        log('warn', 'low keyframe coverage; retrying DESKTOP_SHOT', { coverageRatio, elapsedMs: elapsed, attempt: coverage.attempt, progressAgeMs });
         requestFullFrame('coverage_retry');
       } else if (coverageRatio >= 0.95) {
-        keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, seenKeys: new Set() };
+        keyframeCoverageRef.current = { active: false, requestedAt: 0, attempt: 0, seenArea: 0, lastProgressAt: 0, seenKeys: new Set() };
       }
     }
 
@@ -1341,7 +1351,8 @@ export function useDesktopStream(device, canvasRef, options = {}) {
           const successRate = total > 0 ? Math.round(stats.rendered / total * 100) : 0;
           const staleRate = total > 0 ? Math.round(stats.stale / total * 100) : 0;
 
-          log('info', 'block render stats (5s)', {
+          const level = stats.failed > 0 ? 'warn' : 'debug';
+          log(level, 'block render stats (5s)', {
             rendered: stats.rendered,
             failed: stats.failed,
             skipped: stats.skipped,

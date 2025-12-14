@@ -79,6 +79,22 @@
   box-shadow: 0 0 0 2px var(--color-accent);
 }
 
+/* Codec Selector */
+.codec-selector {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.codec-selector-input {
+  width: 130px;
+}
+
+.codec-selector-input .ant-select-selector {
+  background: var(--color-bg-tertiary) !important;
+  border-color: var(--color-border) !important;
+}
+
 /* FPS Selector */
 .fps-selector {
   display: flex;

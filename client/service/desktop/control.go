@@ -48,6 +48,8 @@ func HandleConfig(pack modules.Packet) error {
 	var errors []string
 	var warnings []string
 	var selectedBounds image.Rectangle
+	qualityAutoSet := false
+	qualityAutoEnabled := false
 
 	// Update allowControl (per session toggle)
 	if allowVal, ok := pack.Data["allowControl"]; ok {
@@ -112,8 +114,36 @@ func HandleConfig(pack modules.Packet) error {
 	}
 skipFPS:
 
+	// Update adaptive quality mode (if provided)
+	if autoVal, ok := pack.Data["quality_auto"]; ok {
+		auto, okBool := autoVal.(bool)
+		if !okBool {
+			errors = append(errors, "quality_auto: invalid type")
+		} else if adaptiveQualityManager != nil {
+			qualityAutoSet = true
+			qualityAutoEnabled = auto
+			if auto {
+				adaptiveQualityManager.EnableAutoAdaptation()
+				updated = append(updated, "quality_auto")
+				telemetry.LogStructured("INFO", "config: quality auto enabled", map[string]interface{}{
+					"mode": "auto",
+				})
+			} else {
+				// No-op here; fixed mode is engaged when the user sets an explicit quality value.
+				updated = append(updated, "quality_auto")
+			}
+		} else {
+			warnings = append(warnings, "quality_auto: adaptive quality unavailable")
+		}
+	}
+
 	// Update quality (if provided)
 	if qualityVal, ok := pack.Data["quality"]; ok {
+		if qualityAutoSet && qualityAutoEnabled {
+			// In auto mode, ignore explicit quality values so adaptive quality can operate.
+			// The UI should omit "quality" when "quality_auto" is true, but handle mixed payloads safely.
+			goto skipQuality
+		}
 		var quality int32
 		switch v := qualityVal.(type) {
 		case float64:
@@ -134,16 +164,44 @@ skipFPS:
 			adaptiveQualityManager.SetFixedQuality(quality, 0)
 		}
 
-		// Update active codec quality
-		codec := GetCodec()
-		if _, ok := codec.(*JPEGCodec); ok {
-			// Update JPEG quality dynamically
-			newCodec := NewJPEGCodec(int(quality))
-			if adaptiveQualityManager != nil {
-				newCodec.EnableAdaptiveQuality(adaptiveQualityManager)
-			}
-			SetCodec(newCodec)
+		// Update active codec quality while preserving the selected codec (including proxy fallbacks).
+		// This keeps "quality" working even when the requested codec falls back to JPEG internally.
+		current := GetCodec()
+		var requestedName string
+		var requestedType int
+		if proxy, ok := current.(*ProxyCodec); ok {
+			requestedName = proxy.RequestedName()
+			requestedType = proxy.RequestedType()
+		} else {
+			requestedName = current.Name()
+			requestedType = current.Type()
 		}
+
+		switch strings.ToLower(strings.TrimSpace(requestedName)) {
+		case "raw", "rgba":
+			// No-op: raw has no quality setting.
+		case "png", "lossless":
+			// No-op: PNG is lossless.
+		case "webp":
+			SetCodec(NewWebPCodec(int(quality)))
+		case "avif":
+			SetCodec(NewAVIFCodec(int(quality)))
+		case "vp8":
+			SetCodec(NewHardwareCodec(CodecTypeVP8, int(quality), getHardwareSupport()))
+		case "vp9":
+			SetCodec(NewHardwareCodec(CodecTypeVP9, int(quality), getHardwareSupport()))
+		case "h264", "h.264":
+			SetCodec(NewHardwareCodec(CodecTypeH264, int(quality), getHardwareSupport()))
+		default:
+			// JPEG (default)
+			jpeg := NewJPEGCodec(int(quality))
+			if adaptiveQualityManager != nil {
+				jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
+			}
+			SetCodec(jpeg)
+		}
+
+		_ = requestedType // reserved for future codec-type keyed behavior
 
 		telemetry.LogStructured("INFO", "config: quality updated", map[string]interface{}{
 			"old": oldQuality,
@@ -225,6 +283,8 @@ skipCapture:
 				jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
 			}
 			newCodec = jpeg
+		case "png", "lossless":
+			newCodec = NewPNGCodecFast()
 		case "webp":
 			newCodec = NewWebPCodec(quality)
 		case "avif":
@@ -264,6 +324,10 @@ skipCodec:
 		"codec":                  currentCodec.Name(),
 		"capture_backend":        captureBackendName(getConfiguredCaptureBackend()),
 		"capture_backend_active": getActiveCaptureBackend(),
+	}
+	if adaptiveQualityManager != nil {
+		ackData["quality_auto"] = adaptiveQualityManager.adaptationMode.Load() == 0
+		ackData["quality_effective"] = adaptiveQualityManager.GetCurrentJPEGQuality()
 	}
 	ackData["diag"] = map[string]any{
 		"bridge_mode":         IsBridgeMode(),

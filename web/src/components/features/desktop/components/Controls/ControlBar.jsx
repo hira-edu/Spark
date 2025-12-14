@@ -1,5 +1,6 @@
 import React from 'react';
 import { DesktopOutlined } from '@ant-design/icons';
+import CodecSelector from './CodecSelector';
 import QualitySlider from './QualitySlider';
 import FPSSelector from './FPSSelector';
 import InputToggle from './InputToggle';
@@ -24,10 +25,15 @@ const KeyboardIcon = () => (
  * ControlBar - Bottom control bar for desktop viewer
  */
 const ControlBar = ({
+  codec,
+  onCodecChange,
   quality,
   onQualityChange,
+  qualityAuto,
+  onQualityAutoChange,
   targetFps,
   onFpsChange,
+  allowControl = true,
   mouseEnabled,
   onMouseToggle,
   keyboardEnabled,
@@ -44,10 +50,18 @@ const ControlBar = ({
   return (
     <div className="control-bar">
       <div className="control-bar-left">
+        <CodecSelector
+          value={codec}
+          onChange={onCodecChange}
+          disabled={disabled}
+        />
+        <div className="control-divider" />
         <QualitySlider
           value={quality}
           onChange={onQualityChange}
-          disabled={disabled}
+          auto={codec === 'jpeg' ? qualityAuto : false}
+          onAutoChange={codec === 'jpeg' ? onQualityAutoChange : undefined}
+          disabled={disabled || codec !== 'jpeg'}
         />
         <div className="control-divider" />
         <FPSSelector
@@ -63,14 +77,14 @@ const ControlBar = ({
           label="Mouse"
           active={mouseEnabled}
           onClick={onMouseToggle}
-          disabled={disabled}
+          disabled={disabled || !allowControl}
         />
         <InputToggle
           icon={<KeyboardIcon />}
           label="Keyboard"
           active={keyboardEnabled}
           onClick={onKeyboardToggle}
-          disabled={disabled}
+          disabled={disabled || !allowControl}
         />
         {monitors.length > 1 && (
           <>
@@ -94,6 +108,7 @@ const ControlBar = ({
         <ActionButtons
           onScreenshot={onScreenshot}
           onClipboard={onClipboard}
+          clipboardDisabled={!allowControl}
           isFullscreen={isFullscreen}
           onFullscreen={onFullscreen}
           disabled={disabled}
