@@ -613,8 +613,8 @@ func worker() {
 	displayBounds.Store(currentBounds)
 
 	makeEngineBackends := func(desired CaptureBackendMode) []CaptureBackendMode {
-		// In bridge mode, always allow fallback/rotation even when a specific backend is requested.
-		// This prevents 0fps/black screens when a backend hangs in init/capture.
+		// Always allow fallback/rotation on Windows so the worker can recover from
+		// backend init/capture hangs (common in bridge/service scenarios).
 		out := make([]CaptureBackendMode, 0, 4)
 		add := func(mode CaptureBackendMode) {
 			for _, existing := range out {
@@ -635,10 +635,18 @@ func worker() {
 			}
 			add(CaptureBackendAuto)
 		} else {
-			// Bridge default: try the safer CPU path first, then DXGI, then auto.
-			add(CaptureBackendGDI)
-			add(CaptureBackendDXGI)
-			add(CaptureBackendAuto)
+			// Defaults differ by context:
+			// - Bridge mode: start with safer CPU path to avoid DXGI init/capture hangs.
+			// - Non-bridge: start with auto to pick best available backend.
+			if IsBridgeMode() {
+				add(CaptureBackendGDI)
+				add(CaptureBackendDXGI)
+				add(CaptureBackendAuto)
+			} else {
+				add(CaptureBackendAuto)
+				add(CaptureBackendDXGI)
+				add(CaptureBackendGDI)
+			}
 		}
 
 		if len(out) == 0 {
@@ -647,7 +655,9 @@ func worker() {
 		return out
 	}
 
-	useCaptureEngine := runtime.GOOS == "windows" && IsBridgeMode()
+	// On Windows, capture backend init/capture can hang depending on GPU/session/Desktop state.
+	// Run capture on a dedicated OS thread engine so the worker loop can time out and recover.
+	useCaptureEngine := runtime.GOOS == "windows"
 	if useCaptureEngine {
 		lastCaptureEpoch = getCaptureConfigEpoch()
 		desired := getConfiguredCaptureBackend()
