@@ -81,6 +81,14 @@ func dxgiCaptureTimeoutMillis() int {
 }
 
 func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
+	// Bridge mode runs inside a user-session helper process launched by the service.
+	// On some systems DXGI output duplication can hang indefinitely during init in this
+	// context, which manifests as 0fps/black screen and prevents any fallback from
+	// being attempted. Prefer a guaranteed-working backend first.
+	if IsBridgeMode() && desired == CaptureBackendAuto {
+		return []CaptureBackendMode{CaptureBackendGDI}
+	}
+
 	order := getFallbackOrder()
 	if IsBridgeMode() && desired == CaptureBackendAuto && len(order) > 0 {
 		order = preferGDIOverDXGI(order)
