@@ -552,8 +552,28 @@ func startCaptureWorker() bool {
 }
 
 func worker() {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	// On Windows, some capture backends (notably DXGI output duplication and certain
+	// DPI-related calls) require thread affinity. Others (e.g. screenshot/GDI paths)
+	// are more stable without forcing the goroutine onto a single OS thread.
+	//
+	// Only lock the OS thread when we might be using a thread-affine backend.
+	lockedThread := false
+	if runtime.GOOS == "windows" {
+		desired := getConfiguredCaptureBackend()
+		// Outside bridge mode, "auto" may select DXGI, so keep the original safety.
+		if desired == CaptureBackendDXGI || desired == CaptureBackendSharedSurface || (desired == CaptureBackendAuto && !IsBridgeMode()) {
+			runtime.LockOSThread()
+			lockedThread = true
+		}
+	} else {
+		runtime.LockOSThread()
+		lockedThread = true
+	}
+	defer func() {
+		if lockedThread {
+			runtime.UnlockOSThread()
+		}
+	}()
 
 	defer atomic.StoreInt32(&working, 0)
 
