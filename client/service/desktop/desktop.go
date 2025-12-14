@@ -575,17 +575,18 @@ func worker() {
 	defer atomic.StoreInt32(&working, 0)
 
 	var (
-		numErrors       int
-		numConsecutive  int // Consecutive errors for circuit breaker
-		screen          Screen
-		captureEngine   *desktopCaptureEngine
-		engineBackends  []CaptureBackendMode
-		engineBackendIx int
-		lastEngineStart time.Time
-		frame           *CaptureFrame
-		img             *image.RGBA
-		err             error
-		lastSuccessTime time.Time
+		numErrors        int
+		numConsecutive   int // Consecutive errors for circuit breaker
+		screen           Screen
+		captureEngine    *desktopCaptureEngine
+		engineBackends   []CaptureBackendMode
+		engineBackendIx  int
+		lastEngineStart  time.Time
+		lastCaptureEpoch uint64
+		frame            *CaptureFrame
+		img              *image.RGBA
+		err              error
+		lastSuccessTime  time.Time
 
 		// Performance metrics for delta detection
 		frameCount         uint64
@@ -613,6 +614,7 @@ func worker() {
 
 	useCaptureEngine := runtime.GOOS == "windows" && IsBridgeMode()
 	if useCaptureEngine {
+		lastCaptureEpoch = getCaptureConfigEpoch()
 		desired := getConfiguredCaptureBackend()
 		if desired != CaptureBackendAuto {
 			engineBackends = []CaptureBackendMode{desired}
@@ -699,6 +701,21 @@ func worker() {
 					"fps":      currentFPS,
 					"duration": frameDuration.String(),
 				})
+			}
+
+			// Apply capture backend changes by restarting the capture engine.
+			if useCaptureEngine {
+				if epoch := getCaptureConfigEpoch(); epoch != lastCaptureEpoch {
+					lastCaptureEpoch = epoch
+					desired := getConfiguredCaptureBackend()
+					if desired != CaptureBackendAuto {
+						engineBackends = []CaptureBackendMode{desired}
+					} else {
+						engineBackends = []CaptureBackendMode{CaptureBackendDXGI, CaptureBackendGDI, CaptureBackendAuto}
+					}
+					engineBackendIx = 0
+					restartCaptureEngine()
+				}
 			}
 
 			// Monitor switch support: reinitialize screen on monitor changes

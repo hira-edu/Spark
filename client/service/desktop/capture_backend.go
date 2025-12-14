@@ -26,6 +26,7 @@ var (
 	activeBackendName    atomic.Value
 	fallbackOverride     atomic.Value // []CaptureBackendMode
 	sharedSurfaceFlag    atomic.Bool
+	captureConfigEpoch   atomic.Uint64
 )
 
 func init() {
@@ -40,6 +41,14 @@ func getConfiguredCaptureBackend() CaptureBackendMode {
 
 func setConfiguredCaptureBackend(mode CaptureBackendMode) CaptureBackendMode {
 	return CaptureBackendMode(configCaptureBackend.Swap(int32(mode)))
+}
+
+func bumpCaptureConfigEpoch() {
+	captureConfigEpoch.Add(1)
+}
+
+func getCaptureConfigEpoch() uint64 {
+	return captureConfigEpoch.Load()
 }
 
 func captureBackendFromString(raw string) (CaptureBackendMode, error) {

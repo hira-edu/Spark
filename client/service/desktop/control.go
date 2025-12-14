@@ -193,6 +193,9 @@ skipMonitor:
 			goto skipCapture
 		}
 		oldBackend := setConfiguredCaptureBackend(newBackend)
+		if oldBackend != newBackend {
+			bumpCaptureConfigEpoch()
+		}
 		updated = append(updated, "capture")
 		telemetry.LogStructured("INFO", "config: capture backend updated", map[string]interface{}{
 			"old": captureBackendName(oldBackend),
