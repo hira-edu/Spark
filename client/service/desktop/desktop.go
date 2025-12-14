@@ -1594,7 +1594,13 @@ func anySessionNeedsWSFrames() bool {
 		if desktop == nil || desktop.escape.Load() {
 			return true
 		}
-		if desktop.wsFramesSuppressed.Load() {
+		// Only suppress WS tile frames when the caller explicitly requested it AND
+		// a WebRTC session is actually active. This keeps WS tiles as a safe fallback
+		// when WebRTC negotiation hasn't completed or has failed.
+		desktop.lock.Lock()
+		suppress := desktop.wsFramesSuppressed.Load() && desktop.rtc != nil
+		desktop.lock.Unlock()
+		if suppress {
 			return true
 		}
 		needed = true
@@ -1638,7 +1644,10 @@ func sendImageDiff(diff []*[]byte, keyframe bool) {
 
 		// When WebRTC is active, the browser can ask us to suppress WS tile frames
 		// (keeps WS for signaling/control acks, but removes heavy canvas traffic).
-		if desktop.wsFramesSuppressed.Load() {
+		//
+		// IMPORTANT: Only suppress when a WebRTC session is actually active; otherwise
+		// we keep WS tiles enabled as a fallback to avoid 0fps/black screens.
+		if desktop.wsFramesSuppressed.Load() && desktop.rtc != nil {
 			return true
 		}
 
