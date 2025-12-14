@@ -2674,7 +2674,7 @@ func InitDesktop(pack modules.Packet) error {
 				return
 			}
 
-			seed, seedErr := screenshot.CaptureRect(rect)
+			seed, seedErr := stillCapture(rect)
 			if seedErr != nil || seed == nil {
 				if seedErr != nil {
 					telemetry.LogStructured("WARN", "desktop: failed to seed initial frame (async)", map[string]interface{}{
@@ -2818,7 +2818,7 @@ func GetDesktop(pack modules.Packet) {
 	if prev == nil {
 		if boundsVal := displayBounds.Load(); boundsVal != nil {
 			if bounds, ok := boundsVal.(image.Rectangle); ok && bounds.Dx() > 0 && bounds.Dy() > 0 {
-				if seed, seedErr := screenshot.CaptureRect(bounds); seedErr == nil && seed != nil {
+				if seed, seedErr := stillCapture(bounds); seedErr == nil && seed != nil {
 					prevDesktop.Store(seed)
 					prev = seed
 				} else if seedErr != nil {
