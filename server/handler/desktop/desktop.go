@@ -1372,6 +1372,11 @@ func normalizeConfig(data map[string]any) (gin.H, bool) {
 	if allow, ok := data[`allowControl`].(bool); ok {
 		payload[`allowControl`] = allow
 	}
+	// Allow capture backend overrides from the web UI (e.g. auto/dxgi/gdi/sharedSurface).
+	// The device performs validation and will ignore unsupported values.
+	if capture, ok := data[`capture`].(string); ok && len(capture) > 0 {
+		payload[`capture`] = strings.TrimSpace(capture)
+	}
 
 	// Allow empty payloads; the device will perform stricter validation
 	return payload, true
