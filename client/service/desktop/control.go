@@ -274,6 +274,7 @@ skipCodec:
 		"prev_frame_present":  prevDesktop.Load() != nil,
 		"capture_backend_act": getActiveCaptureBackend(),
 		"capture_stats":       CaptureStats(),
+		"capture_engine":      CaptureEngineStats(),
 	}
 	if proxy, ok := currentCodec.(*ProxyCodec); ok {
 		ackData["codec_requested"] = proxy.RequestedName()
