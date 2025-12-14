@@ -1299,6 +1299,11 @@ func (desktop *session) stopMetricsReporter() {
 }
 
 func (desktop *session) emitBackpressureMetrics(uuid string) {
+	defer func() {
+		if r := recover(); r != nil {
+			recordRecoveredPanic("emitBackpressureMetrics", r)
+		}
+	}()
 	ticker := time.NewTicker(backpressureReportInterval)
 	defer ticker.Stop()
 	for {
@@ -1339,6 +1344,11 @@ func startSessionMetricsReporter(uuid string, desktop *session) {
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				recordRecoveredPanic("sessionMetricsReporter", r)
+			}
+		}()
 		ticker := time.NewTicker(sessionMetricsInterval)
 		defer ticker.Stop()
 
@@ -2661,6 +2671,11 @@ func InitDesktop(pack modules.Packet) error {
 	// in the UI bridge. Seed asynchronously so streaming starts immediately.
 	if prev == nil {
 		go func(desktopUUID string, monitor int32, rect image.Rectangle, sess *session) {
+			defer func() {
+				if r := recover(); r != nil {
+					recordRecoveredPanic("seedInitialFrame", r)
+				}
+			}()
 			// Give the capture worker a brief window to produce the first keyframe.
 			time.Sleep(150 * time.Millisecond)
 
@@ -2877,6 +2892,11 @@ func GetDesktop(pack modules.Packet) {
 }
 
 func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
+	defer func() {
+		if r := recover(); r != nil {
+			recordRecoveredPanic("handleDesktop", r)
+		}
+	}()
 	defer func() {
 		stopSessionMetricsReporter(desktop)
 		// Cleanup on exit

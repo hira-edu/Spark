@@ -23,10 +23,24 @@ func init() {
 }
 
 func metricsReporterLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			recordRecoveredPanic("metricsReporterLoop", r)
+			time.Sleep(500 * time.Millisecond)
+			go metricsReporterLoop()
+		}
+	}()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		publishDesktopMetrics()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					recordRecoveredPanic("publishDesktopMetrics", r)
+				}
+			}()
+			publishDesktopMetrics()
+		}()
 	}
 }
 

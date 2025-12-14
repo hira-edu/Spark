@@ -275,6 +275,7 @@ skipCodec:
 		"capture_backend_act": getActiveCaptureBackend(),
 		"process":             ProcessDiagStats(),
 		"worker":              WorkerDiagStats(),
+		"panic":               LastPanicDiag(),
 		"capture_stats":       CaptureStats(),
 		"capture_engine":      CaptureEngineStats(),
 	}

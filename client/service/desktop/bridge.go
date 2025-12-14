@@ -103,6 +103,11 @@ func StopBridge() {
 
 // handleMessage processes incoming IPC messages from Session 0
 func (b *Bridge) handleMessage(msg *ipc.Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			recordRecoveredPanic("Bridge.handleMessage", r)
+		}
+	}()
 	telemetry.LogStructured("INFO", "[IPC_BRIDGE_MSG_RECEIVED] IPC message received from Session 0", map[string]interface{}{
 		"type":         msg.Type,
 		"payload_size": len(msg.Payload),
