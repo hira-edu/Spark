@@ -822,29 +822,25 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			dxgiFailed = false
 
 		case CaptureBackendGDI:
-			var gdi ScreenCapture = &ScreenGDI{}
-			if err := tryInit("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
-				// Bridge mode fallback: try per-call GDI if persistent GDI fails.
-				if IsBridgeMode() {
-					telemetry.LogStructured("WARN", "GDI init failed, trying compat backend", map[string]interface{}{
-						"display": displayIndex,
-						"error":   err.Error(),
-					})
-					gdi = &ScreenGDICompat{}
-					if err := tryInit("gdi_compat", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
-						telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
-							"display": displayIndex,
-							"error":   err.Error(),
-						})
-						continue
-					}
-				} else {
-					telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
-						"display": displayIndex,
-						"error":   err.Error(),
-					})
-					continue
-				}
+			// Bridge mode: prefer per-call GDI resources to avoid init-time hangs
+			// seen with persistent device contexts in some session environments.
+			var (
+				gdi         ScreenCapture
+				gdiInitName = "gdi"
+			)
+			if IsBridgeMode() {
+				gdi = &ScreenGDICompat{}
+				gdiInitName = "gdi_compat"
+			} else {
+				gdi = &ScreenGDI{}
+			}
+
+			if err := tryInit(gdiInitName, func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
+				telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
+					"display": displayIndex,
+					"error":   err.Error(),
+				})
+				continue
 			}
 			if dxgiFailed {
 				dxgiFallbackCount.Add(1)
