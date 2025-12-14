@@ -661,18 +661,32 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 	}
 
 	desired := getConfiguredCaptureBackend()
-	// In bridge mode, prefer a pure screenshot path to avoid backend init/capture hangs
-	// that can stall the entire worker (manifesting as 0fps/black screen).
+	// In bridge mode, run a conservative capture path by default. Some systems hang
+	// inside kbinani/screenshot (notably around GetDIBits on the screen DC), which
+	// stalls the capture worker and manifests as 0fps/black screen.
 	if IsBridgeMode() && desired == CaptureBackendAuto {
-		ss := &ScreenScreenshot{}
-		_ = ss.Init(displayIndex, rect)
-		s.screen = ss
-		setActiveCaptureBackend("screenshot")
-		telemetry.LogStructured("WARN", "Bridge mode: forcing screenshot capture backend", map[string]interface{}{
-			"display":           displayIndex,
-			"rect":              rect.String(),
-			"requested_backend": captureBackendName(desired),
-		})
+		gdi := &ScreenGDI{}
+		if err := tryInit("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err == nil {
+			s.screen = gdi
+			setActiveCaptureBackend("gdi")
+			telemetry.LogStructured("INFO", "Bridge mode: forcing GDI capture backend", map[string]interface{}{
+				"display":           displayIndex,
+				"rect":              rect.String(),
+				"requested_backend": captureBackendName(desired),
+			})
+			return
+		} else {
+			ss := &ScreenScreenshot{}
+			_ = ss.Init(displayIndex, rect)
+			s.screen = ss
+			setActiveCaptureBackend("screenshot")
+			telemetry.LogStructured("WARN", "Bridge mode: GDI init failed; falling back to screenshot capture backend", map[string]interface{}{
+				"display":           displayIndex,
+				"rect":              rect.String(),
+				"requested_backend": captureBackendName(desired),
+				"error":             err.Error(),
+			})
+		}
 		return
 	}
 

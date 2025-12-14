@@ -556,15 +556,12 @@ func worker() {
 	// DPI-related calls) require thread affinity. Others (e.g. screenshot/GDI paths)
 	// are more stable without forcing the goroutine onto a single OS thread.
 	//
-	// Only lock the OS thread when we might be using a thread-affine backend.
+	// In practice, many Windows capture paths (including GDI) behave more reliably
+	// when the worker stays on a single thread for the lifetime of the session.
 	lockedThread := false
 	if runtime.GOOS == "windows" {
-		desired := getConfiguredCaptureBackend()
-		// Outside bridge mode, "auto" may select DXGI, so keep the original safety.
-		if desired == CaptureBackendDXGI || desired == CaptureBackendSharedSurface || (desired == CaptureBackendAuto && !IsBridgeMode()) {
-			runtime.LockOSThread()
-			lockedThread = true
-		}
+		runtime.LockOSThread()
+		lockedThread = true
 	} else {
 		runtime.LockOSThread()
 		lockedThread = true
