@@ -578,6 +578,10 @@ func worker() {
 		numErrors       int
 		numConsecutive  int // Consecutive errors for circuit breaker
 		screen          Screen
+		captureEngine   *desktopCaptureEngine
+		engineBackends  []CaptureBackendMode
+		engineBackendIx int
+		lastEngineStart time.Time
 		frame           *CaptureFrame
 		img             *image.RGBA
 		err             error
@@ -607,8 +611,31 @@ func worker() {
 	}
 	displayBounds.Store(currentBounds)
 
-	screen.Init(uint(activeMonitor), currentBounds)
-	defer screen.Release()
+	useCaptureEngine := runtime.GOOS == "windows" && IsBridgeMode()
+	if useCaptureEngine {
+		desired := getConfiguredCaptureBackend()
+		if desired != CaptureBackendAuto {
+			engineBackends = []CaptureBackendMode{desired}
+		} else {
+			// Bridge mode: try a few backend overrides. If a backend hangs in init/capture,
+			// the engine will stop responding and the worker will rotate to the next one.
+			engineBackends = []CaptureBackendMode{CaptureBackendDXGI, CaptureBackendGDI, CaptureBackendAuto}
+		}
+		if len(engineBackends) == 0 {
+			engineBackends = []CaptureBackendMode{CaptureBackendAuto}
+		}
+
+		captureEngine = newDesktopCaptureEngine(uint(activeMonitor), currentBounds, engineBackends[engineBackendIx])
+		lastEngineStart = time.Now()
+		defer func() {
+			if captureEngine != nil {
+				captureEngine.Stop()
+			}
+		}()
+	} else {
+		screen.Init(uint(activeMonitor), currentBounds)
+		defer screen.Release()
+	}
 
 	// FIXED: Use ticker for precise frame timing (Issue #1)
 	currentFPS := clampFPSValue(configFPS.Load())
@@ -627,6 +654,26 @@ func worker() {
 		"height":   currentBounds.Dy(),
 		"duration": frameDuration.String(),
 	})
+
+	restartCaptureEngine := func() {
+		if !useCaptureEngine {
+			return
+		}
+		if captureEngine != nil {
+			captureEngine.Stop()
+		}
+		if len(engineBackends) == 0 {
+			engineBackends = []CaptureBackendMode{CaptureBackendAuto}
+		}
+		captureEngine = newDesktopCaptureEngine(uint(activeMonitor), currentBounds, engineBackends[engineBackendIx])
+		lastEngineStart = time.Now()
+		telemetry.LogStructured("WARN", "worker: restarted capture engine", map[string]interface{}{
+			"monitor":          activeMonitor,
+			"width":            currentBounds.Dx(),
+			"height":           currentBounds.Dy(),
+			"backend_override": captureBackendName(engineBackends[engineBackendIx]),
+		})
+	}
 
 	for atomic.LoadInt32(&working) == 1 {
 		select {
@@ -656,7 +703,14 @@ func worker() {
 
 			// Monitor switch support: reinitialize screen on monitor changes
 			if desiredMonitor := clampMonitorValue(configMonitor.Load()); desiredMonitor != activeMonitor {
-				screen.Release()
+				if useCaptureEngine {
+					if captureEngine != nil {
+						captureEngine.Stop()
+						captureEngine = nil
+					}
+				} else {
+					screen.Release()
+				}
 
 				newBounds, boundsErr := getDisplayBoundsForMonitor(desiredMonitor)
 				if boundsErr != nil {
@@ -666,7 +720,11 @@ func worker() {
 						"error": boundsErr.Error(),
 					})
 					// Re-initialize previous monitor to keep capture alive
-					screen.Init(uint(activeMonitor), currentBounds)
+					if useCaptureEngine {
+						restartCaptureEngine()
+					} else {
+						screen.Init(uint(activeMonitor), currentBounds)
+					}
 					continue
 				}
 
@@ -677,7 +735,13 @@ func worker() {
 				// Clear previous frame to force full-frame sync on new monitor
 				prevDesktop.Store((*image.RGBA)(nil))
 
-				screen.Init(uint(activeMonitor), currentBounds)
+				// Reset backend rotation on monitor switch (new surface/device context).
+				engineBackendIx = 0
+				if useCaptureEngine {
+					restartCaptureEngine()
+				} else {
+					screen.Init(uint(activeMonitor), currentBounds)
+				}
 
 				// Broadcast resolution change before next frame
 				broadcastResolutionChange(currentBounds)
@@ -693,7 +757,30 @@ func worker() {
 			}
 
 			// Capture frame
-			frame, err = screen.Capture()
+			if useCaptureEngine {
+				timeout := frameDuration / 2
+				if timeout < 150*time.Millisecond {
+					timeout = 150 * time.Millisecond
+				}
+				if timeout > 2*time.Second {
+					timeout = 2 * time.Second
+				}
+				if captureEngine == nil {
+					restartCaptureEngine()
+				}
+				frame, err = captureEngine.Capture(timeout)
+				if errors.Is(err, errCaptureEngineTimeout) {
+					// Rotate backend overrides with a small cooldown to avoid thrashing.
+					const restartCooldown = 2 * time.Second
+					if time.Since(lastEngineStart) >= restartCooldown && len(engineBackends) > 0 {
+						engineBackendIx = (engineBackendIx + 1) % len(engineBackends)
+						restartCaptureEngine()
+					}
+					continue
+				}
+			} else {
+				frame, err = screen.Capture()
+			}
 			if frame != nil {
 				img = frame.Image
 			} else {
