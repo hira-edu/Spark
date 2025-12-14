@@ -206,11 +206,15 @@ func enumerateDisplays() []map[string]int {
 var (
 	// Block buffer pool: reusable byte slices for block extraction
 	// Pool key: buffer size (width * height * 4)
-	// Max block size: 64*64*4 = 16,384 bytes (reduced from 96x96 for finer granularity)
+	// Max block size: max(blockSize, keyframeBlockSize)^2 * 4 (RGBA)
 	blockBufferPool = sync.Pool{
 		New: func() interface{} {
-			// Allocate max block size buffer
-			buf := make([]byte, blockSize*blockSize*4)
+			// Allocate max block size buffer (handles keyframeBlockSize).
+			maxTile := blockSize
+			if keyframeBlockSize > maxTile {
+				maxTile = keyframeBlockSize
+			}
+			buf := make([]byte, maxTile*maxTile*4)
 			return &buf
 		},
 	}
@@ -2273,7 +2277,14 @@ func getImageBlock(img *image.RGBA, rect image.Rectangle) ([]byte, int) {
 		poolStats.blockBufferPuts.Add(1)
 	}()
 
-	buf := (*bufPtr)[:blockBytes] // Slice to actual size needed
+	buf := *bufPtr
+	if cap(buf) < blockBytes {
+		// Pool buffer is too small (e.g., keyframeBlockSize > blockSize); grow and reuse.
+		poolStats.allocations.Add(1)
+		buf = make([]byte, blockBytes)
+		*bufPtr = buf
+	}
+	buf = buf[:blockBytes] // Slice to actual size needed
 
 	// Extract block with stride normalization
 	// Input stride: img.Stride (may not equal width*4)
