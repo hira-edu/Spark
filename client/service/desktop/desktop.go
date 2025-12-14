@@ -552,17 +552,11 @@ func startCaptureWorker() bool {
 }
 
 func worker() {
-	// On Windows, some capture backends (notably DXGI output duplication and certain
-	// DPI-related calls) require thread affinity. Others (e.g. screenshot/GDI paths)
-	// are more stable without forcing the goroutine onto a single OS thread.
-	//
-	// In practice, many Windows capture paths (including GDI) behave more reliably
-	// when the worker stays on a single thread for the lifetime of the session.
 	lockedThread := false
-	if runtime.GOOS == "windows" {
-		runtime.LockOSThread()
-		lockedThread = true
-	} else {
+	// Windows capture is handled by the capture engine (dedicated locked thread),
+	// so keep the worker goroutine flexible to avoid thread-affinity issues in
+	// non-capture calls (e.g. display enumeration).
+	if runtime.GOOS != "windows" {
 		runtime.LockOSThread()
 		lockedThread = true
 	}
@@ -601,16 +595,25 @@ func worker() {
 		resolutionChanges uint64
 	)
 
-	// Initialize monitor selection and bounds
-	activeMonitor := clampMonitorValue(configMonitor.Load())
-	if currentBounds, err = getDisplayBoundsForMonitor(activeMonitor); err != nil {
-		telemetry.LogStructured("ERROR", "worker: failed to load display bounds", map[string]interface{}{
-			"monitor": activeMonitor,
-			"error":   err.Error(),
-		})
-		return
+	// Initialize monitor selection and bounds.
+	// Prefer the already-resolved bounds from InitDesktop to avoid repeated monitor enumeration.
+	activeMonitor := configMonitor.Load()
+	if boundsVal := displayBounds.Load(); boundsVal != nil {
+		if b, ok := boundsVal.(image.Rectangle); ok && b.Dx() > 0 && b.Dy() > 0 {
+			currentBounds = b
+		}
 	}
-	displayBounds.Store(currentBounds)
+	if currentBounds.Dx() == 0 || currentBounds.Dy() == 0 {
+		activeMonitor = clampMonitorValue(activeMonitor)
+		if currentBounds, err = getDisplayBoundsForMonitor(activeMonitor); err != nil {
+			telemetry.LogStructured("ERROR", "worker: failed to load display bounds", map[string]interface{}{
+				"monitor": activeMonitor,
+				"error":   err.Error(),
+			})
+			return
+		}
+		displayBounds.Store(currentBounds)
+	}
 
 	makeEngineBackends := func(desired CaptureBackendMode) []CaptureBackendMode {
 		// Always allow fallback/rotation on Windows so the worker can recover from
@@ -753,8 +756,10 @@ func worker() {
 				}
 			}
 
-			// Monitor switch support: reinitialize screen on monitor changes
-			if desiredMonitor := clampMonitorValue(configMonitor.Load()); desiredMonitor != activeMonitor {
+			// Monitor switch support: reinitialize screen on monitor changes.
+			// Avoid calling into display enumeration unless the requested monitor changed.
+			if desiredMonitorRaw := configMonitor.Load(); desiredMonitorRaw != activeMonitor {
+				desiredMonitor := clampMonitorValue(desiredMonitorRaw)
 				if useCaptureEngine {
 					if captureEngine != nil {
 						captureEngine.Stop()
