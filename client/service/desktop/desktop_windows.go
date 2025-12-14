@@ -81,18 +81,7 @@ func dxgiCaptureTimeoutMillis() int {
 }
 
 func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
-	// Bridge mode runs inside a user-session helper process launched by the service.
-	// On some systems DXGI/GDI initialization or capture can hang in this context.
-	// Returning an empty preference list forces Screen.Init to use the screenshot
-	// fallback backend, which is slower but robust.
-	if IsBridgeMode() && desired == CaptureBackendAuto {
-		return nil
-	}
-
 	order := getFallbackOrder()
-	if IsBridgeMode() && desired == CaptureBackendAuto && len(order) > 0 {
-		order = preferGDIOverDXGI(order)
-	}
 	final := make([]CaptureBackendMode, 0, len(order)+4)
 	appendMode := func(mode CaptureBackendMode) {
 		if mode == CaptureBackendAuto || !isBackendSelectable(mode) {
@@ -665,22 +654,6 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 	if s.overrideBackend != CaptureBackendAuto {
 		desired = s.overrideBackend
 	}
-	// Bridge mode can run inside a constrained user-session helper process. Avoid
-	// doing any synchronous "test capture" here; a hang in Capture() would stall
-	// the entire worker and manifest as 0fps/black screen.
-	if IsBridgeMode() && desired == CaptureBackendAuto {
-		ss := &ScreenScreenshot{}
-		_ = ss.Init(displayIndex, rect)
-		s.screen = ss
-		setActiveCaptureBackend("screenshot")
-		telemetry.LogStructured("WARN", "Bridge mode: forcing screenshot capture backend", map[string]interface{}{
-			"display":           displayIndex,
-			"rect":              rect.String(),
-			"requested_backend": captureBackendName(desired),
-		})
-		return
-	}
-
 	order := backendPreferenceOrder(desired)
 	var (
 		initSuccess bool
