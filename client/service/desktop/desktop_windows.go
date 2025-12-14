@@ -315,9 +315,9 @@ func (s *ScreenGDICompat) Capture() (*CaptureFrame, error) {
 	}
 	defer winGDI.SelectObject(memoryDevice, old)
 
-	rop := winGDI.SRCCOPY
+	rop := uint32(winGDI.SRCCOPY)
 	if !IsBridgeMode() {
-		rop |= winGDI.CAPTUREBLT
+		rop |= uint32(winGDI.CAPTUREBLT)
 	}
 	if !winGDI.BitBlt(memoryDevice, 0, 0, int32(width), int32(height), hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), rop) {
 		return nil, errors.New("BitBlt failed")
@@ -1226,10 +1226,10 @@ func (s *ScreenGDI) Init(_ uint, rect image.Rectangle) (err error) {
 	}
 	s.memptr = bits
 
-	s.rop = winGDI.SRCCOPY
+	s.rop = uint32(winGDI.SRCCOPY)
 	// Disable CAPTUREBLT in bridge mode; it can hang on some systems.
 	if !IsBridgeMode() {
-		s.rop |= winGDI.CAPTUREBLT
+		s.rop |= uint32(winGDI.CAPTUREBLT)
 	}
 	return nil
 }
