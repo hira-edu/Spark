@@ -650,6 +650,25 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 		return err
 	}
 
+	tryInitWithTimeout := func(name string, init func() error, release func(), timeout time.Duration) error {
+		done := make(chan error, 1)
+		go func() {
+			done <- tryInit(name, init, release)
+		}()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(timeout):
+			telemetry.LogStructured("WARN", "Capture backend init timed out", map[string]interface{}{
+				"backend":    name,
+				"display":    displayIndex,
+				"timeout_ms": timeout.Milliseconds(),
+				"is_bridge":  IsBridgeMode(),
+			})
+			return errors.New("capture init timeout")
+		}
+	}
+
 	desired := getConfiguredCaptureBackend()
 	if s.overrideBackend != CaptureBackendAuto {
 		desired = s.overrideBackend
@@ -670,7 +689,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 				continue
 			}
 			shared := &ScreenSharedSurface{}
-			if err := tryInit("shared_surface", func() error { return shared.Init(displayIndex, rect) }, shared.Release); err != nil {
+			if err := tryInitWithTimeout("shared_surface", func() error { return shared.Init(displayIndex, rect) }, shared.Release, 2*time.Second); err != nil {
 				telemetry.LogStructured("WARN", "Shared surface initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
 					"error":   err.Error(),
@@ -695,7 +714,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 				continue
 			}
 			nvfbc := &ScreenNVFBC{}
-			if err := tryInit("nvfbc", func() error { return nvfbc.Init(displayIndex, rect) }, nvfbc.Release); err != nil {
+			if err := tryInitWithTimeout("nvfbc", func() error { return nvfbc.Init(displayIndex, rect) }, nvfbc.Release, 2*time.Second); err != nil {
 				telemetry.LogStructured("WARN", "NVFBC initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
 					"error":   err.Error(),
@@ -708,7 +727,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 
 		case CaptureBackendDXGI:
 			dxgi := &ScreenDXGI{}
-			if err := tryInit("dxgi", func() error { return dxgi.Init(displayIndex, rect) }, dxgi.Release); err != nil {
+			if err := tryInitWithTimeout("dxgi", func() error { return dxgi.Init(displayIndex, rect) }, dxgi.Release, 2*time.Second); err != nil {
 				dxgiFailed = true
 				telemetry.LogStructured("WARN", "DXGI initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
@@ -723,7 +742,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 
 		case CaptureBackendGDI:
 			gdi := &ScreenGDI{}
-			if err := tryInit("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
+			if err := tryInitWithTimeout("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release, 2*time.Second); err != nil {
 				telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
 					"display": displayIndex,
 					"error":   err.Error(),
