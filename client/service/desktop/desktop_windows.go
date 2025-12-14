@@ -82,6 +82,9 @@ func dxgiCaptureTimeoutMillis() int {
 
 func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 	order := getFallbackOrder()
+	if IsBridgeMode() && desired == CaptureBackendAuto && len(order) > 0 {
+		order = preferGDIOverDXGI(order)
+	}
 	final := make([]CaptureBackendMode, 0, len(order)+4)
 	appendMode := func(mode CaptureBackendMode) {
 		if mode == CaptureBackendAuto || !isBackendSelectable(mode) {
@@ -123,6 +126,37 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 		return []CaptureBackendMode{CaptureBackendGDI}
 	}
 	return final
+}
+
+// preferGDIOverDXGI reorders a fallback list so the GDI backend is attempted
+// before DXGI when both are present. This is a pragmatic safety valve for
+// bridge mode where DXGI init can hang on some systems, leading to 0fps/black.
+func preferGDIOverDXGI(order []CaptureBackendMode) []CaptureBackendMode {
+	dxgiIdx := -1
+	gdiIdx := -1
+	for i, mode := range order {
+		switch mode {
+		case CaptureBackendDXGI:
+			dxgiIdx = i
+		case CaptureBackendGDI:
+			gdiIdx = i
+		}
+	}
+	if dxgiIdx == -1 || gdiIdx == -1 || gdiIdx < dxgiIdx {
+		return order
+	}
+
+	out := make([]CaptureBackendMode, 0, len(order))
+	for i, mode := range order {
+		if i == gdiIdx {
+			continue
+		}
+		if i == dxgiIdx {
+			out = append(out, CaptureBackendGDI)
+		}
+		out = append(out, mode)
+	}
+	return out
 }
 
 func nvfbcSupported() bool {
