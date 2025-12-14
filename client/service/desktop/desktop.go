@@ -612,17 +612,46 @@ func worker() {
 	}
 	displayBounds.Store(currentBounds)
 
+	makeEngineBackends := func(desired CaptureBackendMode) []CaptureBackendMode {
+		// In bridge mode, always allow fallback/rotation even when a specific backend is requested.
+		// This prevents 0fps/black screens when a backend hangs in init/capture.
+		out := make([]CaptureBackendMode, 0, 4)
+		add := func(mode CaptureBackendMode) {
+			for _, existing := range out {
+				if existing == mode {
+					return
+				}
+			}
+			out = append(out, mode)
+		}
+
+		if desired != CaptureBackendAuto {
+			add(desired)
+			if desired != CaptureBackendGDI {
+				add(CaptureBackendGDI)
+			}
+			if desired != CaptureBackendDXGI {
+				add(CaptureBackendDXGI)
+			}
+			add(CaptureBackendAuto)
+		} else {
+			// Bridge default: try the safer CPU path first, then DXGI, then auto.
+			add(CaptureBackendGDI)
+			add(CaptureBackendDXGI)
+			add(CaptureBackendAuto)
+		}
+
+		if len(out) == 0 {
+			return []CaptureBackendMode{CaptureBackendAuto}
+		}
+		return out
+	}
+
 	useCaptureEngine := runtime.GOOS == "windows" && IsBridgeMode()
 	if useCaptureEngine {
 		lastCaptureEpoch = getCaptureConfigEpoch()
 		desired := getConfiguredCaptureBackend()
-		if desired != CaptureBackendAuto {
-			engineBackends = []CaptureBackendMode{desired}
-		} else {
-			// Bridge mode: try a few backend overrides. If a backend hangs in init/capture,
-			// the engine will stop responding and the worker will rotate to the next one.
-			engineBackends = []CaptureBackendMode{CaptureBackendDXGI, CaptureBackendGDI, CaptureBackendAuto}
-		}
+		engineBackends = makeEngineBackends(desired)
 		if len(engineBackends) == 0 {
 			engineBackends = []CaptureBackendMode{CaptureBackendAuto}
 		}
@@ -708,11 +737,7 @@ func worker() {
 				if epoch := getCaptureConfigEpoch(); epoch != lastCaptureEpoch {
 					lastCaptureEpoch = epoch
 					desired := getConfiguredCaptureBackend()
-					if desired != CaptureBackendAuto {
-						engineBackends = []CaptureBackendMode{desired}
-					} else {
-						engineBackends = []CaptureBackendMode{CaptureBackendDXGI, CaptureBackendGDI, CaptureBackendAuto}
-					}
+					engineBackends = makeEngineBackends(desired)
 					engineBackendIx = 0
 					restartCaptureEngine()
 				}

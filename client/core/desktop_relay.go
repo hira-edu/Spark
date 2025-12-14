@@ -14,7 +14,7 @@ import (
 const (
 	desktopRelayWaitForSessionTimeout = 8 * time.Second
 	desktopRelayInitConnectTimeout    = 15 * time.Second
-	desktopRelayControlConnectTimeout = 3 * time.Second
+	desktopRelayControlConnectTimeout = 8 * time.Second
 	desktopRelayRetrySleep            = 300 * time.Millisecond
 )
 

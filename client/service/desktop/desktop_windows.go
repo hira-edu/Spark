@@ -38,9 +38,14 @@ var (
 
 // Capture statistics for Windows platforms (NVFBC/DXGI/GDI)
 var (
+	captureAttempts   atomic.Uint64
 	captureCount      atomic.Uint64
 	captureErrors     atomic.Uint64
-	captureLatency    atomic.Int64  // nanoseconds (last capture)
+	captureLatency    atomic.Int64 // nanoseconds (last completed capture)
+	captureInflight   atomic.Bool
+	captureLastStart  atomic.Int64  // UnixNano
+	captureLastEnd    atomic.Int64  // UnixNano
+	captureLastError  atomic.Value  // string
 	dxgiFallbackCount atomic.Uint64 // times GDI was used due to DXGI failure
 	nvfbcProbeOnce    sync.Once
 	nvfbcAvailable    atomic.Bool
@@ -48,15 +53,32 @@ var (
 
 // CaptureStats returns capture telemetry for Windows platforms.
 func CaptureStats() map[string]interface{} {
-	return map[string]interface{}{
-		"captures_total":  captureCount.Load(),
-		"errors_total":    captureErrors.Load(),
-		"last_latency_us": captureLatency.Load() / 1000, // microseconds
-		"platform":        runtime.GOOS,
-		"arch":            runtime.GOARCH,
-		"backend":         getActiveCaptureBackend(),
-		"dxgi_fallbacks":  dxgiFallbackCount.Load(),
+	stats := map[string]interface{}{
+		"capture_attempts_total": captureAttempts.Load(),
+		"captures_total":         captureCount.Load(),
+		"errors_total":           captureErrors.Load(),
+		"last_latency_us":        captureLatency.Load() / 1000, // microseconds
+		"inflight":               captureInflight.Load(),
+		"platform":               runtime.GOOS,
+		"arch":                   runtime.GOARCH,
+		"backend":                getActiveCaptureBackend(),
+		"dxgi_fallbacks":         dxgiFallbackCount.Load(),
 	}
+	now := time.Now().UnixNano()
+	lastStart := captureLastStart.Load()
+	if lastStart > 0 && now >= lastStart {
+		stats["last_start_age_ms"] = (now - lastStart) / int64(time.Millisecond)
+	}
+	lastEnd := captureLastEnd.Load()
+	if lastEnd > 0 && now >= lastEnd {
+		stats["last_end_age_ms"] = (now - lastEnd) / int64(time.Millisecond)
+	}
+	if v := captureLastError.Load(); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			stats["last_error"] = s
+		}
+	}
+	return stats
 }
 
 const (
@@ -107,14 +129,18 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 		appendMode(CaptureBackendSharedSurface)
 	}
 
-	appendMode(CaptureBackendNVFBC)
-	// In bridge mode (user-session helper process), DXGI initialization can be flaky/hang
-	// depending on GPU/session state. Prefer GDI first so we always have a working
-	// capture path and keep DXGI as an optional upgrade when explicitly selected.
 	if IsBridgeMode() {
+		// In bridge mode (user-session helper process), DXGI initialization/capture can be flaky/hang
+		// depending on GPU/session state. Prefer GDI first so we always have a working
+		// capture path and keep DXGI as an optional upgrade when explicitly selected.
 		appendMode(CaptureBackendGDI)
 		appendMode(CaptureBackendDXGI)
+		// NVFBC probing/initialization can be costly or unstable in some environments;
+		// only attempt it after other backends fail unless explicitly requested.
+		appendMode(CaptureBackendNVFBC)
 	} else {
+		// Prefer NVFBC in non-bridge mode when available.
+		appendMode(CaptureBackendNVFBC)
 		appendMode(CaptureBackendDXGI)
 		appendMode(CaptureBackendGDI)
 	}
@@ -230,8 +256,8 @@ type ScreenGDI struct {
 	bitmap         winGDI.HBITMAP
 	bitmapInfo     winGDI.BITMAPINFOHEADER
 	bitmapDataSize uintptr
-	hmem           winGDI.HGLOBAL
 	memptr         unsafe.Pointer
+	rop            uint32
 }
 
 // ScreenGDICompat performs GDI capture using per-call resources instead of
@@ -266,9 +292,19 @@ func (s *ScreenGDICompat) Capture() (*CaptureFrame, error) {
 	}
 	defer winGDI.DeleteDC(memoryDevice)
 
-	bitmap := winGDI.CreateCompatibleBitmap(hdc, int32(width), int32(height))
-	if bitmap == 0 {
-		return nil, errors.New("CreateCompatibleBitmap failed")
+	var header winGDI.BITMAPINFOHEADER
+	header.BiSize = uint32(unsafe.Sizeof(header))
+	header.BiPlanes = 1
+	header.BiBitCount = 32
+	header.BiWidth = int32(width)
+	header.BiHeight = -int32(height)
+	header.BiCompression = winGDI.BI_RGB
+	header.BiSizeImage = 0
+
+	var bits unsafe.Pointer
+	bitmap := winGDI.CreateDIBSection(memoryDevice, &header, winGDI.DIB_RGB_COLORS, &bits, 0, 0)
+	if bitmap == 0 || bits == nil {
+		return nil, errors.New("CreateDIBSection failed")
 	}
 	defer winGDI.DeleteObject(winGDI.HGDIOBJ(bitmap))
 
@@ -279,37 +315,17 @@ func (s *ScreenGDICompat) Capture() (*CaptureFrame, error) {
 	}
 	defer winGDI.SelectObject(memoryDevice, old)
 
-	if !winGDI.BitBlt(memoryDevice, 0, 0, int32(width), int32(height), hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), winGDI.SRCCOPY|winGDI.CAPTUREBLT) {
+	rop := winGDI.SRCCOPY
+	if !IsBridgeMode() {
+		rop |= winGDI.CAPTUREBLT
+	}
+	if !winGDI.BitBlt(memoryDevice, 0, 0, int32(width), int32(height), hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), rop) {
 		return nil, errors.New("BitBlt failed")
 	}
 
-	var header winGDI.BITMAPINFOHEADER
-	header.BiSize = uint32(unsafe.Sizeof(header))
-	header.BiPlanes = 1
-	header.BiBitCount = 32
-	header.BiWidth = int32(width)
-	header.BiHeight = -int32(height)
-	header.BiCompression = winGDI.BI_RGB
-	header.BiSizeImage = 0
-
 	bitmapDataSize := uintptr(((int64(width)*int64(header.BiBitCount) + 31) / 32) * 4 * int64(height))
-	hmem := winGDI.GlobalAlloc(winGDI.GMEM_MOVEABLE, bitmapDataSize)
-	if hmem == 0 {
-		return nil, errors.New("GlobalAlloc failed")
-	}
-	defer winGDI.GlobalFree(hmem)
-	memptr := winGDI.GlobalLock(hmem)
-	if memptr == nil {
-		return nil, errors.New("GlobalLock failed")
-	}
-	defer winGDI.GlobalUnlock(hmem)
-
-	if winGDI.GetDIBits(memoryDevice, bitmap, 0, uint32(height), (*uint8)(memptr), (*winGDI.BITMAPINFO)(unsafe.Pointer(&header)), winGDI.DIB_RGB_COLORS) == 0 {
-		return nil, errors.New("GetDIBits failed")
-	}
-
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	imageBytes := ((*[1 << 30]byte)(unsafe.Pointer(memptr)))[:bitmapDataSize:bitmapDataSize]
+	imageBytes := ((*[1 << 30]byte)(unsafe.Pointer(bits)))[:bitmapDataSize:bitmapDataSize]
 	copy(img.Pix[:bitmapDataSize], imageBytes)
 	swizzle.BGRA(img.Pix)
 
@@ -734,25 +750,6 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 		return err
 	}
 
-	tryInitWithTimeout := func(name string, init func() error, release func(), timeout time.Duration) error {
-		done := make(chan error, 1)
-		go func() {
-			done <- tryInit(name, init, release)
-		}()
-		select {
-		case err := <-done:
-			return err
-		case <-time.After(timeout):
-			telemetry.LogStructured("WARN", "Capture backend init timed out", map[string]interface{}{
-				"backend":    name,
-				"display":    displayIndex,
-				"timeout_ms": timeout.Milliseconds(),
-				"is_bridge":  IsBridgeMode(),
-			})
-			return errors.New("capture init timeout")
-		}
-	}
-
 	desired := getConfiguredCaptureBackend()
 	if s.overrideBackend != CaptureBackendAuto {
 		desired = s.overrideBackend
@@ -773,7 +770,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 				continue
 			}
 			shared := &ScreenSharedSurface{}
-			if err := tryInitWithTimeout("shared_surface", func() error { return shared.Init(displayIndex, rect) }, shared.Release, 2*time.Second); err != nil {
+			if err := tryInit("shared_surface", func() error { return shared.Init(displayIndex, rect) }, shared.Release); err != nil {
 				telemetry.LogStructured("WARN", "Shared surface initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
 					"error":   err.Error(),
@@ -798,7 +795,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 				continue
 			}
 			nvfbc := &ScreenNVFBC{}
-			if err := tryInitWithTimeout("nvfbc", func() error { return nvfbc.Init(displayIndex, rect) }, nvfbc.Release, 2*time.Second); err != nil {
+			if err := tryInit("nvfbc", func() error { return nvfbc.Init(displayIndex, rect) }, nvfbc.Release); err != nil {
 				telemetry.LogStructured("WARN", "NVFBC initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
 					"error":   err.Error(),
@@ -811,7 +808,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 
 		case CaptureBackendDXGI:
 			dxgi := &ScreenDXGI{}
-			if err := tryInitWithTimeout("dxgi", func() error { return dxgi.Init(displayIndex, rect) }, dxgi.Release, 2*time.Second); err != nil {
+			if err := tryInit("dxgi", func() error { return dxgi.Init(displayIndex, rect) }, dxgi.Release); err != nil {
 				dxgiFailed = true
 				telemetry.LogStructured("WARN", "DXGI initialization failed, falling back", map[string]interface{}{
 					"display": displayIndex,
@@ -825,18 +822,29 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			dxgiFailed = false
 
 		case CaptureBackendGDI:
-			var gdi ScreenCapture
-			if IsBridgeMode() {
-				gdi = &ScreenGDICompat{}
-			} else {
-				gdi = &ScreenGDI{}
-			}
-			if err := tryInitWithTimeout("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release, 2*time.Second); err != nil {
-				telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
-					"display": displayIndex,
-					"error":   err.Error(),
-				})
-				continue
+			var gdi ScreenCapture = &ScreenGDI{}
+			if err := tryInit("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
+				// Bridge mode fallback: try per-call GDI if persistent GDI fails.
+				if IsBridgeMode() {
+					telemetry.LogStructured("WARN", "GDI init failed, trying compat backend", map[string]interface{}{
+						"display": displayIndex,
+						"error":   err.Error(),
+					})
+					gdi = &ScreenGDICompat{}
+					if err := tryInit("gdi_compat", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release); err != nil {
+						telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
+							"display": displayIndex,
+							"error":   err.Error(),
+						})
+						continue
+					}
+				} else {
+					telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
+						"display": displayIndex,
+						"error":   err.Error(),
+					})
+					continue
+				}
 			}
 			if dxgiFailed {
 				dxgiFallbackCount.Add(1)
@@ -894,7 +902,14 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 }
 
 func (s *Screen) Capture() (*CaptureFrame, error) {
+	captureAttempts.Add(1)
+	captureInflight.Store(true)
+	captureLastStart.Store(time.Now().UnixNano())
+
 	if s.screen == nil {
+		captureLastEnd.Store(time.Now().UnixNano())
+		captureInflight.Store(false)
+		captureLastError.Store("capture backend not initialized")
 		captureCount.Add(1)
 		captureErrors.Add(1)
 		if captureErrors.Load()%10 == 1 {
@@ -909,11 +924,14 @@ func (s *Screen) Capture() (*CaptureFrame, error) {
 	frame, err := s.screen.Capture()
 	latency := time.Since(start)
 
+	captureLastEnd.Store(time.Now().UnixNano())
+	captureInflight.Store(false)
 	captureLatency.Store(latency.Nanoseconds())
 	captureCount.Add(1)
 
 	if err != nil && err != errNoImage {
 		captureErrors.Add(1)
+		captureLastError.Store(err.Error())
 		if captureErrors.Load()%100 == 1 {
 			telemetry.LogStructured("WARN", "Capture error", map[string]interface{}{
 				"error":         err.Error(),
@@ -922,6 +940,8 @@ func (s *Screen) Capture() (*CaptureFrame, error) {
 				"backend":       getActiveCaptureBackend(),
 			})
 		}
+	} else {
+		captureLastError.Store("")
 	}
 
 	return frame, err
@@ -1186,11 +1206,6 @@ func (s *ScreenGDI) Init(_ uint, rect image.Rectangle) (err error) {
 		s.Release()
 		return errors.New("CreateCompatibleDC failed")
 	}
-	s.bitmap = winGDI.CreateCompatibleBitmap(s.hdc, int32(s.width), int32(s.height))
-	if s.bitmap == 0 {
-		s.Release()
-		return errors.New("CreateCompatibleBitmap failed")
-	}
 
 	s.bitmapInfo = winGDI.BITMAPINFOHEADER{}
 	s.bitmapInfo.BiSize = uint32(unsafe.Sizeof(s.bitmapInfo))
@@ -1199,18 +1214,22 @@ func (s *ScreenGDI) Init(_ uint, rect image.Rectangle) (err error) {
 	s.bitmapInfo.BiWidth = int32(s.width)
 	s.bitmapInfo.BiHeight = -int32(s.height)
 	s.bitmapInfo.BiCompression = winGDI.BI_RGB
-	s.bitmapInfo.BiSizeImage = uint32(s.width * s.height * 4)
+	s.bitmapInfo.BiSizeImage = 0
 
 	s.bitmapDataSize = uintptr(((int64(s.width)*int64(s.bitmapInfo.BiBitCount) + 31) / 32) * 4 * int64(s.height))
-	s.hmem = winGDI.GlobalAlloc(winGDI.GMEM_MOVEABLE, s.bitmapDataSize)
-	if s.hmem == 0 {
+
+	var bits unsafe.Pointer
+	s.bitmap = winGDI.CreateDIBSection(s.memoryDevice, &s.bitmapInfo, winGDI.DIB_RGB_COLORS, &bits, 0, 0)
+	if s.bitmap == 0 || bits == nil {
 		s.Release()
-		return errors.New("GlobalAlloc failed")
+		return errors.New("CreateDIBSection failed")
 	}
-	s.memptr = winGDI.GlobalLock(s.hmem)
-	if s.memptr == nil {
-		s.Release()
-		return errors.New("GlobalLock failed")
+	s.memptr = bits
+
+	s.rop = winGDI.SRCCOPY
+	// Disable CAPTUREBLT in bridge mode; it can hang on some systems.
+	if !IsBridgeMode() {
+		s.rop |= winGDI.CAPTUREBLT
 	}
 	return nil
 }
@@ -1223,12 +1242,8 @@ func (s *ScreenGDI) Capture() (*CaptureFrame, error) {
 	}
 	defer winGDI.SelectObject(s.memoryDevice, old)
 
-	if !winGDI.BitBlt(s.memoryDevice, 0, 0, int32(s.width), int32(s.height), s.hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), winGDI.SRCCOPY|winGDI.CAPTUREBLT) {
+	if !winGDI.BitBlt(s.memoryDevice, 0, 0, int32(s.width), int32(s.height), s.hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), s.rop) {
 		return nil, errors.New("BitBlt failed")
-	}
-
-	if winGDI.GetDIBits(s.memoryDevice, s.bitmap, 0, uint32(s.height), (*uint8)(s.memptr), (*winGDI.BITMAPINFO)(unsafe.Pointer(&s.bitmapInfo)), winGDI.DIB_RGB_COLORS) == 0 {
-		return nil, errors.New("GetDIBits failed")
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, s.width, s.height))
@@ -1251,11 +1266,7 @@ func (s *ScreenGDI) Release() {
 		winGDI.DeleteObject(winGDI.HGDIOBJ(s.bitmap))
 		s.bitmap = 0
 	}
-	if s.hmem != 0 {
-		winGDI.GlobalUnlock(s.hmem)
-		winGDI.GlobalFree(s.hmem)
-		s.hmem = 0
-	}
+	s.memptr = nil
 }
 func getDesktopWindow() winGDI.HWND {
 	ret, _, _ := syscall.SyscallN(funcGetDesktopWindow)
