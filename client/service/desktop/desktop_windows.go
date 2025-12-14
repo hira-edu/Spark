@@ -772,29 +772,9 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 		}
 	}
 
-	if initSuccess && s.screen != nil {
-		testStart := time.Now()
-		testFrame, testErr := s.screen.Capture()
-		testLatency := time.Since(testStart)
-		if testFrame != nil {
-			defer testFrame.Close()
-		}
-		if testErr != nil && testErr != errNoImage {
-			telemetry.LogStructured("WARN", "Test capture failed during initialization", map[string]interface{}{
-				"error":   testErr.Error(),
-				"display": displayIndex,
-				"backend": getActiveCaptureBackend(),
-			})
-		} else if testFrame != nil && testFrame.Image != nil {
-			telemetry.LogStructured("INFO", "Test capture successful", map[string]interface{}{
-				"display":    displayIndex,
-				"backend":    getActiveCaptureBackend(),
-				"latency_ms": testLatency.Milliseconds(),
-				"width":      testFrame.Image.Bounds().Dx(),
-				"height":     testFrame.Image.Bounds().Dy(),
-			})
-		}
-	} else if !initSuccess {
+	// Avoid doing a synchronous test capture here: certain Win32 capture backends can
+	// hang inside Capture(), which would block the worker from ever starting.
+	if !initSuccess {
 		telemetry.LogStructured("ERROR", "Failed to initialize any capture backend", map[string]interface{}{
 			"display":           displayIndex,
 			"requested_backend": captureBackendName(desired),
