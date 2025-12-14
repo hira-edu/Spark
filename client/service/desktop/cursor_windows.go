@@ -7,6 +7,7 @@ import (
 	"Rocket/modules"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"hash/crc32"
 	"image"
 	"runtime"
@@ -165,6 +166,15 @@ func cursorCaptureLoop(rawEvent []byte, state *cursorSessionState) {
 		return
 	}
 
+	defer func() {
+		if r := recover(); r != nil {
+			state.active.Store(false)
+			telemetry.LogStructured("ERROR", "cursor: capture loop panic recovered", map[string]interface{}{
+				"panic": fmt.Sprintf("%v", r),
+			})
+		}
+	}()
+
 	// Lock OS thread for Win32 API thread safety (same pattern as main worker)
 	// Some GDI/User32 calls have thread affinity requirements
 	runtime.LockOSThread()
@@ -219,7 +229,16 @@ func cursorCaptureLoop(rawEvent []byte, state *cursorSessionState) {
 }
 
 // captureCursor captures current cursor state
-func captureCursor() (*CursorData, error) {
+func captureCursor() (_ *CursorData, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("cursor capture panic: %v", r)
+			telemetry.LogStructured("ERROR", "cursor: capture panic recovered", map[string]interface{}{
+				"panic": fmt.Sprintf("%v", r),
+			})
+		}
+	}()
+
 	// Get cursor position (in absolute screen coordinates)
 	var pt POINT
 	ret, _, _ := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
