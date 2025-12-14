@@ -2408,28 +2408,6 @@ func InitDesktop(pack modules.Packet) error {
 		prev, _ = prevVal.(*image.RGBA)
 	}
 
-	// DXGI output duplication can return WAIT_TIMEOUT when the desktop hasn't changed yet,
-	// which leaves prevDesktop unset and the browser with a black canvas. Seed a still frame
-	// once during init so the first paint always has pixels.
-	if prev == nil {
-		if seed, seedErr := screenshot.CaptureRect(bounds); seedErr == nil && seed != nil {
-			prevDesktop.Store(seed)
-			prev = seed
-			telemetry.LogStructured("INFO", "desktop: seeded initial frame for first paint", map[string]interface{}{
-				"desktop_uuid": uuid,
-				"width":        seed.Rect.Dx(),
-				"height":       seed.Rect.Dy(),
-				"monitor":      activeMonitor,
-			})
-		} else if seedErr != nil {
-			telemetry.LogStructured("WARN", "desktop: failed to seed initial frame", map[string]interface{}{
-				"desktop_uuid": uuid,
-				"monitor":      activeMonitor,
-				"error":        seedErr.Error(),
-			})
-		}
-	}
-
 	if prev != nil {
 		img := splitFullImage(prev, compress)
 		if img != nil {
@@ -2456,6 +2434,57 @@ func InitDesktop(pack modules.Packet) error {
 	StartCursorCapture(rawEvent)
 
 	go handleDesktop(pack, uuid, desktop)
+
+	// DXGI output duplication can return WAIT_TIMEOUT when the desktop hasn't changed yet,
+	// which leaves prevDesktop unset and the browser with a black canvas. Previously we
+	// seeded synchronously during init, but that can block handleDesktop/worker startup
+	// in the UI bridge. Seed asynchronously so streaming starts immediately.
+	if prev == nil {
+		go func(desktopUUID string, monitor int32, rect image.Rectangle, sess *session) {
+			// Give the capture worker a brief window to produce the first keyframe.
+			time.Sleep(150 * time.Millisecond)
+
+			if sess == nil || sess.escape.Load() {
+				return
+			}
+			if live, ok := sessions.Get(desktopUUID); !ok || live != sess {
+				return
+			}
+			if prevDesktop.Load() != nil {
+				return
+			}
+
+			seed, seedErr := screenshot.CaptureRect(rect)
+			if seedErr != nil || seed == nil {
+				if seedErr != nil {
+					telemetry.LogStructured("WARN", "desktop: failed to seed initial frame (async)", map[string]interface{}{
+						"desktop_uuid": desktopUUID,
+						"monitor":      monitor,
+						"error":        seedErr.Error(),
+					})
+				}
+				return
+			}
+
+			prevDesktop.Store(seed)
+			telemetry.LogStructured("INFO", "desktop: seeded initial frame for first paint (async)", map[string]interface{}{
+				"desktop_uuid": desktopUUID,
+				"width":        seed.Rect.Dx(),
+				"height":       seed.Rect.Dy(),
+				"monitor":      monitor,
+			})
+
+			img := splitFullImage(seed, compress)
+			if img == nil {
+				return
+			}
+			frameSeq := globalFrameSeq.Add(1)
+			select {
+			case sess.channel <- message{t: 0, frame: &img, keyframe: true, frameSeq: frameSeq}:
+			default:
+			}
+		}(uuid, activeMonitor, bounds, desktop)
+	}
 	return nil
 }
 
