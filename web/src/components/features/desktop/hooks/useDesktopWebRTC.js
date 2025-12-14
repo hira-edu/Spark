@@ -5,6 +5,27 @@ const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
 ];
 
+function iceServersKey(iceServers) {
+  if (!Array.isArray(iceServers) || iceServers.length === 0) return '';
+  const normalized = iceServers
+    .filter(Boolean)
+    .map((s) => {
+      const urlsRaw = s.urls;
+      const urls = Array.isArray(urlsRaw) ? urlsRaw : (urlsRaw ? [urlsRaw] : []);
+      return {
+        urls: urls.map(String).sort(),
+        username: s.username ? String(s.username) : '',
+        credential: s.credential ? String(s.credential) : '',
+        credentialType: s.credentialType ? String(s.credentialType) : '',
+      };
+    });
+  try {
+    return JSON.stringify(normalized);
+  } catch (_) {
+    return String(Date.now());
+  }
+}
+
 function preferH264Codec(transceiver) {
   if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
   if (typeof RTCRtpReceiver === 'undefined' || typeof RTCRtpReceiver.getCapabilities !== 'function') return;
@@ -33,6 +54,7 @@ export function useDesktopWebRTC({
   const videoRef = useRef(null);
   const pcRef = useRef(null);
   const dcRef = useRef(null);
+  const iceKeyRef = useRef('');
 
   const [status, setStatus] = useState('off'); // off | connecting | connected | failed
   const [controlChannel, setControlChannel] = useState(null);
@@ -42,11 +64,13 @@ export function useDesktopWebRTC({
     if (Array.isArray(iceServers) && iceServers.length > 0) return iceServers;
     return DEFAULT_ICE_SERVERS;
   }, [iceServers]);
+  const effectiveIceKey = useMemo(() => iceServersKey(effectiveIceServers), [effectiveIceServers]);
 
   const stop = useCallback(() => {
     setStatus('off');
     setHasVideo(false);
     setControlChannel(null);
+    iceKeyRef.current = '';
 
     const dc = dcRef.current;
     dcRef.current = null;
@@ -77,6 +101,7 @@ export function useDesktopWebRTC({
 
     const pc = new RTCPeerConnection({ iceServers: effectiveIceServers });
     pcRef.current = pc;
+    iceKeyRef.current = effectiveIceKey;
 
     const transceiver = pc.addTransceiver('video', { direction: 'recvonly' });
     preferH264Codec(transceiver);
@@ -155,7 +180,19 @@ export function useDesktopWebRTC({
     } catch (err) {
       stop();
     }
-  }, [allowControl, effectiveIceServers, enabled, sendSignal, stop]);
+  }, [allowControl, effectiveIceKey, effectiveIceServers, enabled, sendSignal, stop]);
+
+  // If ICE servers arrive late (e.g., TURN credentials), restart an in-progress
+  // connection attempt so the new config can actually be applied.
+  useEffect(() => {
+    const pc = pcRef.current;
+    if (!pc) return;
+    if (pc.connectionState === 'connected') return;
+    if (iceKeyRef.current && iceKeyRef.current !== effectiveIceKey) {
+      stop();
+      start();
+    }
+  }, [effectiveIceKey, start, stop]);
 
   const handleSignalMessage = useCallback((msg) => {
     const pc = pcRef.current;
@@ -199,4 +236,3 @@ export function useDesktopWebRTC({
     handleSignalMessage,
   };
 }
-

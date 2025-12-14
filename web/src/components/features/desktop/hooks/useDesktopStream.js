@@ -97,6 +97,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // Latest connect routine (used by reconnect timer without capturing stale closures).
   const connectInternalRef = useRef(null);
   const ctxRef = useRef(null);
+  // Double buffering: off-screen canvas for atomic frame updates
+  // Blocks render to offscreen, then swap to visible canvas on rAF
+  const offscreenCanvasRef = useRef(null);
+  const offscreenCtxRef = useRef(null);
+  const swapPendingRef = useRef(false);
+  const swapRafRef = useRef(0);
   const mountedRef = useRef(true); // Track component mount state for async safety
   const blockStatsRef = useRef({ rendered: 0, failed: 0, skipped: 0, stale: 0 }); // Track async block outcomes
   const statsRef = useRef({ frames: 0, bytes: 0 });
@@ -191,6 +197,12 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       window.cancelAnimationFrame(bitmapPumpRafRef.current);
     }
     bitmapPumpRafRef.current = 0;
+    // Clean up double buffer swap RAF
+    if (typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function' && swapRafRef.current) {
+      window.cancelAnimationFrame(swapRafRef.current);
+    }
+    swapRafRef.current = 0;
+    swapPendingRef.current = false;
     blockStatsRef.current = { rendered: 0, failed: 0, skipped: 0, stale: 0 };
     // Reset resolution tracking - critical for proper frame buffering on reconnect
     hasResolutionRef.current = false;
@@ -323,7 +335,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     return () => clearInterval(timer);
   }, [status, keyframeIntervalMs, requestFullFrame]);
 
-  // Initialize canvas context
+  // Initialize canvas context and off-screen buffer for double buffering
   const initCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -335,15 +347,67 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     if (ctxRef.current) {
       ctxRef.current.imageSmoothingEnabled = false;
     }
+
+    // Initialize off-screen canvas for double buffering
+    // This eliminates visible tile painting by rendering to a hidden buffer
+    // and atomically swapping to the visible canvas on requestAnimationFrame
+    offscreenCanvasRef.current = document.createElement('canvas');
+    offscreenCanvasRef.current.width = canvas.width || 1;
+    offscreenCanvasRef.current.height = canvas.height || 1;
+    offscreenCtxRef.current = offscreenCanvasRef.current.getContext('2d', {
+      alpha: false,
+      desynchronized: true
+    });
+    if (offscreenCtxRef.current) {
+      offscreenCtxRef.current.imageSmoothingEnabled = false;
+    }
+  }, [canvasRef]);
+
+  // Schedule atomic swap from off-screen buffer to visible canvas
+  // This is the key to eliminating visible tile painting - all block updates
+  // accumulate in the off-screen buffer and are presented atomically on rAF
+  const scheduleSwap = useCallback(() => {
+    if (!mountedRef.current) return;
+    if (swapPendingRef.current) return; // Already scheduled
+    swapPendingRef.current = true;
+
+    if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+      // Fallback: immediate swap
+      const canvas = canvasRef.current;
+      const ctx = ctxRef.current;
+      const offscreen = offscreenCanvasRef.current;
+      if (canvas && ctx && offscreen && offscreen.width > 0 && offscreen.height > 0) {
+        ctx.drawImage(offscreen, 0, 0);
+      }
+      swapPendingRef.current = false;
+      return;
+    }
+
+    swapRafRef.current = window.requestAnimationFrame(() => {
+      swapRafRef.current = 0;
+      swapPendingRef.current = false;
+      if (!mountedRef.current) return;
+
+      const canvas = canvasRef.current;
+      const ctx = ctxRef.current;
+      const offscreen = offscreenCanvasRef.current;
+      if (!canvas || !ctx || !offscreen) return;
+      if (offscreen.width === 0 || offscreen.height === 0) return;
+
+      // Atomic copy from off-screen to visible canvas
+      ctx.drawImage(offscreen, 0, 0);
+    });
   }, [canvasRef]);
 
   // Pump queued bitmap decodes with a bounded concurrency window. This reduces
   // scanline-like progressive updates under high-resolution/high-motion streams
   // and avoids decoding tiles that will be superseded before paint.
+  // DOUBLE BUFFER: Renders to off-screen canvas, then schedules atomic swap
   const pumpBitmapDecodeQueue = useCallback(() => {
     if (!mountedRef.current) return;
-    const ctx = ctxRef.current;
-    if (!ctx) return;
+    // Use off-screen context for double buffering (fall back to visible if not available)
+    const offCtx = offscreenCtxRef.current || ctxRef.current;
+    if (!offCtx) return;
 
     while (bitmapDecodeInFlightRef.current < MAX_BITMAP_DECODE_IN_FLIGHT) {
       const next = pendingBitmapBlocksRef.current.entries().next();
@@ -364,7 +428,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         continue;
       }
 
-      const ctxAtStart = ctx;
+      const ctxAtStart = offCtx;
       bitmapDecodeInFlightRef.current += 1;
 
       createImageBitmap(new Blob([data]), {
@@ -373,7 +437,9 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       }).then((ib) => {
         bitmapDecodeInFlightRef.current -= 1;
 
-        if (!mountedRef.current || ctxAtStart !== ctxRef.current) {
+        // Check if context changed (component remounted/reconnected)
+        const currentOffCtx = offscreenCtxRef.current || ctxRef.current;
+        if (!mountedRef.current || ctxAtStart !== currentOffCtx) {
           blockStatsRef.current.skipped++;
           if (typeof ib.close === 'function') ib.close();
           pumpBitmapDecodeQueue();
@@ -389,9 +455,13 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         }
 
         blockVersionRef.current.set(posKey, capturedSeq);
+        // Draw to off-screen buffer
         ctxAtStart.drawImage(ib, 0, 0, ib.width || bw, ib.height || bh, dx, dy, bw, bh);
         blockStatsRef.current.rendered++;
         if (typeof ib.close === 'function') ib.close();
+
+        // Schedule atomic swap to visible canvas
+        scheduleSwap();
 
         pumpBitmapDecodeQueue();
       }).catch((err) => {
@@ -403,7 +473,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         pumpBitmapDecodeQueue();
       });
     }
-  }, [log, MAX_BITMAP_DECODE_IN_FLIGHT]);
+  }, [log, MAX_BITMAP_DECODE_IN_FLIGHT, scheduleSwap]);
 
   const scheduleBitmapDecodePump = useCallback(() => {
     if (!mountedRef.current) return;
@@ -435,8 +505,11 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   // This is the same pattern used by VNC/noVNC and other professional remote
   // desktop implementations to handle async tile/block updates.
   //
+  // DOUBLE BUFFER: updateImage now renders to off-screen canvas for atomic frame updates
   const updateImage = useCallback((data, it, dx, dy, bw, bh, ctx, frameSeq) => {
-    if (!ctx || bw === 0 || bh === 0) return;
+    // Use off-screen context for double buffering (fall back to visible if not available)
+    const targetCtx = offscreenCtxRef.current || ctx;
+    if (!targetCtx || bw === 0 || bh === 0) return;
     if (!data || data.byteLength === 0) return;
 
     // Create position key for version tracking (include block dimensions for safety)
@@ -445,14 +518,16 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     const currentSeq = frameSeq || 0;
     blockVersionRef.current.set(posKey, currentSeq);
 
-    if (it === 0) { // Raw RGBA - synchronous rendering, always safe
+    if (it === 0) { // Raw RGBA - synchronous rendering to off-screen buffer
       try {
         const clamped = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
-        ctx.putImageData(
+        targetCtx.putImageData(
           new ImageData(clamped, bw, bh),
           dx, dy, 0, 0, bw, bh
         );
         blockStatsRef.current.rendered++;
+        // Schedule atomic swap to visible canvas
+        scheduleSwap();
       } catch (err) {
         blockStatsRef.current.failed++;
         log('error', 'ImageData put failed', { error: err?.message, len: data?.byteLength, bw, bh, dx, dy });
@@ -476,7 +551,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       frameSeq: currentSeq,
     });
     scheduleBitmapDecodePump();
-  }, [log, scheduleBitmapDecodePump]);
+  }, [log, scheduleBitmapDecodePump, scheduleSwap]);
 
   const renderBlocks = useCallback((buffer, payloadOffset, frameSeq) => {
     const canvas = canvasRef.current;
@@ -627,6 +702,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       canvas.width = width;
       canvas.height = height;
       ctx.imageSmoothingEnabled = false;
+      // DOUBLE BUFFER: Also resize off-screen canvas
+      if (offscreenCanvasRef.current) {
+        offscreenCanvasRef.current.width = width;
+        offscreenCanvasRef.current.height = height;
+        if (offscreenCtxRef.current) {
+          offscreenCtxRef.current.imageSmoothingEnabled = false;
+        }
+      }
       // Resolution changes invalidate previous block versions
       blockVersionRef.current.clear();
       log('info', 'canvas resized (binary resolution)', { width, height, version: STREAM_VERSION, isFirstResolution });
@@ -731,6 +814,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
           canvas.width = width;
           canvas.height = height;
           ctx.imageSmoothingEnabled = false;
+          // DOUBLE BUFFER: Also resize off-screen canvas
+          if (offscreenCanvasRef.current) {
+            offscreenCanvasRef.current.width = width;
+            offscreenCanvasRef.current.height = height;
+            if (offscreenCtxRef.current) {
+              offscreenCtxRef.current.imageSmoothingEnabled = false;
+            }
+          }
           // Clear block versions on resize (same as handleResolution)
           blockVersionRef.current.clear();
           log('info', 'canvas resized from DESKTOP_INIT', { width, height });
@@ -799,6 +890,14 @@ export function useDesktopStream(device, canvasRef, options = {}) {
           canvas.width = width;
           canvas.height = height;
           ctx.imageSmoothingEnabled = false;
+          // DOUBLE BUFFER: Also resize off-screen canvas
+          if (offscreenCanvasRef.current) {
+            offscreenCanvasRef.current.width = width;
+            offscreenCanvasRef.current.height = height;
+            if (offscreenCtxRef.current) {
+              offscreenCtxRef.current.imageSmoothingEnabled = false;
+            }
+          }
           blockVersionRef.current.clear();
           log('info', 'canvas resized from DESKTOP_CONFIG_ACK', { width, height });
         }

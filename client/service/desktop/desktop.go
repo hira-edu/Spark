@@ -2203,44 +2203,35 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 		})
 	}
 
-	// Keyframe ordering: checkerboard pass to avoid perceptual "top-to-bottom scanline" filling.
-	// This improves startup smoothness on large resolutions when decoding/drawing is slower than the network.
-	for pass := 0; pass < 2; pass++ {
-		blockY := 0
-		for y := rect.Min.Y; y < rect.Max.Y; y += tileSize {
-			// Calculate block height, clamping to image boundary
-			blockH := tileSize
-			if y+tileSize > rect.Max.Y {
-				blockH = rect.Max.Y - y
+	// Strict scanline ordering: send blocks in sequential row-major order.
+	// With double-buffering in the browser, all blocks render to an off-screen canvas
+	// and swap atomically - no visible "tile painting" regardless of arrival order.
+	// Scanline order is simpler and allows better compression locality.
+	for y := rect.Min.Y; y < rect.Max.Y; y += tileSize {
+		// Calculate block height, clamping to image boundary
+		blockH := tileSize
+		if y+tileSize > rect.Max.Y {
+			blockH = rect.Max.Y - y
+		}
+		for x := rect.Min.X; x < rect.Max.X; x += tileSize {
+			// Calculate block width, clamping to image boundary
+			blockW := tileSize
+			if x+tileSize > rect.Max.X {
+				blockW = rect.Max.X - x
 			}
-			blockX := 0
-			for x := rect.Min.X; x < rect.Max.X; x += tileSize {
-				// Calculate block width, clamping to image boundary
-				blockW := tileSize
-				if x+tileSize > rect.Max.X {
-					blockW = rect.Max.X - x
-				}
 
-				if (blockX+blockY)%2 != pass {
-					blockX++
-					continue
-				}
+			// Source rectangle in image coordinates (for pixel extraction)
+			srcRect := image.Rect(x, y, x+blockW, y+blockH)
 
-				// Source rectangle in image coordinates (for pixel extraction)
-				srcRect := image.Rect(x, y, x+blockW, y+blockH)
+			// Destination rectangle normalized to (0,0) origin (for browser canvas)
+			// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
+			normalizedX := x - originX
+			normalizedY := y - originY
+			dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
 
-				// Destination rectangle normalized to (0,0) origin (for browser canvas)
-				// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
-				normalizedX := x - originX
-				normalizedY := y - originY
-				dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
-
-				block, blockCodecType := getImageBlock(img, srcRect)
-				block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
-				result = append(result, &block)
-				blockX++
-			}
-			blockY++
+			block, blockCodecType := getImageBlock(img, srcRect)
+			block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
+			result = append(result, &block)
 		}
 	}
 	return result

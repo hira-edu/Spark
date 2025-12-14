@@ -331,6 +331,22 @@ func init() {
 		Config.Cluster.ProxyTimeoutSeconds = 10
 	}
 
+	// Initialize WebRTC defaults if not configured
+	if Config.WebRTC == nil {
+		Config.WebRTC = &webrtc{}
+	}
+	// Provide default STUN servers if none configured
+	if len(Config.WebRTC.Stun) == 0 {
+		Config.WebRTC.Stun = []string{
+			"stun:stun.l.google.com:19302",
+			"stun:stun.cloudflare.com:3478",
+		}
+	}
+	// Default credential TTL for TURN ephemeral auth
+	if Config.WebRTC.TurnCredentialTTL == 0 {
+		Config.WebRTC.TurnCredentialTTL = 3600
+	}
+
 	golog.SetLevel(utils.If(len(Config.Log.Level) == 0, `info`, Config.Log.Level))
 }
 

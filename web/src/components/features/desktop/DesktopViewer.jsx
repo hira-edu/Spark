@@ -27,7 +27,6 @@ const DesktopViewer = ({
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
   const [selectedMonitor, setSelectedMonitor] = useState(0);
   const [webrtcIceServers, setWebrtcIceServers] = useState(null);
-  const [webrtcIceLoaded, setWebrtcIceLoaded] = useState(false);
   const deviceId = device?.id || null;
 
   // Refs
@@ -40,7 +39,6 @@ const DesktopViewer = ({
   useEffect(() => {
     let cancelled = false;
     setWebrtcIceServers(null);
-    setWebrtcIceLoaded(false);
 
     (async () => {
       try {
@@ -70,8 +68,6 @@ const DesktopViewer = ({
         }
       } catch (_) {
         // Fall back to the hook defaults (public STUN) when config is unavailable.
-      } finally {
-        if (!cancelled) setWebrtcIceLoaded(true);
       }
     })();
 
@@ -127,17 +123,20 @@ const DesktopViewer = ({
     sendSignalRef.current = sendSignal || null;
   }, [sendSignal]);
 
-  // Start WebRTC after the desktop session is initialized (resolution known).
+  // Start WebRTC proactively as soon as WS connects (don't wait for resolution or ICE fetch).
+  // The hook has default STUN servers and will update if server config arrives later.
+  // This eliminates the sequential dependency that was causing slow WebRTC activation.
   useEffect(() => {
-    if (!webrtcIceLoaded) return;
-    if (status !== 'connected') {
-      stopWebRTC();
-      return;
-    }
-    if (resolution?.width > 0 && resolution?.height > 0) {
+    if (status === 'connected') {
+      // Start WebRTC immediately after WS connects (signaling requires an open WS).
       startWebRTC();
+    } else {
+      // Only stop when explicitly disconnected (not during reconnecting)
+      if (status === 'disconnected' || status === 'error') {
+        stopWebRTC();
+      }
     }
-  }, [webrtcIceLoaded, status, resolution?.width, resolution?.height, startWebRTC, stopWebRTC]);
+  }, [status, startWebRTC, stopWebRTC]);
 
   // Input capture hook
   const {
