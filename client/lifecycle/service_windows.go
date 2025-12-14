@@ -224,6 +224,7 @@ func ensureDesktopBridge(sessionID uint32, reason string) {
 	telemetry.LogSessionEvent("desktop bridge ensure requested", sessionID, map[string]interface{}{
 		"reason": reason,
 	})
+	desktop.RecordBridgeEnsure(sessionID, reason)
 
 	// sessionID==0: ask the session manager to rescan and reconcile.
 	if sessionID == 0 {
@@ -721,6 +722,7 @@ func launchUIInSession(sessionID uint32) {
 		"launch_duration": launchDuration.Seconds(),
 		"launch_attempts": state.launchAttempts,
 	})
+	desktop.RecordBridgeLaunch(sessionID, pi.ProcessId)
 
 	// Monitor process exit in background
 	go monitorProcess(sessionID, state.process)
@@ -742,6 +744,8 @@ func terminateUIInSession(sessionID uint32) {
 	telemetry.LogSessionEvent("terminating UI", sessionID, map[string]interface{}{
 		"pid": process.pid,
 	})
+	desktop.RecordBridgeTerminate(sessionID, process.pid, "terminate_ui_in_session")
+	desktop.RecordBridgeExitReason(sessionID, "terminated_by_service")
 
 	// Close job handle - this terminates all processes in the job
 	windows.CloseHandle(process.jobHandle)
@@ -789,6 +793,7 @@ func monitorProcess(sessionID uint32, process *ProcessHandle) {
 	// Get exit code
 	var exitCode uint32
 	windows.GetExitCodeProcess(process.processHandle, &exitCode)
+	desktop.RecordBridgeExit(sessionID, process.pid, exitCode, time.Since(process.startTime))
 
 	sessionStateMu.Lock()
 	state := sessionStates[sessionID]

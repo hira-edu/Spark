@@ -235,6 +235,24 @@ func (r *Relay) handlePacket(payload []byte) {
 		}
 	}
 
+	// Attach Session 0 supervisor diagnostics to aid debugging bridge restarts.
+	// This is especially useful when the UI bridge repeatedly exits and restarts,
+	// resulting in 0 FPS / black screen on the browser side.
+	if pack.Data == nil {
+		pack.Data = map[string]any{}
+	}
+	var diag map[string]interface{}
+	if raw, ok := pack.Data["diag"]; ok && raw != nil {
+		if m, ok := raw.(map[string]interface{}); ok {
+			diag = m
+		}
+	}
+	if diag == nil {
+		diag = map[string]interface{}{}
+		pack.Data["diag"] = diag
+	}
+	diag["service"] = BridgeSupervisorDiag(r.sessionID)
+
 	sendDesktopPacket(pack, rawEvent)
 	telemetry.LogStructured("INFO", "Relay: packet forwarded to server", map[string]interface{}{
 		"session_id": r.sessionID,
