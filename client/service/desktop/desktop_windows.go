@@ -1104,16 +1104,19 @@ func (s *ScreenGDI) Init(_ uint, rect image.Rectangle) (err error) {
 	return nil
 }
 func (s *ScreenGDI) Capture() (*CaptureFrame, error) {
+	const hgdiError = winGDI.HGDIOBJ(^uintptr(0))
+
 	old := winGDI.SelectObject(s.memoryDevice, winGDI.HGDIOBJ(s.bitmap))
-	if old == 0 {
+	if old == 0 || old == hgdiError {
 		return nil, errors.New("SelectObject failed")
 	}
+	defer winGDI.SelectObject(s.memoryDevice, old)
 
-	if !winGDI.BitBlt(s.memoryDevice, 0, 0, int32(s.width), int32(s.height), s.hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), winGDI.SRCCOPY) {
+	if !winGDI.BitBlt(s.memoryDevice, 0, 0, int32(s.width), int32(s.height), s.hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), winGDI.SRCCOPY|winGDI.CAPTUREBLT) {
 		return nil, errors.New("BitBlt failed")
 	}
 
-	if winGDI.GetDIBits(s.hdc, s.bitmap, 0, uint32(s.height), (*uint8)(s.memptr), (*winGDI.BITMAPINFO)(unsafe.Pointer(&s.bitmapInfo)), winGDI.DIB_RGB_COLORS) == 0 {
+	if winGDI.GetDIBits(s.memoryDevice, s.bitmap, 0, uint32(s.height), (*uint8)(s.memptr), (*winGDI.BITMAPINFO)(unsafe.Pointer(&s.bitmapInfo)), winGDI.DIB_RGB_COLORS) == 0 {
 		return nil, errors.New("GetDIBits failed")
 	}
 
