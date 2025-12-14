@@ -108,8 +108,16 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 	}
 
 	appendMode(CaptureBackendNVFBC)
-	appendMode(CaptureBackendDXGI)
-	appendMode(CaptureBackendGDI)
+	// In bridge mode (user-session helper process), DXGI initialization can be flaky/hang
+	// depending on GPU/session state. Prefer GDI first so we always have a working
+	// capture path and keep DXGI as an optional upgrade when explicitly selected.
+	if IsBridgeMode() {
+		appendMode(CaptureBackendGDI)
+		appendMode(CaptureBackendDXGI)
+	} else {
+		appendMode(CaptureBackendDXGI)
+		appendMode(CaptureBackendGDI)
+	}
 
 	if len(final) == 0 {
 		return []CaptureBackendMode{CaptureBackendGDI}
