@@ -547,7 +547,16 @@ func startCaptureWorker() bool {
 	if !atomic.CompareAndSwapInt32(&working, 0, 1) {
 		return false
 	}
-	go worker()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				telemetry.LogStructured("ERROR", "desktop worker panic recovered", map[string]interface{}{
+					"panic": fmt.Sprintf("%v", r),
+				})
+			}
+		}()
+		worker()
+	}()
 	return true
 }
 
@@ -567,6 +576,19 @@ func worker() {
 	}()
 
 	defer atomic.StoreInt32(&working, 0)
+
+	workerDiag.startUnixNs.Store(time.Now().UnixNano())
+	workerDiag.ticksTotal.Store(0)
+	workerDiag.lastTickUnixNs.Store(0)
+	workerDiag.lastSessionsSeen.Store(0)
+	workerDiag.skippedNoSession.Store(0)
+	workerDiag.captureAttempts.Store(0)
+	workerDiag.lastCaptureStartNs.Store(0)
+	workerDiag.lastCaptureEndNs.Store(0)
+	workerDiag.lastCaptureOKUnixNs.Store(0)
+	workerDiag.lastCaptureErr.Store("")
+	workerDiag.setStage("starting")
+	defer workerDiag.setStage("stopped")
 
 	var (
 		numErrors        int
@@ -610,10 +632,12 @@ func worker() {
 				"monitor": activeMonitor,
 				"error":   err.Error(),
 			})
+			workerDiag.setStage("bounds_error")
 			return
 		}
 		displayBounds.Store(currentBounds)
 	}
+	workerDiag.setStage("bounds_ready")
 
 	makeEngineBackends := func(desired CaptureBackendMode) []CaptureBackendMode {
 		// Always allow fallback/rotation on Windows so the worker can recover from
@@ -671,6 +695,7 @@ func worker() {
 
 		captureEngine = newDesktopCaptureEngine(uint(activeMonitor), currentBounds, engineBackends[engineBackendIx])
 		lastEngineStart = time.Now()
+		workerDiag.setStage("engine_created")
 		defer func() {
 			if captureEngine != nil {
 				captureEngine.Stop()
@@ -698,6 +723,7 @@ func worker() {
 		"height":   currentBounds.Dy(),
 		"duration": frameDuration.String(),
 	})
+	workerDiag.setStage("running")
 
 	restartCaptureEngine := func() {
 		if !useCaptureEngine {
@@ -725,12 +751,19 @@ func worker() {
 			// Periodic check: exit if no sessions for extended period
 			if sessions.Count() == 0 {
 				telemetry.LogStructured("INFO", "worker: no active sessions, exiting", nil)
+				workerDiag.setStage("no_sessions_exit")
 				return
 			}
 
 		case tickTime := <-ticker.C:
+			workerDiag.ticksTotal.Add(1)
+			workerDiag.lastTickUnixNs.Store(tickTime.UnixNano())
+			sessCount := sessions.Count()
+			workerDiag.lastSessionsSeen.Store(int64(sessCount))
+
 			// Skip if no active sessions (but don't exit immediately)
-			if sessions.Count() == 0 {
+			if sessCount == 0 {
+				workerDiag.skippedNoSession.Add(1)
 				continue
 			}
 
@@ -815,6 +848,9 @@ func worker() {
 
 			// Capture frame
 			if useCaptureEngine {
+				workerDiag.setStage("capture")
+				workerDiag.captureAttempts.Add(1)
+				workerDiag.lastCaptureStartNs.Store(time.Now().UnixNano())
 				timeout := frameDuration / 2
 				if timeout < 150*time.Millisecond {
 					timeout = 150 * time.Millisecond
@@ -826,6 +862,11 @@ func worker() {
 					restartCaptureEngine()
 				}
 				frame, err = captureEngine.Capture(timeout)
+				workerDiag.lastCaptureEndNs.Store(time.Now().UnixNano())
+				workerDiag.setCaptureErr(err)
+				if err == nil || errors.Is(err, errNoImage) {
+					workerDiag.lastCaptureOKUnixNs.Store(time.Now().UnixNano())
+				}
 				if errors.Is(err, errCaptureEngineTimeout) {
 					// Rotate backend overrides with a small cooldown to avoid thrashing.
 					const restartCooldown = 2 * time.Second
@@ -836,8 +877,17 @@ func worker() {
 					continue
 				}
 			} else {
+				workerDiag.setStage("capture")
+				workerDiag.captureAttempts.Add(1)
+				workerDiag.lastCaptureStartNs.Store(time.Now().UnixNano())
 				frame, err = screen.Capture()
+				workerDiag.lastCaptureEndNs.Store(time.Now().UnixNano())
+				workerDiag.setCaptureErr(err)
+				if err == nil || errors.Is(err, errNoImage) {
+					workerDiag.lastCaptureOKUnixNs.Store(time.Now().UnixNano())
+				}
 			}
+			workerDiag.setStage("post_capture")
 			if frame != nil {
 				img = frame.Image
 			} else {

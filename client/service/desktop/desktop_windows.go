@@ -917,7 +917,22 @@ func (s *Screen) Capture() (*CaptureFrame, error) {
 	}
 
 	start := time.Now()
-	frame, err := s.screen.Capture()
+	var (
+		frame *CaptureFrame
+		err   error
+	)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic in capture backend: %v", r)
+				telemetry.LogStructured("ERROR", "Panic during desktop capture", map[string]interface{}{
+					"backend": getActiveCaptureBackend(),
+					"panic":   r,
+				})
+			}
+		}()
+		frame, err = s.screen.Capture()
+	}()
 	latency := time.Since(start)
 
 	captureLastEnd.Store(time.Now().UnixNano())

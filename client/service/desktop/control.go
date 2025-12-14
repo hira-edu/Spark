@@ -273,6 +273,8 @@ skipCodec:
 		"frame_callback_set":  getFrameCallback() != nil,
 		"prev_frame_present":  prevDesktop.Load() != nil,
 		"capture_backend_act": getActiveCaptureBackend(),
+		"process":             ProcessDiagStats(),
+		"worker":              WorkerDiagStats(),
 		"capture_stats":       CaptureStats(),
 		"capture_engine":      CaptureEngineStats(),
 	}

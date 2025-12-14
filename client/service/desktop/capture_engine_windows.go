@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"errors"
+	"fmt"
 	"image"
 	"runtime"
 	"sync"
@@ -19,23 +20,23 @@ type captureEngineResult struct {
 }
 
 var (
-	captureEngineGen            atomic.Uint64
-	captureEngineStarts         atomic.Uint64
-	captureEngineStops          atomic.Uint64
-	captureEngineLastGen        atomic.Uint64
-	captureEngineLastOverride   atomic.Value // string
-	captureEngineInitStartUnix  atomic.Int64
-	captureEngineInitEndUnix    atomic.Int64
-	captureEngineInitDone       atomic.Bool
-	captureEngineCaptureCalls   atomic.Uint64
-	captureEngineReqEnqueued    atomic.Uint64
-	captureEngineReqReceived    atomic.Uint64
-	captureEngineRespSent       atomic.Uint64
-	captureEngineLastCallUnix   atomic.Int64
-	captureEngineLastReqUnix    atomic.Int64
-	captureEngineLastRespUnix   atomic.Int64
-	captureEngineLastTimeouts   atomic.Uint64
-	captureEngineLastError      atomic.Value // string
+	captureEngineGen           atomic.Uint64
+	captureEngineStarts        atomic.Uint64
+	captureEngineStops         atomic.Uint64
+	captureEngineLastGen       atomic.Uint64
+	captureEngineLastOverride  atomic.Value // string
+	captureEngineInitStartUnix atomic.Int64
+	captureEngineInitEndUnix   atomic.Int64
+	captureEngineInitDone      atomic.Bool
+	captureEngineCaptureCalls  atomic.Uint64
+	captureEngineReqEnqueued   atomic.Uint64
+	captureEngineReqReceived   atomic.Uint64
+	captureEngineRespSent      atomic.Uint64
+	captureEngineLastCallUnix  atomic.Int64
+	captureEngineLastReqUnix   atomic.Int64
+	captureEngineLastRespUnix  atomic.Int64
+	captureEngineLastTimeouts  atomic.Uint64
+	captureEngineLastError     atomic.Value // string
 )
 
 // desktopCaptureEngine runs desktop capture on a dedicated OS thread (Windows),
@@ -74,6 +75,14 @@ func newDesktopCaptureEngine(displayIndex uint, rect image.Rectangle, override C
 }
 
 func (e *desktopCaptureEngine) run() {
+	defer func() {
+		if r := recover(); r != nil {
+			captureEngineLastError.Store(fmt.Sprintf("panic: %v", r))
+			// Best-effort: stop the engine so the worker can restart cleanly.
+			e.Stop()
+		}
+	}()
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
