@@ -6,6 +6,8 @@ import (
 	"Rocket/utils/cmap"
 	"Rocket/utils/melody"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/hex"
 	"github.com/gin-gonic/gin"
 	"net"
@@ -143,25 +145,41 @@ func CheckDevice(deviceID, connUUID string) (string, bool) {
 	return ``, false
 }
 
-// EncAES - Encryption removed; TLS provides transport security.
-// Returns data unchanged. Key parameter kept for API compatibility.
-// Used for both config encryption and client key generation.
+// EncAES is kept for format compatibility with older clients.
+// Newer builds do not apply application-layer encryption (TLS provides transport security),
+// so this returns a copy of data unchanged.
 func EncAES(data []byte, key []byte) ([]byte, error) {
 	_ = key // Unused - kept for API compatibility
-	// Return a copy for safety (no encryption needed - TLS handles security)
 	return append([]byte(nil), data...), nil
 }
 
-// DecAES - Decryption removed; TLS provides transport security.
-// Returns data unchanged. Supports both old encrypted format and new plaintext.
-// Key parameter kept for API compatibility.
+// DecAES supports backward compatibility with older clients that used a lightweight
+// obfuscation scheme: MD5[16] + AES-CTR(plaintext, iv=MD5, key=saltBytes).
+//
+// For newer plaintext payloads, it returns a copy of data unchanged.
 func DecAES(data []byte, key []byte) ([]byte, error) {
-	_ = key // Unused - kept for API compatibility
 	if len(data) == 0 {
 		return nil, nil
 	}
-	// Return a copy for safety (no decryption needed - TLS handles security)
-	return append([]byte(nil), data...), nil
+	if len(data) <= 16 {
+		// New format: plaintext (just return a copy as-is)
+		return append([]byte(nil), data...), nil
+	}
+
+	// Old format: try to decrypt and verify.
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	stream := cipher.NewCTR(block, data[:16])
+	decBuffer := make([]byte, len(data)-16)
+	stream.XORKeyStream(decBuffer, data[16:])
+	hash, _ := utils.GetMD5(decBuffer)
+	if !bytes.Equal(hash, data[:16]) {
+		// Not in legacy encrypted format, return as-is.
+		return append([]byte(nil), data...), nil
+	}
+	return decBuffer, nil
 }
 
 // Legacy function registration system - DEPRECATED

@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"strings"
 
+	"Rocket/server/common"
+	"Rocket/server/config"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -38,7 +41,8 @@ func DeviceAuthMiddleware() gin.HandlerFunc {
 		case 16:
 			authValid = bytes.Equal(keyBytes, uuid)
 		case 32:
-			authValid = bytes.Equal(keyBytes[:16], uuid)
+			decKey, err := common.DecAES(keyBytes, config.Config.SaltBytes)
+			authValid = err == nil && len(decKey) == 16 && bytes.Equal(decKey, uuid)
 		}
 
 		if !authValid {

@@ -88,8 +88,6 @@ func TestInitiatePunchHandler(t *testing.T) {
 	setPeerStoreForTest(newMemoryPeerStore(peerTTL))
 
 	router := setupTestRouter()
-	peerAID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	peerBID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	// First, register two peers
 	registerPeerA := map[string]any{
@@ -345,8 +343,8 @@ func TestPunchSessionExpiry(t *testing.T) {
 	// Add an expired session
 	punchSessions["expired-session"] = &PunchSession{
 		SessionID:   "expired-session",
-		InitiatorID: "peer-a",
-		TargetID:    "peer-b",
+		InitiatorID: peerAUUID,
+		TargetID:    peerBUUID,
 		Status:      "pending",
 		ExpiresAt:   timeNow().Add(-1 * time.Second), // Already expired
 	}
@@ -356,13 +354,13 @@ func TestPunchSessionExpiry(t *testing.T) {
 
 	// Register peer
 	registerReq := map[string]any{
-		"peer_id": "peer-a",
+		"peer_id": peerAUUID,
 		"endpoints": []map[string]any{
 			{"protocol": "tcp", "host": "1.2.3.4", "port": 12345},
 		},
 	}
 	body, _ := json.Marshal(registerReq)
-	req := httptest.NewRequest("POST", "/p2p/rendezvous/register", bytes.NewReader(body))
+	req := newDeviceRequestWithUUID("POST", "/p2p/rendezvous/register", peerAUUID, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
@@ -375,13 +373,13 @@ func TestPunchSessionExpiry(t *testing.T) {
 	// Try to exchange with expired session
 	exchangeReq := map[string]any{
 		"session_id": "expired-session",
-		"peer_id":    "peer-a",
+		"peer_id":    peerAUUID,
 		"token":      regResp.Token,
 		"success":    true,
 	}
 
 	body, _ = json.Marshal(exchangeReq)
-	req = httptest.NewRequest("POST", "/p2p/punch/exchange", bytes.NewReader(body))
+	req = newDeviceRequestWithUUID("POST", "/p2p/punch/exchange", peerAUUID, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp = httptest.NewRecorder()
 
