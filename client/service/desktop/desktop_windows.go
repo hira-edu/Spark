@@ -661,6 +661,21 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 	}
 
 	desired := getConfiguredCaptureBackend()
+	// In bridge mode, prefer a pure screenshot path to avoid backend init/capture hangs
+	// that can stall the entire worker (manifesting as 0fps/black screen).
+	if IsBridgeMode() && desired == CaptureBackendAuto {
+		ss := &ScreenScreenshot{}
+		_ = ss.Init(displayIndex, rect)
+		s.screen = ss
+		setActiveCaptureBackend("screenshot")
+		telemetry.LogStructured("WARN", "Bridge mode: forcing screenshot capture backend", map[string]interface{}{
+			"display":           displayIndex,
+			"rect":              rect.String(),
+			"requested_backend": captureBackendName(desired),
+		})
+		return
+	}
+
 	order := backendPreferenceOrder(desired)
 	var (
 		initSuccess bool
