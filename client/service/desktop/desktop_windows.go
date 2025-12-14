@@ -234,6 +234,90 @@ type ScreenGDI struct {
 	memptr         unsafe.Pointer
 }
 
+// ScreenGDICompat performs GDI capture using per-call resources instead of
+// keeping persistent device contexts. This is slower than ScreenGDI but avoids
+// init-time hangs seen on some Windows environments.
+type ScreenGDICompat struct {
+	rect image.Rectangle
+}
+
+func (s *ScreenGDICompat) Init(_ uint, rect image.Rectangle) error {
+	s.rect = rect
+	return nil
+}
+
+func (s *ScreenGDICompat) Capture() (*CaptureFrame, error) {
+	width := s.rect.Dx()
+	height := s.rect.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, errors.New("invalid capture bounds")
+	}
+
+	hwnd := getDesktopWindow()
+	hdc := winGDI.GetDC(hwnd)
+	if hdc == 0 {
+		return nil, errors.New("GetDC failed")
+	}
+	defer winGDI.ReleaseDC(hwnd, hdc)
+
+	memoryDevice := winGDI.CreateCompatibleDC(hdc)
+	if memoryDevice == 0 {
+		return nil, errors.New("CreateCompatibleDC failed")
+	}
+	defer winGDI.DeleteDC(memoryDevice)
+
+	bitmap := winGDI.CreateCompatibleBitmap(hdc, int32(width), int32(height))
+	if bitmap == 0 {
+		return nil, errors.New("CreateCompatibleBitmap failed")
+	}
+	defer winGDI.DeleteObject(winGDI.HGDIOBJ(bitmap))
+
+	const hgdiError = winGDI.HGDIOBJ(^uintptr(0))
+	old := winGDI.SelectObject(memoryDevice, winGDI.HGDIOBJ(bitmap))
+	if old == 0 || old == hgdiError {
+		return nil, errors.New("SelectObject failed")
+	}
+	defer winGDI.SelectObject(memoryDevice, old)
+
+	if !winGDI.BitBlt(memoryDevice, 0, 0, int32(width), int32(height), hdc, int32(s.rect.Min.X), int32(s.rect.Min.Y), winGDI.SRCCOPY|winGDI.CAPTUREBLT) {
+		return nil, errors.New("BitBlt failed")
+	}
+
+	var header winGDI.BITMAPINFOHEADER
+	header.BiSize = uint32(unsafe.Sizeof(header))
+	header.BiPlanes = 1
+	header.BiBitCount = 32
+	header.BiWidth = int32(width)
+	header.BiHeight = -int32(height)
+	header.BiCompression = winGDI.BI_RGB
+	header.BiSizeImage = 0
+
+	bitmapDataSize := uintptr(((int64(width)*int64(header.BiBitCount) + 31) / 32) * 4 * int64(height))
+	hmem := winGDI.GlobalAlloc(winGDI.GMEM_MOVEABLE, bitmapDataSize)
+	if hmem == 0 {
+		return nil, errors.New("GlobalAlloc failed")
+	}
+	defer winGDI.GlobalFree(hmem)
+	memptr := winGDI.GlobalLock(hmem)
+	if memptr == nil {
+		return nil, errors.New("GlobalLock failed")
+	}
+	defer winGDI.GlobalUnlock(hmem)
+
+	if winGDI.GetDIBits(memoryDevice, bitmap, 0, uint32(height), (*uint8)(memptr), (*winGDI.BITMAPINFO)(unsafe.Pointer(&header)), winGDI.DIB_RGB_COLORS) == 0 {
+		return nil, errors.New("GetDIBits failed")
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	imageBytes := ((*[1 << 30]byte)(unsafe.Pointer(memptr)))[:bitmapDataSize:bitmapDataSize]
+	copy(img.Pix[:bitmapDataSize], imageBytes)
+	swizzle.BGRA(img.Pix)
+
+	return &CaptureFrame{Image: img}, nil
+}
+
+func (s *ScreenGDICompat) Release() {}
+
 // ScreenScreenshot is a last-resort fallback that uses github.com/kbinani/screenshot
 // to capture pixels when all Windows-specific backends fail to initialize.
 //
@@ -741,7 +825,12 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			dxgiFailed = false
 
 		case CaptureBackendGDI:
-			gdi := &ScreenGDI{}
+			var gdi ScreenCapture
+			if IsBridgeMode() {
+				gdi = &ScreenGDICompat{}
+			} else {
+				gdi = &ScreenGDI{}
+			}
 			if err := tryInitWithTimeout("gdi", func() error { return gdi.Init(displayIndex, rect) }, gdi.Release, 2*time.Second); err != nil {
 				telemetry.LogStructured("ERROR", "GDI initialization failed", map[string]interface{}{
 					"display": displayIndex,
@@ -771,12 +860,22 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 
 	// Last-resort fallback: use screenshot library if all optimized backends fail.
 	if !initSuccess {
-		ss := &ScreenScreenshot{}
-		if err := ss.Init(displayIndex, rect); err == nil {
-			s.screen = ss
-			setActiveCaptureBackend("screenshot")
+		var fallback ScreenCapture
+		fallbackName := "screenshot"
+		if IsBridgeMode() {
+			// In bridge mode, prefer the pure-GDI compat path over kbinani/screenshot
+			// to avoid known hangs around GetDIBits on some systems.
+			fallback = &ScreenGDICompat{}
+			fallbackName = "gdi"
+		} else {
+			fallback = &ScreenScreenshot{}
+		}
+		if err := fallback.Init(displayIndex, rect); err == nil {
+			s.screen = fallback
+			setActiveCaptureBackend(fallbackName)
 			initSuccess = true
-			telemetry.LogStructured("WARN", "Falling back to screenshot capture backend", map[string]interface{}{
+			telemetry.LogStructured("WARN", "Falling back to capture backend", map[string]interface{}{
+				"backend":           fallbackName,
 				"display":           displayIndex,
 				"rect":              rect.String(),
 				"requested_backend": captureBackendName(desired),
