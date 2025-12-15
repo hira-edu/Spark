@@ -2,8 +2,10 @@
 
 var Zmodem = module.exports;
 
-//TODO: Make this usable without require.js or what not.
-window.Zmodem = Zmodem;
+// Expose a global for non-bundled browser integrations (webpack builds can still `require()` this module).
+if (typeof window !== "undefined") {
+    window.Zmodem = Zmodem;
+}
 
 Object.assign(
     Zmodem,

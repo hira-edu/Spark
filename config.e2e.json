@@ -1,0 +1,20 @@
+{
+  "listen": ":18080",
+  "salt": "testsalt1234567890123",
+  "auth": {
+    "admin": "admin123"
+  },
+  "log": {
+    "level": "info",
+    "path": "./logs",
+    "days": 1
+  },
+  "webrtc": {
+    "stun_servers": [
+      "stun:stun.l.google.com:19302",
+      "stun:stun.cloudflare.com:3478"
+    ],
+    "turn_servers": []
+  }
+}
+

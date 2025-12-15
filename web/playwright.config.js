@@ -60,11 +60,13 @@ export default defineConfig({
     // },
   ],
 
-  /* Run your local dev server before starting the tests */
-  webServer: process.env.CI ? undefined : {
-    command: 'npm run start',
-    url: 'http://localhost:18080',
-    reuseExistingServer: true,
+  /* Run Rocket server before starting the tests */
+  webServer: {
+    command: process.platform === 'win32'
+      ? 'go run ..\\\\server -config ..\\\\config.e2e.json'
+      : 'go run ../server -config ../config.e2e.json',
+    url: process.env.BASE_URL || 'http://localhost:18080',
+    reuseExistingServer: !process.env.CI,
     timeout: 120000,
   },
 

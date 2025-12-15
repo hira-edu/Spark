@@ -92,7 +92,13 @@ func dxgiCaptureTimeoutMillis() int {
 		fps = fpsDefault
 	}
 	frameDuration := time.Second / time.Duration(fps)
-	timeout := frameDuration / 2
+	// Use a timeout close to the expected frame cadence. Using a shorter timeout
+	// can cause phase-locking where we repeatedly miss periodic updates (e.g. a
+	// 30Hz timer-driven window) and spuriously return WAIT_TIMEOUT (errNoImage),
+	// which stalls streaming despite actual desktop changes.
+	// Add a small slack so we don't "just miss" periodic updates and get stuck
+	// returning WAIT_TIMEOUT in lockstep with a fixed ticker cadence.
+	timeout := frameDuration + frameDuration/2
 	if timeout < time.Duration(minDXGICaptureTimeoutMS)*time.Millisecond {
 		timeout = time.Duration(minDXGICaptureTimeoutMS) * time.Millisecond
 	}
@@ -135,13 +141,19 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 		// capture path and keep DXGI as an optional upgrade when explicitly selected.
 		appendMode(CaptureBackendGDI)
 		appendMode(CaptureBackendDXGI)
+		appendMode(CaptureBackendDXGI_NV12)
 		// NVFBC probing/initialization can be costly or unstable in some environments;
 		// only attempt it after other backends fail unless explicitly requested.
-		appendMode(CaptureBackendNVFBC)
+		if nvfbcSupported() {
+			appendMode(CaptureBackendNVFBC)
+		}
 	} else {
-		// Prefer NVFBC in non-bridge mode when available.
-		appendMode(CaptureBackendNVFBC)
-		appendMode(CaptureBackendDXGI)
+		// Prefer GPU-native NV12 in non-bridge mode for best performance.
+		appendMode(CaptureBackendDXGI_NV12) // Try GPU-native NV12 first
+		if nvfbcSupported() {
+			appendMode(CaptureBackendNVFBC)
+		}
+		appendMode(CaptureBackendDXGI) // Fallback to standard DXGI
 		appendMode(CaptureBackendGDI)
 	}
 
@@ -228,9 +240,12 @@ type pointerInfo struct {
 }
 
 type ScreenDXGI struct {
-	rect      image.Rectangle
-	device    *d3d11.ID3D11Device
-	deviceCtx *d3d11.ID3D11DeviceContext
+	rect         image.Rectangle
+	displayIndex uint
+	adapterIndex uint
+	outputIndex  uint
+	device       *d3d11.ID3D11Device
+	deviceCtx    *d3d11.ID3D11DeviceContext
 
 	duplicator *dxgi.IDXGIOutputDuplication
 	stagedTex  *d3d11.ID3D11Texture2D
@@ -551,6 +566,88 @@ func (s *ScreenDXGI) initDuplicator(displayIndex uint) error {
 	return nil
 }
 
+func (s *ScreenDXGI) initDuplicatorSelected(sel *dxgiOutputSelection) error {
+	if sel == nil {
+		return errors.New("nil selection")
+	}
+	if s.device == nil {
+		return errors.New("dxgi device not initialized")
+	}
+
+	var hr int32
+	var dxgiDevice1 *dxgi.IDXGIDevice1
+	hr = s.device.QueryInterface(dxgi.IID_IDXGIDevice1, &dxgiDevice1)
+	if d3d.HRESULT(hr).Failed() {
+		return fmt.Errorf("dxgi device query failed: %w", d3d.HRESULT(hr))
+	}
+	defer dxgiDevice1.Release()
+
+	adapter, output, err := openDXGIAdapterOutput(sel)
+	if err != nil {
+		return err
+	}
+	defer output.Release()
+	defer adapter.Release()
+
+	logDXGIAdapterInfo(adapter, output, s.displayIndex)
+
+	var dup *dxgi.IDXGIOutputDuplication
+	formats := []dxgi.DXGI_FORMAT{dxgi.DXGI_FORMAT_R8G8B8A8_UNORM}
+
+	var output5 *dxgi.IDXGIOutput5
+	hr = output.QueryInterface(dxgi.IID_IDXGIOutput5, &output5)
+	s.needsSwizzle = false
+	if !d3d.HRESULT(hr).Failed() {
+		defer output5.Release()
+		hr = output5.DuplicateOutput1(dxgiDevice1, 0, formats, &dup)
+	}
+	if dup == nil || d3d.HRESULT(hr).Failed() {
+		s.needsSwizzle = true
+		var output1 *dxgi.IDXGIOutput1
+		hr = output.QueryInterface(dxgi.IID_IDXGIOutput1, &output1)
+		if d3d.HRESULT(hr).Failed() {
+			return fmt.Errorf("dxgi output1 query failed: %w", d3d.HRESULT(hr))
+		}
+		defer output1.Release()
+		hr = output1.DuplicateOutput(dxgiDevice1, &dup)
+		if d3d.HRESULT(hr).Failed() {
+			return fmt.Errorf("dxgi duplicate output failed: %w", d3d.HRESULT(hr))
+		}
+	}
+
+	s.duplicator = dup
+	s.shouldDrawPointer = true
+	return nil
+}
+
+func (s *ScreenDXGI) resetDuplicator(reason d3d.HRESULT) error {
+	full := reason == d3d.DXGI_ERROR_DEVICE_REMOVED ||
+		reason == d3d.DXGI_ERROR_DEVICE_RESET ||
+		reason == d3d.DXGI_ERROR_DEVICE_HUNG ||
+		reason == d3d.DXGI_ERROR_DRIVER_INTERNAL_ERROR
+
+	if s.duplicator != nil {
+		s.duplicator.Release()
+		s.duplicator = nil
+	}
+
+	if full {
+		s.Release()
+		return s.Init(s.displayIndex, s.rect)
+	}
+
+	if sel, err := findDXGIOutputForRect(s.rect); err == nil && sel != nil {
+		if sel.AdapterIndex != s.adapterIndex {
+			s.Release()
+			return s.Init(s.displayIndex, s.rect)
+		}
+		s.outputIndex = sel.OutputIndex
+		return s.initDuplicatorSelected(sel)
+	}
+
+	return s.initDuplicator(s.displayIndex)
+}
+
 func (s *ScreenDXGI) ensureStage(texture *d3d11.ID3D11Texture2D) error {
 	desc := d3d11.D3D11_TEXTURE2D_DESC{}
 	if hr := texture.GetDesc(&desc); d3d.HRESULT(hr).Failed() {
@@ -779,6 +876,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			}
 			s.screen = shared
 			setActiveCaptureBackend("shared_surface")
+			setCaptureD3D11Device(nil)
 			initSuccess = true
 
 		case CaptureBackendNVFBC:
@@ -804,7 +902,23 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			}
 			s.screen = nvfbc
 			setActiveCaptureBackend("nvfbc")
+			setCaptureD3D11Device(nil)
 			initSuccess = true
+
+		case CaptureBackendDXGI_NV12:
+			dxgiNV12 := &ScreenDXGINV12{displayIndex: displayIndex, rect: rect}
+			if err := tryInit("dxgi_nv12", func() error { return dxgiNV12.Init(displayIndex, rect) }, dxgiNV12.Release); err != nil {
+				telemetry.LogStructured("WARN", "DXGI NV12 initialization failed, falling back", map[string]interface{}{
+					"display": displayIndex,
+					"error":   err.Error(),
+				})
+				continue
+			}
+			s.screen = dxgiNV12
+			setActiveCaptureBackend("dxgi_nv12")
+			setCaptureD3D11Device(dxgiNV12.GetD3D11Device())
+			initSuccess = true
+			dxgiFailed = false
 
 		case CaptureBackendDXGI:
 			dxgi := &ScreenDXGI{}
@@ -818,6 +932,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			}
 			s.screen = dxgi
 			setActiveCaptureBackend("dxgi")
+			setCaptureD3D11Device(nil)
 			initSuccess = true
 			dxgiFailed = false
 
@@ -847,6 +962,7 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			}
 			s.screen = gdi
 			setActiveCaptureBackend("gdi")
+			setCaptureD3D11Device(nil)
 			initSuccess = true
 			dxgiFailed = false
 		}
@@ -962,6 +1078,7 @@ func (s *Screen) Release() {
 	if s.screen != nil {
 		s.screen.Release()
 	}
+	setCaptureD3D11Device(nil)
 	telemetry.LogStructured("INFO", "Desktop capture released", map[string]interface{}{
 		"platform":       runtime.GOOS,
 		"backend":        getActiveCaptureBackend(),
@@ -981,12 +1098,43 @@ func (s *ScreenDXGI) Init(displayIndex uint, rect image.Rectangle) (err error) {
 	}()
 
 	s.rect = rect
+	s.displayIndex = displayIndex
 	if !winDXGI.IsValidDpiAwarenessContext(winDXGI.DpiAwarenessContextPerMonitorAwareV2) {
 		return errors.New("no valid DPI awareness context")
 	}
 	_, err = winDXGI.SetThreadDpiAwarenessContext(winDXGI.DpiAwarenessContextPerMonitorAwareV2)
 	if err != nil {
 		return err
+	}
+
+	sel, _ := findDXGIOutputForRect(rect)
+	var adapter *dxgi.IDXGIAdapter1
+	if sel != nil {
+		var output *dxgi.IDXGIOutput
+		var openErr error
+		adapter, output, openErr = openDXGIAdapterOutput(sel)
+		if openErr != nil {
+			adapter = nil
+			sel = nil
+		} else if output != nil {
+			output.Release()
+		}
+	}
+
+	if adapter != nil {
+		s.adapterIndex = sel.AdapterIndex
+		s.outputIndex = sel.OutputIndex
+		s.device, s.deviceCtx, err = createD3D11DeviceForAdapter(adapter)
+		adapter.Release()
+		if err == nil {
+			if err := s.initDuplicatorSelected(sel); err != nil {
+				s.Release()
+				return err
+			}
+			return nil
+		}
+		// Fall back to legacy init if adapter-specific device creation fails.
+		s.Release()
 	}
 
 	s.device, s.deviceCtx, err = d3d11.NewD3D11Device()
@@ -1006,6 +1154,10 @@ func (s *ScreenDXGI) Capture() (*CaptureFrame, error) {
 		return nil, errors.New("dxgi duplicator not initialized")
 	}
 
+	if winDXGI.IsValidDpiAwarenessContext(winDXGI.DpiAwarenessContextPerMonitorAwareV2) {
+		_, _ = winDXGI.SetThreadDpiAwarenessContext(winDXGI.DpiAwarenessContextPerMonitorAwareV2)
+	}
+
 	timeout := dxgiCaptureTimeoutMillis()
 	var frameInfo dxgi.DXGI_OUTDUPL_FRAME_INFO
 	var desktopResource *dxgi.IDXGIResource
@@ -1016,6 +1168,14 @@ func (s *ScreenDXGI) Capture() (*CaptureFrame, error) {
 		return nil, errNoImage
 	}
 	if d3d.HRESULT(hr).Failed() {
+		if shouldResetDXGI(d3d.HRESULT(hr)) {
+			telemetry.LogStructured("WARN", "dxgi capture reset", map[string]interface{}{
+				"display": s.displayIndex,
+				"reason":  fmt.Sprintf("0x%08X", uint32(d3d.HRESULT(hr))),
+			})
+			_ = s.resetDuplicator(d3d.HRESULT(hr))
+			return nil, errNoImage
+		}
 		return nil, fmt.Errorf("dxgi acquire frame failed: %w", d3d.HRESULT(hr))
 	}
 	defer s.duplicator.ReleaseFrame()

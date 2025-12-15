@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { request } from '../../../../utils/utils';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { getBaseURL } from '../../../../utils/utils';
 
 /**
  * useAudioStream - Hook for managing audio streaming from remote device
@@ -20,25 +21,40 @@ const useAudioStream = (device) => {
   const wsRef = useRef(null);
   const audioContextRef = useRef(null);
   const startTimeRef = useRef(null);
-  const streamUuidRef = useRef(null);
+  const decoderRef = useRef(null);
+  const nextPlayTimeRef = useRef(0);
+  const tsRef = useRef(0);
 
-  // Fetch available audio devices from remote
-  const fetchDevices = useCallback(async () => {
-    if (!device?.id) return;
+  const decodeAndPlay = useCallback((packet) => {
+    const ctx = audioContextRef.current;
+    const decoder = decoderRef.current;
+    if (!ctx || !decoder || !packet || packet.byteLength === 0) return;
+
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
 
     try {
-      const res = await request('/api/device/audio/devices', {
-        device: device.id,
-      });
+      const ts = tsRef.current;
+      tsRef.current += 20_000; // 20ms in microseconds (best-effort)
 
-      if (res.data?.code === 0 && res.data?.data) {
-        setDevices(res.data.data.devices || []);
-      }
-    } catch (err) {
-      console.error('Failed to fetch audio devices:', err);
-      setDevices([]);
+      const chunk = new EncodedAudioChunk({
+        type: 'key',
+        timestamp: ts,
+        data: packet,
+      });
+      decoder.decode(chunk);
+    } catch (_) {
+      // Ignore decode errors; decoder state may vary across browsers.
     }
-  }, [device?.id]);
+  }, []);
+
+  // Fetch available audio devices from remote via active WS session.
+  const fetchDevices = useCallback(async () => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ act: 'AUDIO_LIST' }));
+  }, []);
 
   // Initialize WebAudio context
   const initAudioContext = useCallback(() => {
@@ -52,6 +68,50 @@ const useAudioStream = (device) => {
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
+
+    // Initialize WebCodecs Opus decoder when available.
+    if (!decoderRef.current && typeof AudioDecoder !== 'undefined') {
+      const ctx = audioContextRef.current;
+      const decoder = new AudioDecoder({
+        output: (audio) => {
+          try {
+            const frames = audio.numberOfFrames;
+            const channels = audio.numberOfChannels;
+            const sampleRate = audio.sampleRate;
+            const buf = ctx.createBuffer(channels, frames, sampleRate);
+
+            for (let ch = 0; ch < channels; ch += 1) {
+              const plane = new Float32Array(frames);
+              audio.copyTo(plane, { planeIndex: ch });
+              buf.getChannelData(ch).set(plane);
+            }
+            audio.close();
+
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+
+            const now = ctx.currentTime;
+            if (!nextPlayTimeRef.current || nextPlayTimeRef.current < now) {
+              nextPlayTimeRef.current = now + 0.03;
+            }
+            src.start(nextPlayTimeRef.current);
+            nextPlayTimeRef.current += buf.duration;
+          } catch (_) {
+            try { audio.close(); } catch (_) {}
+          }
+        },
+        error: () => {},
+      });
+
+      try {
+        decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+        decoderRef.current = decoder;
+        tsRef.current = 0;
+      } catch (_) {
+        try { decoder.close(); } catch (_) {}
+      }
+    }
   }, []);
 
   // Start audio stream
@@ -63,9 +123,6 @@ const useAudioStream = (device) => {
     setStatus('connecting');
     initAudioContext();
 
-    // Generate unique stream UUID
-    const streamUuid = `audio-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    streamUuidRef.current = streamUuid;
     startTimeRef.current = Date.now();
 
     // Reset stats
@@ -79,60 +136,51 @@ const useAudioStream = (device) => {
     });
 
     // Connect WebSocket
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/audio/connect?device=${device.id}`;
-
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(getBaseURL(true, `api/device/audio?device=${device.id}`));
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log('Audio WebSocket connected');
-
-      // Send start command
-      ws.send(JSON.stringify({
-        act: 'AUDIO_SELECT',
-        data: {
-          uuid: streamUuid,
-          device: deviceIndex,
-        },
-      }));
-
+      // Send select/start command
+      ws.send(JSON.stringify({ act: 'AUDIO_SELECT', data: { device: deviceIndex } }));
       setStatus('streaming');
     };
 
     ws.onmessage = (event) => {
       try {
-        // Parse message (could be text or binary)
         if (typeof event.data === 'string') {
           const msg = JSON.parse(event.data);
-
-          // Handle control messages
-          if (msg.act === 'AUDIO_ERROR') {
-            console.error('Audio error from server:', msg.data);
-            setStatus('error');
-          } else if (msg.act === 'AUDIO_DEVICES') {
-            setDevices(msg.data.devices || []);
+          if (msg.act === 'AUDIO_LIST' && msg.code === 0) {
+            setDevices(msg?.data?.devices || []);
           }
-        } else if (event.data instanceof ArrayBuffer) {
-          // Handle binary audio data
-          const audioBuffer = event.data;
-          const byteLength = audioBuffer.byteLength;
+          if (msg.act === 'AUDIO_ERROR') {
+            setStatus('error');
+          }
+          return;
+        }
 
-          // Update stats
+        if (event.data instanceof ArrayBuffer) {
+          const buf = new Uint8Array(event.data);
+          const isMagic = buf.length >= 6 && buf[0] === 34 && buf[1] === 22 && buf[2] === 19 && buf[3] === 17 && buf[4] === 23 && buf[5] === 5;
+          if (isMagic) {
+            const txt = new TextDecoder().decode(buf.slice(6));
+            const msg = JSON.parse(txt);
+            if (msg.act === 'AUDIO_LIST' && msg.code === 0) {
+              setDevices(msg?.data?.devices || []);
+            }
+            return;
+          }
+
+          // Raw Opus packet
+          const byteLength = buf.byteLength;
           setStats(prev => ({
             ...prev,
             packetsReceived: prev.packetsReceived + 1,
             bytesReceived: prev.bytesReceived + byteLength,
             duration: (Date.now() - startTimeRef.current) / 1000,
           }));
-
-          // Store audio data for visualizer
-          setAudioData(new Uint8Array(audioBuffer));
-
-          // Decode and play audio (if using Opus decoder)
-          // For now, just store the data
-          // TODO: Implement Opus decoding and playback via Web Audio API
+          setAudioData(buf);
+          decodeAndPlay(buf);
         }
       } catch (err) {
         console.error('Failed to process audio message:', err);
@@ -156,12 +204,7 @@ const useAudioStream = (device) => {
     if (wsRef.current) {
       // Send stop command
       if (wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({
-          act: 'AUDIO_STOP',
-          data: {
-            uuid: streamUuidRef.current,
-          },
-        }));
+        wsRef.current.send(JSON.stringify({ act: 'AUDIO_STOP' }));
       }
 
       wsRef.current.close();
@@ -170,8 +213,13 @@ const useAudioStream = (device) => {
 
     setStatus('disconnected');
     setAudioData(null);
-    streamUuidRef.current = null;
     startTimeRef.current = null;
+    nextPlayTimeRef.current = 0;
+    tsRef.current = 0;
+    if (decoderRef.current) {
+      try { decoderRef.current.close(); } catch (_) {}
+      decoderRef.current = null;
+    }
   }, []);
 
   // Cleanup on unmount

@@ -40,6 +40,9 @@ var handlers = map[string]func(pack modules.Packet, wsConn *common.Conn){
 	`FILES_FETCH`:           fetchFile,
 	`FILES_REMOVE`:          removeFiles,
 	`FILES_UPLOAD`:          uploadFiles,
+	`FILES_MKDIR`:           mkdirFiles,
+	`FILES_MOVE`:            moveFiles,
+	`FILES_COPY`:            copyFiles,
 	`FILE_UPLOAD_TEXT`:      uploadTextFile,
 	`FILE_EXEC`:             execFile,
 	`PROCESSES_LIST`:        listProcesses,
@@ -270,6 +273,55 @@ func removeFiles(pack modules.Packet, wsConn *common.Conn) {
 	} else {
 		wsConn.SendCallback(modules.Packet{Code: 0}, pack)
 	}
+}
+
+func mkdirFiles(pack modules.Packet, wsConn *common.Conn) {
+	rawPath, ok := pack.GetData(`path`, reflect.String)
+	if !ok || len(strings.TrimSpace(rawPath.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	if err := file.Mkdir(rawPath.(string)); err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
+}
+
+func moveFiles(pack modules.Packet, wsConn *common.Conn) {
+	src, ok := pack.GetData(`src`, reflect.String)
+	if !ok || len(strings.TrimSpace(src.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	dst, ok := pack.GetData(`dst`, reflect.String)
+	if !ok || len(strings.TrimSpace(dst.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	if err := file.Move(src.(string), dst.(string)); err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
+}
+
+func copyFiles(pack modules.Packet, wsConn *common.Conn) {
+	src, ok := pack.GetData(`src`, reflect.String)
+	if !ok || len(strings.TrimSpace(src.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	dst, ok := pack.GetData(`dst`, reflect.String)
+	if !ok || len(strings.TrimSpace(dst.(string))) == 0 {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, pack)
+		return
+	}
+	if err := file.Copy(src.(string), dst.(string)); err != nil {
+		wsConn.SendCallback(modules.Packet{Code: 1, Msg: err.Error()}, pack)
+		return
+	}
+	wsConn.SendCallback(modules.Packet{Code: 0}, pack)
 }
 
 func execFile(pack modules.Packet, wsConn *common.Conn) {

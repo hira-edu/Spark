@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/webrtc/v4/pkg/media"
 	xdraw "golang.org/x/image/draw"
 )
 
@@ -49,6 +50,17 @@ type rtcSession struct {
 	scaleBuf      *image.RGBA
 	webcamStop    func()
 	audioStop     func()
+
+	frameCh chan rtcFrameRequest
+	stopCh  chan struct{}
+	stopped atomic.Bool
+
+	onClosed func()
+}
+
+type rtcFrameRequest struct {
+	frame    *CaptureFrame
+	duration time.Duration
 }
 
 func isWebRTCEnabled() bool {
@@ -158,7 +170,7 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 			audioStop = stopFn
 		}
 	}
-	return &rtcSession{
+	sess := &rtcSession{
 		desktopID:     desktopID,
 		rtc:           rtc,
 		encoder:       encoder,
@@ -167,14 +179,43 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 		bitrate:       bitrate,
 		maxWidth:      maxWidth,
 		maxHeight:     maxHeight,
+		frameCh:       make(chan rtcFrameRequest, 3),
+		stopCh:        make(chan struct{}),
 		webcamStop:    webcamStop,
 		audioStop:     audioStop,
-	}, nil
+	}
+	sess.start()
+	return sess, nil
+}
+
+func (r *rtcSession) start() {
+	if r == nil || r.stopped.Load() {
+		return
+	}
+	go r.run()
 }
 
 func (r *rtcSession) close() {
 	if r == nil {
 		return
+	}
+	if r.stopped.CompareAndSwap(false, true) {
+		close(r.stopCh)
+		// Best-effort drain queued frames.
+		for {
+			select {
+			case req := <-r.frameCh:
+				if req.frame != nil {
+					req.frame.Close()
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+		if r.onClosed != nil {
+			go r.onClosed()
+		}
 	}
 	if r.webcamStop != nil {
 		r.webcamStop()
@@ -190,30 +231,118 @@ func (r *rtcSession) close() {
 	}
 }
 
-func (r *rtcSession) sendFrame(img *image.RGBA, interval time.Duration) error {
-	if r == nil || r.encoder == nil || r.rtc == nil || img == nil {
-		return nil
+type frameEncoder interface {
+	EncodeFrame(frame *CaptureFrame, duration time.Duration) (media.Sample, error)
+}
+
+func (r *rtcSession) enqueue(frame *CaptureFrame, duration time.Duration) {
+	if r == nil || frame == nil {
+		if frame != nil {
+			frame.Close()
+		}
+		return
 	}
+	if r.stopped.Load() {
+		frame.Close()
+		return
+	}
+	req := rtcFrameRequest{frame: frame, duration: duration}
+
+	defer func() {
+		if recover() != nil {
+			frame.Close()
+		}
+	}()
+
+	select {
+	case r.frameCh <- req:
+		return
+	default:
+		// Queue full: drop oldest, keep newest.
+		select {
+		case old := <-r.frameCh:
+			if old.frame != nil {
+				old.frame.Close()
+			}
+		default:
+		}
+		select {
+		case r.frameCh <- req:
+		default:
+			frame.Close()
+		}
+	}
+}
+
+func (r *rtcSession) run() {
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case req := <-r.frameCh:
+			r.sendQueued(req)
+		}
+	}
+}
+
+func (r *rtcSession) sendQueued(req rtcFrameRequest) {
+	if r == nil || r.encoder == nil || r.rtc == nil || req.frame == nil {
+		if req.frame != nil {
+			req.frame.Close()
+		}
+		return
+	}
+	defer req.frame.Close()
+
 	now := time.Now().UnixNano()
-	// Use atomic load/store for lastSent to prevent race conditions
 	last := atomic.LoadInt64(&r.lastSent)
 	if last != 0 && now-last < r.targetFrameNs {
-		return nil
+		return
+	}
+
+	duration := req.duration
+	if duration <= 0 {
+		duration = time.Second / 30
+	}
+
+	// Prefer GPU path when available.
+	if req.frame.GPU != nil {
+		if enc, ok := r.encoder.(frameEncoder); ok {
+			sample, err := enc.EncodeFrame(req.frame, duration)
+			if err != nil {
+				r.close()
+				return
+			}
+			if err := r.rtc.SendFrame(sample.Data, sample.Duration); err != nil {
+				r.close()
+				return
+			}
+			atomic.StoreInt64(&r.lastSent, now)
+			return
+		}
+		// No GPU-capable encoder for this codec.
+		return
+	}
+
+	img := req.frame.Image
+	if img == nil {
+		return
 	}
 	src := img
 	if scaled := r.scaleFrame(img); scaled != nil {
 		src = scaled
 	}
 
-	sample, err := r.encoder.Encode(src, interval)
+	sample, err := r.encoder.Encode(src, duration)
 	if err != nil {
-		return err
+		r.close()
+		return
 	}
 	if err := r.rtc.SendFrame(sample.Data, sample.Duration); err != nil {
-		return err
+		r.close()
+		return
 	}
 	atomic.StoreInt64(&r.lastSent, now)
-	return nil
 }
 
 func (r *rtcSession) scaleFrame(img *image.RGBA) *image.RGBA {

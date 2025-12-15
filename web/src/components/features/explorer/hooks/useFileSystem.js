@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { message } from 'antd';
 import axios from 'axios';
 import { request, translate, catchBlobReq, orderCompare } from '../../../../utils/utils';
@@ -253,6 +254,49 @@ export function useFileSystem(device) {
     }
   }, [device, path, refresh]);
 
+  const movePath = useCallback(async (src, dst) => {
+    if (!device?.id) return;
+    const response = await request(`/api/device/file/move`, {
+      device: device.id,
+      src,
+      dst,
+    });
+    if (response.data?.code !== 0) {
+      throw new Error(response.data?.msg || 'Failed to move');
+    }
+  }, [device]);
+
+  const copyPath = useCallback(async (src, dst) => {
+    if (!device?.id) return;
+    const response = await request(`/api/device/file/copy`, {
+      device: device.id,
+      src,
+      dst,
+    });
+    if (response.data?.code !== 0) {
+      throw new Error(response.data?.msg || 'Failed to copy');
+    }
+  }, [device]);
+
+  const uploadFiles = useCallback(async (fileList, targetPath = path) => {
+    if (!device?.id) return;
+    const list = Array.from(fileList || []);
+    for (const f of list) {
+      const name = f?.name ? String(f.name) : '';
+      if (!name) continue;
+      const url = `/api/device/file/upload?device=${encodeURIComponent(device.id)}&path=${encodeURIComponent(targetPath)}&file=${encodeURIComponent(name)}`;
+      const res = await axios.post(url, f, {
+        headers: {
+          'Content-Type': f?.type || 'application/octet-stream',
+        },
+        maxBodyLength: Infinity,
+      });
+      if (res?.data?.code !== 0) {
+        throw new Error(res?.data?.msg || `Upload failed: ${name}`);
+      }
+    }
+  }, [device, path]);
+
   return {
     files,
     loading,
@@ -274,6 +318,9 @@ export function useFileSystem(device) {
     deleteFiles,
     createFolder,
     rename,
+    movePath,
+    copyPath,
+    uploadFiles,
     listFiles,
     getParentPath,
   };

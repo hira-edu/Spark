@@ -1,5 +1,5 @@
-//go:build cgo
-// +build cgo
+//go:build cgo && rocket_audio && !headless
+// +build cgo,rocket_audio,!headless
 
 package audio
 
@@ -18,12 +18,12 @@ import (
 )
 
 const (
-	sampleRate      = 48000               // Opus standard sample rate
-	channels        = 1                   // Mono for efficiency
-	framesPerBuffer = 960                 // 20ms at 48kHz
+	sampleRate      = 48000 // Opus standard sample rate
+	channels        = 1     // Mono for efficiency
+	framesPerBuffer = 960   // 20ms at 48kHz
 	frameDuration   = 20 * time.Millisecond
-	bitrate         = 64000               // 64 kbps
-	complexity      = 10                  // Maximum quality
+	bitrate         = 64000 // 64 kbps
+	complexity      = 10    // Maximum quality
 )
 
 var (
@@ -34,22 +34,22 @@ var (
 
 // AudioSession represents an active audio streaming session
 type AudioSession struct {
-	uuid         string
-	deviceIndex  int
-	device       *portaudio.DeviceInfo
-	stream       *portaudio.Stream
-	encoder      *opus.Encoder
-	audioData    chan []byte // Encoded audio data channel
-	stop         chan struct{}
-	senderStop   chan struct{}
-	mu           sync.Mutex
-	running      bool
+	uuid        string
+	deviceIndex int
+	device      *portaudio.DeviceInfo
+	stream      *portaudio.Stream
+	encoder     *opus.Encoder
+	audioData   chan []byte // Encoded audio data channel
+	stop        chan struct{}
+	senderStop  chan struct{}
+	mu          sync.Mutex
+	running     bool
 
 	// Statistics
-	seqNumber    uint32
-	framesSent   uint64
-	bytesSent    uint64
-	errors       uint64
+	seqNumber  uint32
+	framesSent uint64
+	bytesSent  uint64
+	errors     uint64
 }
 
 var (
@@ -175,7 +175,7 @@ func HandleSelect(pack modules.Packet) error {
 	if err != nil {
 		return fmt.Errorf("failed to create Opus encoder: %w", err)
 	}
-	encoder.SetBitrate(bitrate)   // 64 kbps
+	encoder.SetBitrate(bitrate)       // 64 kbps
 	encoder.SetComplexity(complexity) // Max quality
 	// Note: SetVBR, SetInBandFEC, SetPacketLossPerc may not be available in all opus bindings
 	// The encoder will use reasonable defaults

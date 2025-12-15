@@ -25,6 +25,13 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+func shortDeviceID(id string) string {
+	if len(id) <= 16 {
+		return id
+	}
+	return id[:16] + "..."
+}
+
 type desktop struct {
 	uuid       string
 	device     string
@@ -574,17 +581,17 @@ func onDesktopConnect(session *melody.Session) {
 	deviceID := device.(string)
 
 	common.Info(session, `[SERVER_DESKTOP_DEVICE_LOOKUP]`, ``, `Looking up device connection`, map[string]any{
-		`device_id`: deviceID[:16] + `...`,
+		`device_id`: shortDeviceID(deviceID),
 	})
 
 	connUUID, ok := common.CheckDevice(deviceID, ``)
 	if !ok {
 		common.Warn(session, `DESKTOP_CONN`, `fail`, `device not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: shortDeviceID(deviceID),
 		})
 		common.Warn(session, `[SERVER_DESKTOP_DEVICE_NOT_FOUND]`, ``, `Device not in online devices map`, map[string]any{
-			`device_id`: deviceID[:16] + `...`,
+			`device_id`: shortDeviceID(deviceID),
 		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
@@ -599,7 +606,7 @@ func onDesktopConnect(session *melody.Session) {
 	if !ok {
 		common.Warn(session, `DESKTOP_CONN`, `fail`, `device connection not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: shortDeviceID(deviceID),
 			`connUUID`: connUUID[:8] + `...`,
 		})
 		common.Warn(session, `[SERVER_DESKTOP_WS_NOT_FOUND]`, ``, `Device WebSocket session not found in Melody`, map[string]any{
@@ -626,7 +633,7 @@ func onDesktopConnect(session *melody.Session) {
 
 	common.Info(session, `[SERVER_DESKTOP_SESSION_CREATED]`, ``, `Desktop session created`, map[string]any{
 		`desktop_uuid`: desktopUUID[:8] + `...`,
-		`device_id`:    deviceID[:16] + `...`,
+		`device_id`:    shortDeviceID(deviceID),
 	})
 
 	common.AddEvent(desktopEventWrapper(desktop), connUUID, desktopUUID)
@@ -663,7 +670,7 @@ func onDesktopConnect(session *melody.Session) {
 	// Get device info for logging
 	deviceInfo := map[string]any{
 		`uuid`:     desktopUUID[:8] + `...`,
-		`deviceID`: deviceID[:16] + `...`,
+		`deviceID`: shortDeviceID(deviceID),
 	}
 	if dev, ok := common.Devices.Get(connUUID); ok {
 		deviceInfo[`name`] = dev.Hostname
@@ -792,7 +799,7 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 	case `DESKTOP_BROWSER_STATS`:
 		statsPayload := utility.CollectBrowserStats(pack.Data)
 		statsPayload[`desktop_uuid`] = desktop.uuid[:8] + `...`
-		statsPayload[`device_id`] = desktop.device[:16] + `...`
+		statsPayload[`device_id`] = shortDeviceID(desktop.device)
 		common.Info(session, `[SERVER_DESKTOP_BROWSER_STATS]`, ``, `Browser telemetry snapshot`, statsPayload)
 		return
 	case `DESKTOP_KILL`:
@@ -973,7 +980,7 @@ func onDesktopDisconnect(session *melody.Session) {
 
 	common.Info(session, `[SERVER_DESKTOP_CLEANUP]`, ``, `Cleaning up desktop session`, map[string]any{
 		`desktop_uuid`: desktop.uuid[:8] + `...`,
-		`device_id`:    desktop.device[:16] + `...`,
+		`device_id`:    shortDeviceID(desktop.device),
 		`frame_count`:  desktop.frameCount,
 		`close_code`:   closeCode,
 		`close_text`:   closeText,

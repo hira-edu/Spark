@@ -3,6 +3,7 @@
  * Runs once after all tests
  */
 import { stopMockDevice } from './utils/mockServer.js';
+import { stopMockAgent } from './utils/mockAgent.js';
 
 export default async function globalTeardown() {
   console.log('[Teardown] Cleaning up E2E test environment...');
@@ -12,6 +13,13 @@ export default async function globalTeardown() {
     stopMockDevice('[Teardown]');
   } catch (err) {
     console.log('[Teardown] Mock device stop skipped:', err?.message || err);
+  }
+
+  // Kill mock agent process if running
+  try {
+    stopMockAgent('[Teardown]');
+  } catch (err) {
+    console.log('[Teardown] Mock agent stop skipped:', err?.message || err);
   }
 
   console.log('[Teardown] Cleanup complete');

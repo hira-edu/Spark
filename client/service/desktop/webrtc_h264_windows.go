@@ -14,6 +14,8 @@ import (
 	"time"
 	"unsafe"
 
+	"Rocket/client/service/desktop/colorconv"
+
 	"github.com/pion/webrtc/v4/pkg/media"
 	"golang.org/x/sys/windows"
 )
@@ -460,6 +462,7 @@ type h264Encoder struct {
 	keyFrameInterval int
 	aqm              *AdaptiveQualityManager
 	forceKeyFrame    atomic.Bool
+	captureDevice    *iD3D11Device
 
 	mu          sync.Mutex
 	workerOnce  sync.Once
@@ -470,8 +473,12 @@ type h264Encoder struct {
 }
 
 type h264Request struct {
-	img      *image.RGBA
-	duration time.Duration
+	img        *image.RGBA
+	gpuTexture *iD3D11Texture2D
+	gpuWidth   int
+	gpuHeight  int
+	isGPU      bool
+	duration   time.Duration
 }
 
 type h264Result struct {
@@ -492,6 +499,7 @@ func NewH264Encoder(cfg WebRTCEncoderConfig) (WebRTCEncoder, error) {
 	return &h264Encoder{
 		baseBitRate:      bitRate,
 		keyFrameInterval: keyInterval,
+		captureDevice:    getCaptureD3D11Device(),
 	}, nil
 }
 
@@ -550,6 +558,59 @@ func (e *h264Encoder) Encode(img *image.RGBA, duration time.Duration) (media.Sam
 	}
 }
 
+func (e *h264Encoder) EncodeFrame(frame *CaptureFrame, duration time.Duration) (media.Sample, error) {
+	if frame == nil {
+		return media.Sample{}, errors.New("nil frame")
+	}
+	if frame.Image != nil {
+		return e.Encode(frame.Image, duration)
+	}
+	if frame.GPU == nil || frame.GPU.Resource == nil {
+		return media.Sample{}, errors.New("frame has no CPU image or GPU texture")
+	}
+	if frame.GPU.Backend != "dxgi_nv12" {
+		return media.Sample{}, errors.New("unsupported GPU backend")
+	}
+	tex, ok := frame.GPU.Resource.(*iD3D11Texture2D)
+	if !ok || tex == nil {
+		return media.Sample{}, errors.New("GPU resource is not D3D11 texture")
+	}
+	if duration <= 0 {
+		duration = time.Second / 30
+	}
+
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return media.Sample{}, errors.New("encoder closed")
+	}
+	e.startWorkerLocked()
+	frameQueue := e.frameQueue
+	resultQueue := e.resultQueue
+	e.mu.Unlock()
+
+	req := h264Request{
+		gpuTexture: tex,
+		gpuWidth:   frame.GPU.Width,
+		gpuHeight:  frame.GPU.Height,
+		isGPU:      true,
+		duration:   duration,
+	}
+
+	select {
+	case frameQueue <- req:
+	default:
+		return media.Sample{}, nil
+	}
+
+	select {
+	case res := <-resultQueue:
+		return res.sample, res.err
+	case <-time.After(150 * time.Millisecond):
+		return media.Sample{}, errors.New("encoder timeout")
+	}
+}
+
 func (e *h264Encoder) Close() error {
 	e.mu.Lock()
 	if e.closed {
@@ -562,6 +623,10 @@ func (e *h264Encoder) Close() error {
 	}
 	e.mu.Unlock()
 	e.wg.Wait()
+	if e.captureDevice != nil {
+		e.captureDevice.Release()
+		e.captureDevice = nil
+	}
 	return nil
 }
 
@@ -591,6 +656,8 @@ func (e *h264Encoder) encodeLoop() {
 		inBuf     *imfMediaBuffer
 		outSample *imfSample
 		outBuf    *imfMediaBuffer
+		dxgiMgr   *DXGIDeviceManager
+		ownedDev  *iD3D11Device
 		width     int
 		height    int
 		bitRate   int
@@ -598,7 +665,7 @@ func (e *h264Encoder) encodeLoop() {
 		encodeBuf []byte
 	)
 
-	cleanup := func() {
+	releaseTransformState := func() {
 		if outBuf != nil {
 			outBuf.Release()
 			outBuf = nil
@@ -630,16 +697,38 @@ func (e *h264Encoder) encodeLoop() {
 		width, height, bitRate, frameSeq = 0, 0, 0, 0
 		encodeBuf = nil
 	}
-	defer cleanup()
+	defer func() {
+		releaseTransformState()
+		if dxgiMgr != nil {
+			dxgiMgr.Release()
+			dxgiMgr = nil
+		}
+		if ownedDev != nil {
+			ownedDev.Release()
+			ownedDev = nil
+		}
+	}()
+
+	if e.captureDevice != nil {
+		mgr, err := NewDXGIDeviceManager(e.captureDevice)
+		if err == nil {
+			dxgiMgr = mgr
+		}
+	}
 
 	reinit := func(w, h int, targetBitRate int) error {
-		cleanup()
+		releaseTransformState()
 
 		t, err := coCreateH264Transform()
 		if err != nil {
 			return err
 		}
 		transform = t
+		if dxgiMgr != nil {
+			if err := dxgiMgr.ConfigureTransform(transform); err != nil {
+				return err
+			}
+		}
 
 		it, err := mfCreateMediaType()
 		if err != nil {
@@ -754,11 +843,15 @@ func (e *h264Encoder) encodeLoop() {
 	}
 
 	for req := range e.frameQueue {
-		if req.img == nil {
+		if !req.isGPU && req.img == nil {
 			continue
 		}
-		w := req.img.Bounds().Dx()
-		h := req.img.Bounds().Dy()
+		w := req.gpuWidth
+		h := req.gpuHeight
+		if !req.isGPU {
+			w = req.img.Bounds().Dx()
+			h = req.img.Bounds().Dy()
+		}
 		if w <= 0 || h <= 0 {
 			continue
 		}
@@ -774,6 +867,26 @@ func (e *h264Encoder) encodeLoop() {
 			targetBitRate = e.aqm.GetCurrentBitrate()
 		}
 		e.mu.Unlock()
+
+		if req.isGPU && dxgiMgr == nil {
+			if e.captureDevice == nil && ownedDev == nil {
+				ownedDev = getCaptureD3D11Device()
+			}
+			if e.captureDevice != nil {
+				if mgr, err := NewDXGIDeviceManager(e.captureDevice); err == nil {
+					dxgiMgr = mgr
+				}
+			} else if ownedDev != nil {
+				if mgr, err := NewDXGIDeviceManager(ownedDev); err == nil {
+					dxgiMgr = mgr
+				}
+			}
+			// Force reinit with DXGI manager attached.
+			if dxgiMgr != nil {
+				transform = nil
+				width, height, bitRate, frameSeq = 0, 0, 0, 0
+			}
+		}
 
 		if transform == nil || w != width || h != height || targetBitRate != bitRate {
 			if err := reinit(w, h, targetBitRate); err != nil {
@@ -794,37 +907,62 @@ func (e *h264Encoder) encodeLoop() {
 			_ = transform.ProcessMessage(mftMessageNotifyStartOfStream, 0)
 		}
 
-		rgbaToNV12(req.img, encodeBuf, w, h)
+		if req.isGPU {
+			if dxgiMgr == nil {
+				e.sendResult(h264Result{err: errors.New("DXGI device manager unavailable")})
+				continue
+			}
+			if req.gpuTexture == nil {
+				e.sendResult(h264Result{err: errors.New("nil GPU texture")})
+				continue
+			}
+			sample, err := dxgiMgr.CreateSampleFromTexture(req.gpuTexture)
+			if err != nil {
+				e.sendResult(h264Result{err: err})
+				continue
+			}
+			if err := transform.ProcessInput(0, sample, 0); err != nil {
+				sample.Release()
+				e.sendResult(h264Result{err: err})
+				continue
+			}
+			sample.Release()
+		} else {
+			if err := colorconv.RGBAToNV12(req.img, encodeBuf, w, h); err != nil {
+				e.sendResult(h264Result{err: err})
+				continue
+			}
 
-		ptr, maxLen, _, err := inBuf.Lock()
-		if err != nil {
-			e.sendResult(h264Result{err: err})
-			continue
-		}
-		if uint32(len(encodeBuf)) > maxLen {
+			ptr, maxLen, _, lockErr := inBuf.Lock()
+			if lockErr != nil {
+				e.sendResult(h264Result{err: lockErr})
+				continue
+			}
+			if uint32(len(encodeBuf)) > maxLen {
+				_ = inBuf.Unlock()
+				e.sendResult(h264Result{err: errors.New("input buffer too small")})
+				continue
+			}
+			copy(unsafe.Slice((*byte)(ptr), len(encodeBuf)), encodeBuf)
 			_ = inBuf.Unlock()
-			e.sendResult(h264Result{err: errors.New("input buffer too small")})
-			continue
-		}
-		copy(unsafe.Slice((*byte)(ptr), len(encodeBuf)), encodeBuf)
-		_ = inBuf.Unlock()
-		_ = inBuf.SetCurrentLength(uint32(len(encodeBuf)))
+			_ = inBuf.SetCurrentLength(uint32(len(encodeBuf)))
 
-		if err := transform.ProcessInput(0, inSample, 0); err != nil {
-			e.sendResult(h264Result{err: err})
-			continue
+			if procErr := transform.ProcessInput(0, inSample, 0); procErr != nil {
+				e.sendResult(h264Result{err: procErr})
+				continue
+			}
 		}
 
 		var outStatus uint32
 		out := mftOutputDataBuffer{StreamID: 0, Sample: outSample}
-		err = transform.ProcessOutput(0, &out, &outStatus)
-		if err != nil {
+		outErr := transform.ProcessOutput(0, &out, &outStatus)
+		if outErr != nil {
 			// Need more input - treat as dropped frame.
-			if errno, ok := err.(syscall.Errno); ok && uint32(errno) == 0xC00D6D72 {
+			if errno, ok := outErr.(syscall.Errno); ok && uint32(errno) == 0xC00D6D72 {
 				e.sendResult(h264Result{sample: media.Sample{Duration: req.duration}})
 				continue
 			}
-			e.sendResult(h264Result{err: err})
+			e.sendResult(h264Result{err: outErr})
 			continue
 		}
 
@@ -888,69 +1026,4 @@ func avccToAnnexB(buf []byte) ([]byte, bool) {
 		i += n
 	}
 	return out, true
-}
-
-func rgbaToNV12(img *image.RGBA, dst []byte, w, h int) {
-	yPlane := dst[:w*h]
-	uvPlane := dst[w*h:]
-
-	// BT.601 full range conversion (good enough for screen content; encoder will signal).
-	// Y =  0.257R + 0.504G + 0.098B + 16
-	// U = -0.148R - 0.291G + 0.439B + 128
-	// V =  0.439R - 0.368G - 0.071B + 128
-
-	clamp := func(v int) byte {
-		if v < 0 {
-			return 0
-		}
-		if v > 255 {
-			return 255
-		}
-		return byte(v)
-	}
-
-	for y := 0; y < h; y++ {
-		srcRow := img.Pix[y*img.Stride:]
-		yRow := yPlane[y*w:]
-		for x := 0; x < w; x++ {
-			r := int(srcRow[x*4+0])
-			g := int(srcRow[x*4+1])
-			b := int(srcRow[x*4+2])
-			yy := (66*r + 129*g + 25*b + 128) >> 8
-			yy += 16
-			yRow[x] = clamp(yy)
-		}
-	}
-
-	for y := 0; y < h; y += 2 {
-		row0 := img.Pix[y*img.Stride:]
-		row1 := img.Pix[(y+1)*img.Stride:]
-		uvRow := uvPlane[(y/2)*w:]
-		for x := 0; x < w; x += 2 {
-			r0 := int(row0[x*4+0])
-			g0 := int(row0[x*4+1])
-			b0 := int(row0[x*4+2])
-			r1 := int(row0[(x+1)*4+0])
-			g1 := int(row0[(x+1)*4+1])
-			b1 := int(row0[(x+1)*4+2])
-			r2 := int(row1[x*4+0])
-			g2 := int(row1[x*4+1])
-			b2 := int(row1[x*4+2])
-			r3 := int(row1[(x+1)*4+0])
-			g3 := int(row1[(x+1)*4+1])
-			b3 := int(row1[(x+1)*4+2])
-
-			rAvg := (r0 + r1 + r2 + r3) >> 2
-			gAvg := (g0 + g1 + g2 + g3) >> 2
-			bAvg := (b0 + b1 + b2 + b3) >> 2
-
-			u := (-38*rAvg - 74*gAvg + 112*bAvg + 128) >> 8
-			v := (112*rAvg - 94*gAvg - 18*bAvg + 128) >> 8
-			u += 128
-			v += 128
-
-			uvRow[x] = clamp(u)
-			uvRow[x+1] = clamp(v)
-		}
-	}
 }

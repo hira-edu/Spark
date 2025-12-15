@@ -130,6 +130,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   const sendControlRef = useRef(null);
   const lastShotRequestAtRef = useRef(0);
   const shotFallbackTimerRef = useRef(null);
+  const lastFrameAtRef = useRef(0);
   // Track approximate keyframe coverage after a DESKTOP_SHOT request.
   // Some agents (or lossy transport) can deliver incomplete tiles; this enables
   // bounded retries to recover a full screen.
@@ -187,6 +188,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     chunkFrameSeqRef.current = 0;
     wireHeaderLengthRef.current = FRAME_HEADER_LENGTH;
     lastWireFrameSeqRef.current = 0;
+    lastFrameAtRef.current = 0;
     chunkMetaStateRef.current = { frameSeq: 0, nextIndex: 0, total: 0 };
     pingTimersRef.current = { server: 0, device: 0 };
     // Clear block version tracking on cleanup to ensure fresh state on reconnect
@@ -279,13 +281,15 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       shotFallbackTimerRef.current = null;
     }
 
-    const startFrames = statsRef.current.frames || 0;
+    // Use a monotonic "last frame received at" timestamp for stall detection; `statsRef.current.frames`
+    // is reset every second for UI updates and can cause false negatives.
+    const startFrameAt = lastFrameAtRef.current || 0;
     shotFallbackTimerRef.current = setTimeout(() => {
       shotFallbackTimerRef.current = null;
       if (!mountedRef.current) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if ((statsRef.current.frames || 0) !== startFrames) return;
+      if ((lastFrameAtRef.current || 0) !== startFrameAt) return;
       requestFullFrame(reason || 'stalled');
     }, Math.max(0, timeoutMs));
   }, [requestFullFrame]);
@@ -718,13 +722,17 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     // CRITICAL: Mark that we now have resolution
     hasResolutionRef.current = true;
 
-    if (isFirstResolution || wasResized) {
-      scheduleShotIfStalled('resolution_update', 800);
+    if (isFirstResolution) {
+      scheduleShotIfStalled('resolution_init', 800);
+    } else if (wasResized) {
+      // A real resolution change implies the next deltas/keyframes may not cover the new canvas.
+      // Request an immediate full frame to avoid "missing tiles" after resize.
+      requestFullFrame('resolution_resize');
     }
 
     setResolution({ width, height });
     flushPendingFrames();
-  }, [canvasRef, log, flushPendingFrames, scheduleShotIfStalled]);
+  }, [canvasRef, log, flushPendingFrames, requestFullFrame, scheduleShotIfStalled]);
 
   // Handle incoming JSON messages
   const handleJSON = useCallback(async (payload) => {
@@ -1167,6 +1175,7 @@ export function useDesktopStream(device, canvasRef, options = {}) {
       }
     }
 
+    lastFrameAtRef.current = Date.now();
     statsRef.current.bytes += bytes.byteLength;
     log('debug', 'frame received', { op, size: bytes.byteLength, frameSeq: chunkFrameSeq, chunkIndex, chunkTotal });
 

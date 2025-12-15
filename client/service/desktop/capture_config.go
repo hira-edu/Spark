@@ -3,15 +3,24 @@ package desktop
 import (
 	"Rocket/client/config"
 	"Rocket/client/telemetry"
+	"os"
+	"strings"
 )
 
 // ApplyCaptureConfig wires the launcher-provided capture config (mode,
 // fallback order, flags) into the desktop worker before any sessions start.
 func ApplyCaptureConfig(cfg config.CaptureConfig) {
-	desired, err := captureBackendFromString(cfg.Mode)
+	mode := cfg.Mode
+	if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
+		// Allow environment override for CI/perf harnesses.
+		// Example: SPARK_CAPTURE_BACKEND=dxgi
+		mode = raw
+	}
+
+	desired, err := captureBackendFromString(mode)
 	if err != nil {
 		telemetry.LogStructured("WARN", "capture config: invalid mode, falling back to auto", map[string]interface{}{
-			"mode":  cfg.Mode,
+			"mode":  mode,
 			"error": err.Error(),
 		})
 		desired = CaptureBackendAuto

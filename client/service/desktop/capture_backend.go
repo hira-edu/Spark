@@ -16,6 +16,7 @@ const (
 	CaptureBackendNVFBC
 	CaptureBackendSharedSurface
 	CaptureBackendDXGI
+	CaptureBackendDXGI_NV12 // GPU-native NV12 capture (Windows 10+)
 	CaptureBackendGDI
 	CaptureBackendPipeWire
 	CaptureBackendX11
@@ -62,6 +63,8 @@ func captureBackendFromString(raw string) (CaptureBackendMode, error) {
 		return CaptureBackendNVFBC, nil
 	case "sharedsurface", "shsurf", "predwm":
 		return CaptureBackendSharedSurface, nil
+	case "dxginv12", "dxgi nv12", "gpunv12":
+		return CaptureBackendDXGI_NV12, nil
 	case "dxgi":
 		return CaptureBackendDXGI, nil
 	case "desktopduplication", "duplication", "dup":
@@ -85,6 +88,8 @@ func captureBackendName(mode CaptureBackendMode) string {
 		return "shared_surface"
 	case CaptureBackendDXGI:
 		return "dxgi"
+	case CaptureBackendDXGI_NV12:
+		return "dxgi_nv12"
 	case CaptureBackendGDI:
 		return "gdi"
 	case CaptureBackendPipeWire:
@@ -161,6 +166,8 @@ func normalizeBackend(mode CaptureBackendMode) CaptureBackendMode {
 		return CaptureBackendSharedSurface
 	case CaptureBackendDXGI:
 		return CaptureBackendDXGI
+	case CaptureBackendDXGI_NV12:
+		return CaptureBackendDXGI_NV12
 	case CaptureBackendGDI:
 		return CaptureBackendGDI
 	case CaptureBackendPipeWire:

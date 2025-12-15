@@ -131,6 +131,14 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		rtc.Close()
 		return nil, err
 	}
+	closingSess := rtcSess
+	rtcSess.onClosed = func() {
+		sessRef.lock.Lock()
+		if sessRef.rtc == closingSess {
+			sessRef.rtc = nil
+		}
+		sessRef.lock.Unlock()
+	}
 	sess.rtc = rtcSess
 
 	return map[string]any{

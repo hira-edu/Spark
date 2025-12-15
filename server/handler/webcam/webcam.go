@@ -206,7 +206,7 @@ func onWebcamConnect(session *melody.Session) {
 	if !ok {
 		common.Warn(session, `WEBCAM_CONN`, `fail`, `device not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: utils.ShortString(deviceID, 16),
 		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
@@ -216,7 +216,7 @@ func onWebcamConnect(session *melody.Session) {
 	if !ok {
 		common.Warn(session, `WEBCAM_CONN`, `fail`, `device connection not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: utils.ShortString(deviceID, 16),
 			`connUUID`: connUUID[:8] + `...`,
 		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
@@ -240,7 +240,7 @@ func onWebcamConnect(session *melody.Session) {
 	// Get device info for logging
 	deviceInfo := map[string]any{
 		`uuid`:     webcamUUID[:8] + `...`,
-		`deviceID`: deviceID[:16] + `...`,
+		`deviceID`: utils.ShortString(deviceID, 16),
 	}
 	if dev, ok := common.Devices.Get(connUUID); ok {
 		deviceInfo[`name`] = dev.Hostname

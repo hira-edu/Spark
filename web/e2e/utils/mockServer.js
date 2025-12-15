@@ -1,11 +1,13 @@
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import path from 'path';
 
 const DEFAULT_PORT = process.env.MOCK_DEVICE_PORT || '18081';
-const DEFAULT_BINARY = process.env.MOCK_DEVICE_BIN || '/tmp/test_client';
 const REPO_ROOT = path.join(process.cwd(), '..');
 const STATE_DIR = path.join(process.cwd(), '.playwright');
+const BIN_DIR = path.join(STATE_DIR, 'bin');
+const DEFAULT_BINARY = process.env.MOCK_DEVICE_BIN ||
+  path.join(BIN_DIR, process.platform === 'win32' ? 'mock-device.exe' : 'mock-device');
 const PID_FILE = path.join(STATE_DIR, 'mock-device.pid');
 const TEST_CLIENT_PATH = path.join(REPO_ROOT, 'test_client.go');
 const MOCK_HELPER_PATH = path.join(REPO_ROOT, 'test_client_mock_server.go');
@@ -13,6 +15,9 @@ const MOCK_HELPER_PATH = path.join(REPO_ROOT, 'test_client_mock_server.go');
 function ensureStateDir() {
   if (!existsSync(STATE_DIR)) {
     mkdirSync(STATE_DIR, { recursive: true });
+  }
+  if (!existsSync(BIN_DIR)) {
+    mkdirSync(BIN_DIR, { recursive: true });
   }
 }
 
@@ -46,14 +51,48 @@ function readPid() {
   }
 }
 
+function killTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  // On POSIX, kill the whole process group when detached: true was used.
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+}
+
+async function buildMockBinary(outPath, logPrefix = '[MockDevice]') {
+  ensureStateDir();
+  if (!existsSync(TEST_CLIENT_PATH)) {
+    throw new Error('test_client.go not found - cannot build mock device binary');
+  }
+
+  console.log(`${logPrefix} Building mock device binary: ${outPath}`);
+  execFileSync('go', [
+    'build',
+    '-tags',
+    'mockserver',
+    '-o',
+    outPath,
+    TEST_CLIENT_PATH,
+    MOCK_HELPER_PATH,
+  ], { cwd: REPO_ROOT, stdio: 'inherit' });
+  return outPath;
+}
+
 export function stopMockDevice(logPrefix = '[MockDevice]') {
   const pid = readPid();
   if (!pid) return false;
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {
-    // already stopped
-  }
+  killTree(pid);
   try {
     rmSync(PID_FILE);
   } catch {
@@ -80,26 +119,22 @@ export async function ensureMockDeviceRunning({
 
   if (running || forceRestart) {
     stopMockDevice(logPrefix);
+    // Ensure the port is actually free before starting a new process.
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      const stillRunning = await waitForMockDevice(port, 250).then(() => true).catch(() => false);
+      if (!stillRunning) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
   }
 
   if (!existsSync(TEST_CLIENT_PATH)) {
     throw new Error('test_client.go not found - cannot start mock device server');
   }
 
-  const useBinary = existsSync(binaryPath);
-  const command = useBinary ? binaryPath : 'go';
-  const args = useBinary
-    ? ['--mock-desktop', '--mock-standalone', '--mock-port', String(port)]
-    : [
-        'run',
-        '-tags', 'mockserver',
-        TEST_CLIENT_PATH,
-        MOCK_HELPER_PATH,
-        '--mock-desktop',
-        '--mock-standalone',
-        '--mock-port',
-        String(port),
-      ];
+  const resolvedBinaryPath = await buildMockBinary(binaryPath, logPrefix);
+  const command = resolvedBinaryPath;
+  const args = ['--mock-desktop', '--mock-standalone', '--mock-port', String(port)];
 
   const child = spawn(command, args, {
     cwd: REPO_ROOT,

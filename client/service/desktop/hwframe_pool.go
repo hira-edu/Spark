@@ -73,6 +73,15 @@ func cloneGPUFrame(src *GPUFrame) *GPUFrame {
 
 	clone := *src
 
+	// Special-case NV12 texture leases: keep the texture alive and prevent pool
+	// reuse until every consumer releases it.
+	if tex, ok := src.Resource.(*iD3D11Texture2D); ok && tex != nil {
+		if release := retainNV12Lease(tex); release != nil {
+			clone.Release = release
+			return &clone
+		}
+	}
+
 	// If the resource is a COM object, bump AddRef so listeners own the handle.
 	type comObject interface {
 		AddRef() uint32

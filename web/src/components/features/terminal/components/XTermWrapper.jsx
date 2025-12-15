@@ -152,12 +152,16 @@ const XTermWrapper = forwardRef(({
       return;
     }
     const chunk = writeQueueRef.current.shift();
-    if (typeof chunk !== 'string' || chunk.length === 0) {
+    if (typeof chunk === 'string' && chunk.length === 0) {
+      return;
+    }
+    if (chunk instanceof Uint8Array && chunk.length === 0) {
       return;
     }
 
     isWritingRef.current = true;
-    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - chunk.length);
+    const chunkLength = typeof chunk === 'string' ? chunk.length : chunk.length;
+    pendingBytesRef.current = Math.max(0, pendingBytesRef.current - chunkLength);
     term.write(chunk, () => {
       isWritingRef.current = false;
       flushWriteQueue();
@@ -168,12 +172,27 @@ const XTermWrapper = forwardRef(({
     if (!data) {
       return;
     }
-    const normalized = typeof data === 'string' ? data : String(data);
-    for (let offset = 0; offset < normalized.length; offset += WRITE_CHUNK_SIZE) {
-      const chunk = normalized.slice(offset, offset + WRITE_CHUNK_SIZE);
-      if (chunk.length > 0) {
-        writeQueueRef.current.push(chunk);
-        pendingBytesRef.current += chunk.length;
+
+    if (data instanceof ArrayBuffer) {
+      data = new Uint8Array(data);
+    }
+
+    if (data instanceof Uint8Array) {
+      for (let offset = 0; offset < data.length; offset += WRITE_CHUNK_SIZE) {
+        const chunk = data.slice(offset, offset + WRITE_CHUNK_SIZE);
+        if (chunk.length > 0) {
+          writeQueueRef.current.push(chunk);
+          pendingBytesRef.current += chunk.length;
+        }
+      }
+    } else {
+      const normalized = typeof data === 'string' ? data : String(data);
+      for (let offset = 0; offset < normalized.length; offset += WRITE_CHUNK_SIZE) {
+        const chunk = normalized.slice(offset, offset + WRITE_CHUNK_SIZE);
+        if (chunk.length > 0) {
+          writeQueueRef.current.push(chunk);
+          pendingBytesRef.current += chunk.length;
+        }
       }
     }
     if (!isWritingRef.current) {

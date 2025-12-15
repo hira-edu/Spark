@@ -347,6 +347,11 @@ func reportWS(wsConn *common.Conn) error {
 }
 
 func checkUpdate(wsConn *common.Conn) error {
+	// Performance/hardware test runs often execute from a local dev build and should not
+	// auto-update to prebuilt artifacts (which can restart the client mid-test).
+	if os.Getenv("SPARK_DISABLE_UPDATE") == "1" || os.Getenv("ROCKET_DISABLE_UPDATE") == "1" {
+		return nil
+	}
 	if len(config.Commit) == 0 {
 		return nil
 	}

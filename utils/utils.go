@@ -41,6 +41,16 @@ func Max[T int | int32 | int64 | uint | uint32 | uint64 | float32 | float64](a, 
 	return b
 }
 
+func ShortString(s string, n int) string {
+	if n <= 0 {
+		return ``
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + `...`
+}
+
 // XOR performs simple XOR encryption (deprecated, use StreamEncrypt instead)
 // Kept for backwards compatibility during transition
 // XOR - encryption removed; returns data unchanged

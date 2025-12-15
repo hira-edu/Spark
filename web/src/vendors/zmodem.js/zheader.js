@@ -175,19 +175,11 @@ Zmodem.Header = class ZmodemHeader {
      * @returns {Header} An instance of the appropriate Header subclass.
      */
     static build(name /*, args */) {
-        var args = (arguments.length === 1 ? [arguments[0]] : Array.apply(null, arguments));
-
-        //TODO: make this better
         var Ctr = FRAME_NAME_CREATOR[name];
-        if (!Ctr) throw("No frame class “" + name + "” is defined!");
+        if (!Ctr) throw("No frame class "" + name + "" is defined!");
 
-        args.shift();
-
-        //Plegh!
-        //https://stackoverflow.com/questions/33193310/constr-applythis-args-in-es6-classes
-        var hdr = new (Ctr.bind.apply(Ctr, [null].concat(args)));
-
-        return hdr;
+        var args = Array.prototype.slice.call(arguments, 1);
+        return new Ctr(...args);
     }
 
     /**
@@ -452,7 +444,45 @@ const ZMSKNOLOC = 0x80,
 
 class ZFILE_HEADER extends Zmodem.Header {
 
-    //TODO: allow options on instantiation
+    constructor(opts) {
+        super();
+
+        if (!opts || typeof opts !== "object" || (opts instanceof Array)) {
+            return;
+        }
+
+        var bytes = [0, 0, 0, 0];
+
+        if (opts.sparse) {
+            bytes[0] |= ZXSPARS;
+        }
+
+        ZFILE_ORDER.forEach(function(key, i) {
+            if (key === "management" && opts.skip_if_absent) {
+                bytes[i] |= ZMSKNOLOC;
+            }
+
+            if (ZFILE_VALUES[key] instanceof Array) {
+                if (opts[key] === undefined) {
+                    return;
+                }
+                var idx = ZFILE_VALUES[key].indexOf(opts[key]);
+                if (idx >= 0) {
+                    bytes[i] |= idx;
+                }
+            }
+            else {
+                for (var extkey in ZFILE_VALUES[key]) {
+                    if (opts[extkey]) {
+                        bytes[i] |= ZFILE_VALUES[key][extkey];
+                    }
+                }
+            }
+        });
+
+        this._bytes4 = bytes;
+    }
+
     get_options() {
         var opts = {
             sparse: !!(this._bytes4[0] & ZXSPARS),
@@ -531,10 +561,9 @@ class ZCRC_HEADER extends ZHeader {
 //class ZCAN_HEADER extends Zmodem.Header {}
 
 //As described, this header represents an information disclosure.
-//It could be interpreted, I suppose, merely as “this is how much space
-//I have FOR YOU.”
-//TODO: implement if needed/requested
-//class ZFREECNT_HEADER extends ZmodemHeader {}
+//It could be interpreted, I suppose, merely as "this is how much space
+//I have FOR YOU."
+class ZFREECNT_HEADER extends ZOffsetHeader {}
 
 //----------------------------------------------------------------------
 
@@ -556,7 +585,7 @@ const FRAME_CLASS_TYPES = [
     undefined, //[ ZCHALLENGE_HEADER, "ZCHALLENGE" ],
     undefined, //[ ZCOMPL_HEADER, "ZCOMPL" ],
     undefined, //[ ZCAN_HEADER, "ZCAN" ],
-    undefined, //[ ZFREECNT_HEADER, "ZFREECNT" ],
+    [ ZFREECNT_HEADER, "ZFREECNT" ],
     undefined, //[ ZCOMMAND_HEADER, "ZCOMMAND" ],
     undefined, //[ ZSTDERR_HEADER, "ZSTDERR" ],
 ];
@@ -607,7 +636,7 @@ const CREATORS = [
     'ZCHALLENGE',
     'ZCOMPL',
     'ZCAN',
-    'ZFREECNT', // ZFREECNT_HEADER,
+    ZFREECNT_HEADER,
     'ZCOMMAND',
     'ZSTDERR',
 ];
@@ -627,7 +656,7 @@ function _get_blank_header(typenum) {
     return _get_blank_header_from_constructor(creator);
 }
 
-//referenced outside TODO
+// Used by the parser when instantiating header classes by constructor.
 function _get_blank_header_from_constructor(creator) {
     if (creator.prototype instanceof ZOffsetHeader) {
         return new creator(0);

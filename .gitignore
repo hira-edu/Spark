@@ -25,5 +25,14 @@
 node_modules/
 dist/
 
+# Playwright artifacts (E2E)
+/web/.playwright/
+/web/test-results/
+/web/playwright-report/
+/web/logs/
+
+# Local handler logs created during dev/E2E
+/server/handler/*/logs/
+
 .DS_Store
 /.idea

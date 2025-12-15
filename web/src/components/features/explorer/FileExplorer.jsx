@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Modal, Input, message } from 'antd';
 import { Toolbar, FileGrid, FileList, ContextMenu, StatusBar } from './components';
 import { useFileSystem } from './hooks';
@@ -33,6 +34,9 @@ const FileExplorer = ({
     deleteFiles,
     createFolder,
     rename,
+    movePath,
+    copyPath,
+    uploadFiles,
     listFiles,
   } = useFileSystem(device);
 
@@ -216,9 +220,32 @@ const FileExplorer = ({
   // Handle paste
   const handlePaste = useCallback(() => {
     closeContextMenu();
-    // TODO: Implement paste functionality
-    message.info('Paste not yet implemented');
-  }, [closeContextMenu]);
+    if (!clipboard.files.length || !clipboard.operation) {
+      return;
+    }
+
+    (async () => {
+      try {
+        const op = clipboard.operation;
+        for (const src of clipboard.files) {
+          const parts = String(src || '').split(/[\\/]/).filter(Boolean);
+          const base = parts.length ? parts[parts.length - 1] : '';
+          if (!base) continue;
+          const dst = path + base;
+          if (op === 'cut') {
+            await movePath(src, dst);
+          } else {
+            await copyPath(src, dst);
+          }
+        }
+        setClipboard({ files: [], operation: null });
+        message.success(i18n.t('COMMON.SUCCESS'));
+        refresh();
+      } catch (err) {
+        message.error(err?.message || i18n.t('COMMON.REQUEST_FAILED'));
+      }
+    })();
+  }, [closeContextMenu, clipboard, copyPath, movePath, path, refresh]);
 
   // Handle new folder
   const handleNewFolder = useCallback(() => {
@@ -244,12 +271,20 @@ const FileExplorer = ({
     input.onchange = (e) => {
       const files = e.target.files;
       if (files.length > 0) {
-        // TODO: Implement file upload
-        message.info(`Uploading ${files.length} file(s)...`);
+        (async () => {
+          try {
+            message.loading({ content: `Uploading ${files.length} file(s)...`, key: 'upload' });
+            await uploadFiles(files, path);
+            message.success({ content: i18n.t('COMMON.SUCCESS'), key: 'upload' });
+            refresh();
+          } catch (err) {
+            message.error({ content: err?.message || i18n.t('COMMON.REQUEST_FAILED'), key: 'upload' });
+          }
+        })();
       }
     };
     input.click();
-  }, []);
+  }, [path, refresh, uploadFiles]);
 
   // Handle sort change
   const handleSortChange = useCallback((field) => {

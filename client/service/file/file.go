@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,6 +144,113 @@ func RemoveFiles(files []string) error {
 		}
 	}
 	return nil
+}
+
+func Mkdir(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" || dir == `\` || dir == `/` {
+		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
+	}
+	return os.MkdirAll(dir, 0755)
+}
+
+func Move(src, dst string) error {
+	src = strings.TrimSpace(src)
+	dst = strings.TrimSpace(dst)
+	if src == "" || dst == "" {
+		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
+	}
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	// Cross-device renames can fail; fall back to copy+remove.
+	if err := Copy(src, dst); err != nil {
+		return err
+	}
+	return os.RemoveAll(src)
+}
+
+func Copy(src, dst string) error {
+	src = strings.TrimSpace(src)
+	dst = strings.TrimSpace(dst)
+	if src == "" || dst == "" {
+		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
+	}
+
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		return copyDir(src, dst)
+	}
+	return copyFile(src, dst, info.Mode())
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func copyDir(src, dst string) error {
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
+
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
+	}
+	if err := os.MkdirAll(dst, info.Mode()); err != nil {
+		return err
+	}
+
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == src {
+			return nil
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			return os.MkdirAll(target, fi.Mode())
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return copyFile(path, target, fi.Mode())
+	})
 }
 
 func UploadFiles(files []string, bridge string, start, end int64) error {

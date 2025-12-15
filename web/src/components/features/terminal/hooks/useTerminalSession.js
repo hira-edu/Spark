@@ -9,7 +9,7 @@ import i18n from '../../../../locale/locale';
  * @param {Object} options - Options for the session
  */
 export function useTerminalSession(device, options = {}) {
-  const { onOutput, onStatusChange } = options;
+  const { onOutput, onOutputBytes, onStatusChange } = options;
 
   const [status, setStatus] = useState('disconnected');
   const [sessionStart, setSessionStart] = useState(null);
@@ -60,7 +60,11 @@ export function useTerminalSession(device, options = {}) {
     if (isMagic && service === 21 && op === 0) {
       // Binary protocol: 4-byte magic + 1-byte service + 1-byte op + 16-byte event + 2-byte length + payload
       // Skip 24-byte header to get actual terminal output
-      const output = ua2str(data.slice(24));
+      const payload = data.slice(24);
+      if (onOutputBytes) {
+        onOutputBytes(payload);
+      }
+      const output = ua2str(payload);
       if (onOutput) {
         onOutput(output);
       }
@@ -75,6 +79,9 @@ export function useTerminalSession(device, options = {}) {
         const parsed = JSON.parse(decrypted);
         if (parsed?.act === 'TERMINAL_OUTPUT') {
           const output = hex2ua(parsed?.data?.output);
+          if (onOutputBytes) {
+            onOutputBytes(output);
+          }
           if (onOutput) {
             onOutput(ua2str(output));
           }
@@ -106,6 +113,9 @@ export function useTerminalSession(device, options = {}) {
 
       if (parsed?.act === 'TERMINAL_OUTPUT') {
         const output = hex2ua(parsed?.data?.output);
+        if (onOutputBytes) {
+          onOutputBytes(output);
+        }
         if (onOutput) {
           onOutput(ua2str(output));
         }
@@ -131,7 +141,7 @@ export function useTerminalSession(device, options = {}) {
     } catch (err) {
       console.error('Failed to parse message:', err);
     }
-  }, [onOutput]);
+  }, [onOutput, onOutputBytes]);
 
   // Connect to the device
   const connect = useCallback(() => {
@@ -205,14 +215,14 @@ export function useTerminalSession(device, options = {}) {
     setSessionStart(null);
   }, []);
 
-  // Send input to terminal
-  const sendInput = useCallback((input) => {
+  // Send raw bytes to terminal (used for binary protocols like ZMODEM)
+  const sendBytes = useCallback((bytes) => {
     const ws = wsRef.current;
     const secret = secretRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN || !secret) return;
 
     // Low-latency raw input: service=21, op=0 (server injects terminal event UUID).
-    const payload = new TextEncoder().encode(input);
+    const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     const payloadLength = payload.length;
     const buffer = new Uint8Array(payloadLength + 8);
     buffer.set(new Uint8Array([34, 22, 19, 17, 21, 0]), 0);
@@ -220,6 +230,11 @@ export function useTerminalSession(device, options = {}) {
     buffer.set(payload, 8);
     ws.send(buffer);
   }, []);
+
+  // Send input to terminal (text)
+  const sendInput = useCallback((input) => {
+    sendBytes(new TextEncoder().encode(input));
+  }, [sendBytes]);
 
   // Resize terminal
   const resize = useCallback((cols, rows) => {
@@ -244,6 +259,7 @@ export function useTerminalSession(device, options = {}) {
     connect,
     disconnect,
     sendInput,
+    sendBytes,
     resize,
   };
 }

@@ -48,12 +48,8 @@ class Detection {
 
         //deny() - user declines ZMODEM; send abort sequence
         //
-        //TODO: It might be ideal to forgo the session “peaceably”,
-        //i.e., such that the peer doesn’t end in error. That’s
-        //possible if we’re the sender, we accept the session,
-        //then we just send a close(), but it doesn’t seem to be
-        //possible for a receiver. Thus, let’s just leave it so
-        //it’s at least consistent (and simpler, too).
+        // It might be ideal to forgo the session "peaceably" (e.g., accept then close as sender),
+        // but denial is intentionally a no-op to avoid false-positive cancellations in mixed streams.
         this._denier = denier;
 
         this._is_valid = checker;

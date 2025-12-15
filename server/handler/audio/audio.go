@@ -1,7 +1,6 @@
 package audio
 
 import (
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -73,20 +72,6 @@ func InitAudio(ctx *gin.Context) {
 		return
 	}
 
-	secretStr, ok := ctx.GetQuery(`secret`)
-	if !ok || len(secretStr) != 32 {
-		logAbort(http.StatusBadRequest, `missing secret`, map[string]any{
-			`secretLen`: len(secretStr),
-		})
-		return
-	}
-	secret, err := hex.DecodeString(secretStr)
-	if err != nil {
-		logAbort(http.StatusBadRequest, `secret decode failed`, map[string]any{
-			`error`: err.Error(),
-		})
-		return
-	}
 	device, ok := ctx.GetQuery(`device`)
 	if !ok {
 		logAbort(http.StatusBadRequest, `missing device`, nil)
@@ -105,19 +90,16 @@ func InitAudio(ctx *gin.Context) {
 	}
 
 	audioSessions.HandleRequestWithKeys(ctx.Writer, ctx.Request, gin.H{
-		`Secret`:   secret,
 		`Device`:   device,
 		`LastPack`: utils.Unix,
 	})
 
 	common.Info(ctx, `AUDIO_HANDSHAKE`, `success`, ``, map[string]any{
 		`device`:     device,
-		`secret_len`: len(secret),
 		`latency_ms`: time.Since(start).Milliseconds(),
 	})
 	span.SetAttributes(
 		attribute.String("audio.device", device),
-		attribute.Int("audio.secret_len", len(secret)),
 		attribute.Int64("latency_ms", time.Since(start).Milliseconds()),
 		attribute.String("origin", ctx.GetHeader(`Origin`)),
 	)
@@ -206,7 +188,7 @@ func onAudioConnect(session *melody.Session) {
 	if !ok {
 		common.Warn(session, `AUDIO_CONN`, `fail`, `device not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: utils.ShortString(deviceID, 16),
 		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
 		session.Close()
@@ -216,7 +198,7 @@ func onAudioConnect(session *melody.Session) {
 	if !ok {
 		common.Warn(session, `AUDIO_CONN`, `fail`, `device connection not found`, map[string]any{
 			`from`:     clientIP,
-			`deviceID`: deviceID[:16] + `...`,
+			`deviceID`: utils.ShortString(deviceID, 16),
 			`connUUID`: connUUID[:8] + `...`,
 		})
 		sendPack(modules.Packet{Act: `WARN`, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`}, session)
@@ -240,7 +222,7 @@ func onAudioConnect(session *melody.Session) {
 	// Get device info for logging
 	deviceInfo := map[string]any{
 		`uuid`:     audioUUID[:8] + `...`,
-		`deviceID`: deviceID[:16] + `...`,
+		`deviceID`: utils.ShortString(deviceID, 16),
 	}
 	if dev, ok := common.Devices.Get(connUUID); ok {
 		deviceInfo[`name`] = dev.Hostname
@@ -262,29 +244,17 @@ func onAudioMessage(session *melody.Session, data []byte) {
 	}
 	audio := val.(*audio)
 
-	service, op, isBinary := utils.CheckBinaryPack(data)
-	if !isBinary || service != 23 {
-		common.Warn(session, `AUDIO_MSG`, `fail`, `invalid binary pack`, map[string]any{
-			`audio`:    audio.uuid[:8] + `...`,
-			`service`:  service,
-			`isBinary`: isBinary,
-		})
-		sendPack(modules.Packet{Code: -1}, session)
-		session.Close()
-		return
-	}
-	if op != 05 {
-		common.Warn(session, `AUDIO_MSG`, `fail`, `invalid op code`, map[string]any{
-			`audio`: audio.uuid[:8] + `...`,
-			`op`:    op,
-		})
-		sendPack(modules.Packet{Code: -1}, session)
-		session.Close()
-		return
+	decoded := data
+	if len(data) >= 6 && data[0] == 34 && data[1] == 22 && data[2] == 19 && data[3] == 17 {
+		service := data[4]
+		op := data[5]
+		if service == 23 && op == 5 {
+			decoded = data[6:]
+		}
 	}
 
-	data = utility.SimpleDecrypt(data[8:], session)
-	if utils.JSON.Unmarshal(data, &pack) != nil {
+	decoded = utility.SimpleDecrypt(decoded, session)
+	if utils.JSON.Unmarshal(decoded, &pack) != nil {
 		common.Warn(session, `AUDIO_MSG`, `fail`, `JSON unmarshal failed`, map[string]any{
 			`audio`: audio.uuid[:8] + `...`,
 		})
@@ -314,13 +284,13 @@ func onAudioMessage(session *melody.Session, data []byte) {
 			`audio`: audio.uuid,
 		}, Event: audio.uuid}, audio.deviceConn)
 		return
-	case `AUDIO_START`:
-		// Start audio streaming
+	case `AUDIO_SELECT`, `AUDIO_START`:
+		// Start audio streaming (AUDIO_START kept as backwards-compatible alias).
 		if pack.Data != nil {
 			deviceID, _ := pack.Data[`device`]
 			mode, _ := pack.Data[`mode`] // "input" or "output"
 			common.SendPack(modules.Packet{
-				Act: `AUDIO_START`,
+				Act: `AUDIO_SELECT`,
 				Data: gin.H{
 					`device`: deviceID,
 					`mode`:   mode,
@@ -331,8 +301,8 @@ func onAudioMessage(session *melody.Session, data []byte) {
 		}
 		return
 	case `AUDIO_STOP`:
-		// Stop audio streaming
-		common.SendPack(modules.Packet{Act: `AUDIO_STOP`, Data: gin.H{
+		// Stop audio streaming (client supports AUDIO_KILL).
+		common.SendPack(modules.Packet{Act: `AUDIO_KILL`, Data: gin.H{
 			`audio`: audio.uuid,
 		}, Event: audio.uuid}, audio.deviceConn)
 		return
@@ -383,7 +353,7 @@ func sendPack(pack modules.Packet, session *melody.Session) bool {
 		return false
 	}
 	data = utility.SimpleEncrypt(data, session)
-	err = session.WriteBinary(append([]byte{34, 22, 19, 17, 23, 05}, data...))
+	err = session.WriteBinary(append([]byte{34, 22, 19, 17, 23, 5}, data...))
 	return err == nil
 }
 

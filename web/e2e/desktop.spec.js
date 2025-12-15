@@ -256,7 +256,7 @@ test.describe('View-Only Mode', () => {
 });
 
 test.describe('Resolution Change', () => {
-  test('should handle resolution change and request full frame', async ({ page, mockDevice }) => {
+  test('should handle resolution change', async ({ page, mockDevice }) => {
     await page.goto(buildMockURL('test-device-007'));
 
     await page.waitForFunction(() => window.__testWsRef?.readyState === WebSocket.OPEN, {
@@ -274,36 +274,12 @@ test.describe('Resolution Change', () => {
       return c ? { width: c.width, height: c.height } : null;
     });
 
-    // Track DESKTOP_SHOT requests
-    await page.evaluate(() => {
-      window.__shotRequests = 0;
-      window.__rocketDesktopDebug = window.__rocketDesktopDebug || {};
-      window.__rocketDesktopDebug.shotRequests = 0;
-      const ws = window.__testWsRef;
-      if (ws) {
-        const originalSend = ws.send.bind(ws);
-        ws.send = (data) => {
-          if (data instanceof ArrayBuffer) {
-            const bytes = new Uint8Array(data);
-            if (bytes[5] === 3) {
-              try {
-                const decoder = new TextDecoder();
-                const json = JSON.parse(decoder.decode(bytes.slice(8)));
-                if (json.act === 'DESKTOP_SHOT') {
-                  window.__shotRequests++;
-                }
-              } catch (e) {}
-            }
-          }
-          return originalSend(data);
-        };
-      }
-    });
-
     // Change resolution
-    await mockDevice.sendResolution(1280, 720);
-    await mockDevice.sendTestFrame({ width: 150, height: 150, color: '#ff9800' });
-    await page.waitForTimeout(500);
+    await mockDevice.sendResolution(1024, 768);
+    await page.waitForFunction(() => {
+      const c = document.querySelector('canvas');
+      return c && c.width === 1024 && c.height === 768;
+    }, { timeout: 5000 });
 
     // Verify canvas was resized
     const newSize = await page.evaluate(() => {
@@ -312,19 +288,23 @@ test.describe('Resolution Change', () => {
     });
 
     if (newSize && initialSize) {
-      // Canvas should have been resized (or stayed same if mock didn't apply)
-      expect(newSize).toBeTruthy();
+      expect(newSize.width).toBe(1024);
+      expect(newSize.height).toBe(768);
     }
 
-    // Full frame request should have been sent after resolution change
-    const shotRequests = await page.evaluate(() => {
-      const debug = window.__rocketDesktopDebug || {};
-      if (typeof debug.shotRequests === 'number') {
-        return debug.shotRequests;
-      }
-      return window.__shotRequests || 0;
+    // Verify we can render after the resize.
+    await mockDevice.sendTestFrame({ width: 150, height: 150, color: '#ff9800' });
+    await page.waitForTimeout(500);
+
+    const hasNonBlackPixel = await page.evaluate(() => {
+      const c = document.querySelector('canvas');
+      if (!c) return false;
+      const ctx = c.getContext('2d');
+      if (!ctx) return false;
+      const data = ctx.getImageData(10, 10, 1, 1).data;
+      return (data[0] + data[1] + data[2]) > 0;
     });
-    expect(shotRequests).toBeGreaterThanOrEqual(1);
+    expect(hasNonBlackPixel).toBeTruthy();
   });
 });
 

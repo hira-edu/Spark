@@ -1145,8 +1145,8 @@ func worker() {
 				globalHWFrameBroadcaster.Dispatch(frame)
 			}
 
-			// Broadcast to WebRTC sessions
-			broadcastRTC(img, frameDuration)
+			// Broadcast to WebRTC sessions (CPU or GPU frames).
+			broadcastRTC(frame, frameDuration)
 			if frame != nil {
 				frame.Close()
 				frame = nil
@@ -3005,8 +3005,25 @@ func healthCheck() {
 	}
 }
 
-func broadcastRTC(img *image.RGBA, interval time.Duration) {
-	if img == nil {
+func cloneCaptureFrameForRTC(frame *CaptureFrame) *CaptureFrame {
+	if frame == nil {
+		return nil
+	}
+
+	out := &CaptureFrame{
+		Image: frame.Image,
+	}
+	if frame.GPU != nil {
+		out.GPU = cloneGPUFrame(frame.GPU)
+	}
+	if out.Image == nil && out.GPU == nil {
+		return nil
+	}
+	return out
+}
+
+func broadcastRTC(frame *CaptureFrame, interval time.Duration) {
+	if frame == nil {
 		return
 	}
 	sessions.IterCb(func(_ string, desktop *session) bool {
@@ -3019,12 +3036,11 @@ func broadcastRTC(img *image.RGBA, interval time.Duration) {
 		if rtc == nil {
 			return true
 		}
-		if err := rtc.sendFrame(img, interval); err != nil {
-			desktop.lock.Lock()
-			rtc.close()
-			desktop.rtc = nil
-			desktop.lock.Unlock()
+		cloned := cloneCaptureFrameForRTC(frame)
+		if cloned == nil {
+			return true
 		}
+		rtc.enqueue(cloned, interval)
 		return true
 	})
 }

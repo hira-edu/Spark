@@ -296,7 +296,7 @@ This living document is the **single source of truth** for the Rocket remote des
 
 **Note:** Guacamole parity is lower priority than Sunshine/RustDesk as current Rocket implementation already has basic view-only and rate limiting.
 
-## TODO Checklist
+## Checklist
 
 - [x] **Document pipeline overview** — Capture end-to-end flow (this document) so audits have a shared source of truth.
 - [x] **Instrument frame-drop/backpressure metrics** — Prometheus counters/gauges now track drops/delivery/high-water locally and a metrics reporter (`client/service/desktop/metrics_reporter.go`) emits `DESKTOP_METRICS` snapshots. The server stores snapshots and exposes `/api/device/desktop/metrics?desktop=<uuid>` for operators.
@@ -1111,7 +1111,7 @@ This audit covered the complete remote desktop capture → render pipeline:
 ### Deliverables
 
 1. **SSOT Document** — This file (~1000 lines, comprehensive pipeline documentation)
-2. **TODO Checklist** — 12 items total: 9 complete, 3 pending (parity items with research complete)
+2. **Checklist** - 12 items total: 9 complete, 3 pending (parity items with research complete)
 3. **Implementation Guides:**
    - TURN credential rotation with coturn
    - Share handler logging migration inventory

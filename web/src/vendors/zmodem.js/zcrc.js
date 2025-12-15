@@ -66,7 +66,7 @@ function __verify(expect, got) {
     }
 }
 
-//TODO: use external implementation(s)
+// CRC implementation is kept self-contained to avoid additional dependencies.
 Zmodem.CRC = {
 
     //https://www.lammertbies.nl/comm/info/crc-calculation.html

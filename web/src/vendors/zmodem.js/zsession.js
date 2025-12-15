@@ -321,21 +321,18 @@ Zmodem.Session = class ZmodemSession extends _Eventer {
         handler.call(this, new_header);
     }
 
-    //TODO: strip out the abort sequence
     _check_for_abort_sequence() {
         var abort_at = Zmodem.ZMLIB.find_subarray( this._input_buffer, ABORT_SEQUENCE );
 
         if (abort_at !== -1) {
 
-            //TODO: expose this to caller
             this._input_buffer.splice( 0, abort_at + ABORT_SEQUENCE.length );
 
             this._aborted = true;
 
-            //TODO compare response here to lrzsz.
             this._on_session_end();
 
-            //We shouldn’t ever expect to receive an abort. Even if we
+            //We shouldn't ever expect to receive an abort. Even if we
             //have sent an abort ourselves, the Sentry should have stopped
             //directing input to this Session object.
             //if (this._expect_abort) {
@@ -446,13 +443,12 @@ Zmodem.Session = class ZmodemSession extends _Eventer {
 }
 
 function _trim_OO(array) {
-    if (0 === Zmodem.ZMLIB.find_subarray(array, OVER_AND_OUT)) {
-        array.splice(0, OVER_AND_OUT.length);
-    }
-
-    //TODO: This assumes OVER_AND_OUT is 2 bytes long. No biggie, but.
-    else if ( array[0] === OVER_AND_OUT[ OVER_AND_OUT.length - 1 ] ) {
-        array.splice(0, 1);
+    // Trim full or partial OVER_AND_OUT prefixes (e.g., some peers send only a leading 'O').
+    for (var n = Math.min(array.length, OVER_AND_OUT.length); n > 0; n--) {
+        if (0 === Zmodem.ZMLIB.find_subarray(array, OVER_AND_OUT.slice(0, n))) {
+            array.splice(0, n);
+            break;
+        }
     }
 
     return array;
@@ -475,6 +471,8 @@ Zmodem.Session.Receive = class ZmodemReceiveSession extends Zmodem.Session {
         this._Add_event("offer");
         this._Add_event("data_in");
         this._Add_event("file_end");
+
+        this._zrpos_retries = 0;
     }
 
     /**
@@ -645,14 +643,18 @@ Zmodem.Session.Receive = class ZmodemReceiveSession extends Zmodem.Session {
             throw "PROTOCOL: Received data without accepting!";
         }
 
-        //TODO: Probably should include some sort of preventive against
-        //infinite loop here: if the peer hasn’t sent us what we want after,
-        //say, 10 ZRPOS headers then we should send ZABORT and just end.
         if (!this._offset_ok) {
             console.warn("offset not ok!");
-            _send_ZRPOS();
+            this._zrpos_retries++;
+            if (this._zrpos_retries > 10) {
+                this.abort();
+                return;
+            }
+            this._send_ZRPOS();
             return;
         }
+
+        this._zrpos_retries = 0;
 
         this._file_offset += subpacket.get_payload().length;
         this._on_data_in(subpacket);
@@ -709,7 +711,7 @@ Zmodem.Session.Receive = class ZmodemReceiveSession extends Zmodem.Session {
 
     _consume_ZSINIT_data(spkt) {
 
-        //TODO: Should this be used when we signal a cancellation?
+        // Store attention sequence for peers that support it.
         this._attn = spkt.get_payload();
     }
 
@@ -869,6 +871,7 @@ Zmodem.Session.Receive = class ZmodemReceiveSession extends Zmodem.Session {
     _consume_ZDATA(header) {
         if ( this._file_offset === header.get_offset() ) {
             this._offset_ok = true;
+            this._zrpos_retries = 0;
         }
         else {
             throw "Error correction is unimplemented.";
@@ -1523,7 +1526,6 @@ Zmodem.Session.Send = class ZmodemSendSession extends Zmodem.Session {
                 NB: try 8k/32k/64k chunk sizes? Looks like there’s
                 no need to change the packet otherwise.
     */
-    //TODO: Put this on a Transfer object similar to what Receive uses?
     _send_interim_file_piece(bytes_obj) {
 
         //We don’t ask the receiver to confirm because there’s no need.

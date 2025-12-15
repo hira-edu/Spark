@@ -2,6 +2,7 @@ package file
 
 import (
 	"Rocket/modules"
+	"Rocket/server/cluster"
 	"Rocket/server/common"
 	"Rocket/server/handler/bridge"
 	"Rocket/server/handler/utility"
@@ -49,6 +50,125 @@ func RemoveDeviceFiles(ctx *gin.Context) {
 	if !ok {
 		common.Warn(ctx, `REMOVE_FILES`, `fail`, `timeout`, map[string]any{
 			`files`: form.Files,
+		})
+		ctx.AbortWithStatusJSON(http.StatusGatewayTimeout, modules.Packet{Code: 1, Msg: `${i18n|COMMON.RESPONSE_TIMEOUT}`})
+	}
+}
+
+// MkdirDeviceDir creates a directory on the target device.
+func MkdirDeviceDir(ctx *gin.Context) {
+	var form struct {
+		Path string `json:"path" yaml:"path" form:"path" binding:"required"`
+	}
+	target, ok := utility.CheckForm(ctx, &form)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(form.Path) == "" {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
+		return
+	}
+
+	trigger := utils.GetStrUUID()
+	common.SendPackByUUID(modules.Packet{Act: `FILES_MKDIR`, Data: gin.H{`path`: form.Path}, Event: trigger}, target)
+	ok = common.AddEventOnce(func(p modules.Packet, _ *melody.Session) {
+		if p.Code != 0 {
+			common.Warn(ctx, `MKDIR`, `fail`, p.Msg, map[string]any{
+				`path`: form.Path,
+			})
+			ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: p.Msg})
+		} else {
+			common.Info(ctx, `MKDIR`, `success`, ``, map[string]any{
+				`path`: form.Path,
+			})
+			ctx.JSON(http.StatusOK, modules.Packet{Code: 0})
+		}
+	}, target, trigger, 5*time.Second)
+	if !ok {
+		common.Warn(ctx, `MKDIR`, `fail`, `timeout`, map[string]any{
+			`path`: form.Path,
+		})
+		ctx.AbortWithStatusJSON(http.StatusGatewayTimeout, modules.Packet{Code: 1, Msg: `${i18n|COMMON.RESPONSE_TIMEOUT}`})
+	}
+}
+
+// MoveDevicePath moves/renames a path on the target device.
+func MoveDevicePath(ctx *gin.Context) {
+	var form struct {
+		Src string `json:"src" yaml:"src" form:"src" binding:"required"`
+		Dst string `json:"dst" yaml:"dst" form:"dst" binding:"required"`
+	}
+	target, ok := utility.CheckForm(ctx, &form)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(form.Src) == "" || strings.TrimSpace(form.Dst) == "" {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
+		return
+	}
+
+	trigger := utils.GetStrUUID()
+	common.SendPackByUUID(modules.Packet{Act: `FILES_MOVE`, Data: gin.H{`src`: form.Src, `dst`: form.Dst}, Event: trigger}, target)
+	ok = common.AddEventOnce(func(p modules.Packet, _ *melody.Session) {
+		if p.Code != 0 {
+			common.Warn(ctx, `MOVE`, `fail`, p.Msg, map[string]any{
+				`src`: form.Src,
+				`dst`: form.Dst,
+			})
+			ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: p.Msg})
+		} else {
+			common.Info(ctx, `MOVE`, `success`, ``, map[string]any{
+				`src`: form.Src,
+				`dst`: form.Dst,
+			})
+			ctx.JSON(http.StatusOK, modules.Packet{Code: 0})
+		}
+	}, target, trigger, 5*time.Second)
+	if !ok {
+		common.Warn(ctx, `MOVE`, `fail`, `timeout`, map[string]any{
+			`src`: form.Src,
+			`dst`: form.Dst,
+		})
+		ctx.AbortWithStatusJSON(http.StatusGatewayTimeout, modules.Packet{Code: 1, Msg: `${i18n|COMMON.RESPONSE_TIMEOUT}`})
+	}
+}
+
+// CopyDevicePath copies a path on the target device.
+func CopyDevicePath(ctx *gin.Context) {
+	var form struct {
+		Src string `json:"src" yaml:"src" form:"src" binding:"required"`
+		Dst string `json:"dst" yaml:"dst" form:"dst" binding:"required"`
+	}
+	target, ok := utility.CheckForm(ctx, &form)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(form.Src) == "" || strings.TrimSpace(form.Dst) == "" {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
+		return
+	}
+
+	trigger := utils.GetStrUUID()
+	common.SendPackByUUID(modules.Packet{Act: `FILES_COPY`, Data: gin.H{`src`: form.Src, `dst`: form.Dst}, Event: trigger}, target)
+	ok = common.AddEventOnce(func(p modules.Packet, _ *melody.Session) {
+		if p.Code != 0 {
+			common.Warn(ctx, `COPY`, `fail`, p.Msg, map[string]any{
+				`src`: form.Src,
+				`dst`: form.Dst,
+			})
+			ctx.AbortWithStatusJSON(http.StatusInternalServerError, modules.Packet{Code: 1, Msg: p.Msg})
+		} else {
+			common.Info(ctx, `COPY`, `success`, ``, map[string]any{
+				`src`: form.Src,
+				`dst`: form.Dst,
+			})
+			ctx.JSON(http.StatusOK, modules.Packet{Code: 0})
+		}
+	}, target, trigger, 5*time.Second)
+	if !ok {
+		common.Warn(ctx, `COPY`, `fail`, `timeout`, map[string]any{
+			`src`: form.Src,
+			`dst`: form.Dst,
 		})
 		ctx.AbortWithStatusJSON(http.StatusGatewayTimeout, modules.Packet{Code: 1, Msg: `${i18n|COMMON.RESPONSE_TIMEOUT}`})
 	}
@@ -297,24 +417,42 @@ func GetDeviceTextFile(ctx *gin.Context) {
 // UploadToDevice handles file from browser
 // and transfer it to device.
 func UploadToDevice(ctx *gin.Context) {
-	var form struct {
-		Path string `json:"path" yaml:"path" form:"path" binding:"required"`
-		File string `json:"file" yaml:"file" form:"file" binding:"required"`
+	deviceID := strings.TrimSpace(ctx.Query(`device`))
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(ctx.PostForm(`device`))
 	}
-	target, ok := utility.CheckForm(ctx, &form)
-	if !ok {
-		return
-	}
-	if len(form.File) == 0 || len(form.Path) == 0 {
+	if deviceID == "" {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
 		return
 	}
+	if cluster.RedirectIfNeeded(ctx, deviceID) {
+		return
+	}
+	target, ok := common.CheckDevice(deviceID, ``)
+	if !ok {
+		ctx.AbortWithStatusJSON(http.StatusBadGateway, modules.Packet{Code: 1, Msg: `${i18n|COMMON.DEVICE_NOT_EXIST}`})
+		return
+	}
+
+	destPath := strings.TrimSpace(ctx.Query(`path`))
+	if destPath == "" {
+		destPath = strings.TrimSpace(ctx.PostForm(`path`))
+	}
+	fileName := strings.TrimSpace(ctx.Query(`file`))
+	if fileName == "" {
+		fileName = strings.TrimSpace(ctx.PostForm(`file`))
+	}
+	if destPath == "" || fileName == "" {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, modules.Packet{Code: -1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`})
+		return
+	}
+
 	bridgeID := utils.GetStrUUID()
 	trigger := utils.GetStrUUID()
 	wait := make(chan bool)
 	called := false
 	response := false
-	fileDest := path.Join(form.Path, form.File)
+	fileDest := path.Join(destPath, fileName)
 	fileSize := ctx.Request.ContentLength
 	common.AddEvent(func(p modules.Packet, _ *melody.Session) {
 		called = true
@@ -339,7 +477,7 @@ func UploadToDevice(ctx *gin.Context) {
 		dst.Header(`Accept-Ranges`, `none`)
 		dst.Header(`Content-Transfer-Encoding`, `binary`)
 		dst.Header(`Content-Type`, `application/octet-stream`)
-		dst.Header(`Content-Disposition`, fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, form.File, url.PathEscape(form.File)))
+		dst.Header(`Content-Disposition`, fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, fileName, url.PathEscape(fileName)))
 	}
 	instance.OnFinish = func(bridge *bridge.Bridge) {
 		if called {
@@ -351,8 +489,8 @@ func UploadToDevice(ctx *gin.Context) {
 		wait <- false
 	}
 	common.SendPackByUUID(modules.Packet{Act: `FILES_FETCH`, Data: gin.H{
-		`path`:   form.Path,
-		`file`:   form.File,
+		`path`:   destPath,
+		`file`:   fileName,
 		`bridge`: bridgeID,
 	}, Event: trigger}, target)
 	select {

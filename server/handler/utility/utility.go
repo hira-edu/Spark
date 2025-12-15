@@ -126,7 +126,7 @@ func OnDevicePackWithUUID(data []byte, uuid, remoteAddr string, sendResponse fun
 				if ok {
 					kickedOldSession = true
 					common.Warn(nil, `CLIENT_DUPLICATE`, ``, `kicking old session for same device`, map[string]any{
-						`deviceID`:       pack.Device.ID[:16] + `...`,
+						`deviceID`:       utils.ShortString(pack.Device.ID, 16),
 						`oldSessionUUID`: existingUUID[:8] + `...`,
 						`newSessionUUID`: uuid[:8] + `...`,
 						`device`: map[string]any{

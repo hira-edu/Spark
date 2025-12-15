@@ -3,7 +3,9 @@ package desktop
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // MTU-aware frame fragmentation for WebRTC and WebSocket paths
@@ -139,8 +141,11 @@ func ParseFragmentHeader(data []byte) (frameID uint32, sequence uint16, total ui
 type FrameReassembler struct {
 	// Map of frameID -> fragment collector
 	frames map[uint32]*fragmentCollector
-	// TODO: Add mutex if needed for concurrent access
-	// TODO: Add timeout for incomplete frames (GC old entries)
+	mu     sync.Mutex
+	lastGC time.Time
+
+	// ttl bounds how long we keep incomplete frames before dropping them.
+	ttl time.Duration
 }
 
 type fragmentCollector struct {
@@ -148,18 +153,29 @@ type fragmentCollector struct {
 	totalFragments uint16
 	received       map[uint16][]byte // sequence -> payload
 	totalSize      int               // Total bytes received
+	createdAt      time.Time
+	lastSeen       time.Time
 }
 
 // NewFrameReassembler creates a new reassembler instance.
 func NewFrameReassembler() *FrameReassembler {
 	return &FrameReassembler{
 		frames: make(map[uint32]*fragmentCollector),
+		ttl:    10 * time.Second,
 	}
 }
 
 // AddFragment processes an incoming fragment and returns the complete frame if all fragments arrived.
 // Returns (completeFrame, true) when frame is complete, or (nil, false) if more fragments needed.
 func (fr *FrameReassembler) AddFragment(fragmentData []byte) ([]byte, bool, error) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+
+	now := time.Now()
+	if fr.lastGC.IsZero() || now.Sub(fr.lastGC) > time.Second {
+		fr.gcLocked(now)
+	}
+
 	frameID, sequence, total, payload, err := ParseFragmentHeader(fragmentData)
 	if err != nil {
 		fragmentStats.reassemblyErrors.Add(1)
@@ -173,9 +189,12 @@ func (fr *FrameReassembler) AddFragment(fragmentData []byte) ([]byte, bool, erro
 			frameID:        frameID,
 			totalFragments: total,
 			received:       make(map[uint16][]byte),
+			createdAt:      now,
+			lastSeen:       now,
 		}
 		fr.frames[frameID] = collector
 	}
+	collector.lastSeen = now
 
 	// Validate total fragments matches
 	if collector.totalFragments != total {
@@ -185,6 +204,9 @@ func (fr *FrameReassembler) AddFragment(fragmentData []byte) ([]byte, bool, erro
 	}
 
 	// Store fragment payload
+	if prev, ok := collector.received[sequence]; ok {
+		collector.totalSize -= len(prev)
+	}
 	collector.received[sequence] = payload
 	collector.totalSize += len(payload)
 
@@ -212,6 +234,23 @@ func (fr *FrameReassembler) AddFragment(fragmentData []byte) ([]byte, bool, erro
 	}
 
 	return nil, false, nil // More fragments needed
+}
+
+func (fr *FrameReassembler) gcLocked(now time.Time) {
+	fr.lastGC = now
+	if fr.ttl <= 0 {
+		return
+	}
+	for id, collector := range fr.frames {
+		if collector == nil {
+			delete(fr.frames, id)
+			continue
+		}
+		if now.Sub(collector.lastSeen) > fr.ttl {
+			delete(fr.frames, id)
+			fragmentStats.reassemblyErrors.Add(1)
+		}
+	}
 }
 
 // GetFragmentationStats returns current fragmentation statistics.

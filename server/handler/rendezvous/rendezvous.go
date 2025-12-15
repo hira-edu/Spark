@@ -2,10 +2,14 @@ package rendezvous
 
 import (
 	"Rocket/server/common"
+	servercfg "Rocket/server/config"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -418,13 +422,12 @@ func exchangePunchHandler(c *gin.Context) {
 // getRelayServersHandler returns available relay servers for fallback
 // GET /p2p/punch/relay
 func getRelayServersHandler(c *gin.Context) {
-	// TODO: Load from config or environment
 	relayServers := getRelayServers()
 
 	c.JSON(http.StatusOK, gin.H{
 		`relay_servers`: relayServers,
-		`websocket_url`: "/api/device/ws",
-		`longpoll_url`:  "/api/poll",
+		`websocket_url`: "/ws",
+		`longpoll_url`:  "/api/longpoll/poll",
 	})
 }
 
@@ -458,19 +461,32 @@ func canNATsPunch(natA, natB string) bool {
 }
 
 func getRelayServers() []map[string]any {
-	// TODO: Load from config
-	return []map[string]any{
+	if raw := strings.TrimSpace(os.Getenv("SPARK_P2P_RELAY_SERVERS")); raw != "" {
+		var parsed []map[string]any
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil && len(parsed) > 0 {
+			return parsed
+		}
+	}
+
+	servers := []map[string]any{
 		{
-			"url":      "/api/device/ws",
+			"url":      "/ws",
 			"protocol": "websocket",
 			"priority": 1,
 		},
-		{
-			"url":      "/api/poll",
+	}
+
+	if servercfg.Config.Transport != nil &&
+		servercfg.Config.Transport.LongPolling != nil &&
+		servercfg.Config.Transport.LongPolling.Enable {
+		servers = append(servers, map[string]any{
+			"url":      "/api/longpoll/poll",
 			"protocol": "longpoll",
 			"priority": 2,
-		},
+		})
 	}
+
+	return servers
 }
 
 // cleanupExpiredPunchSessions removes expired punch sessions

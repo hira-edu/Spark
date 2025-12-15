@@ -37,9 +37,10 @@
   },
   "desktop": {
     "capture": {
-      "mode": "auto",
+      "mode": "dxgi_nv12",
       "enable_pre_dwm": false,
       "fallback_order": [
+        "dxgi_nv12",
         "sharedSurface",
         "nvfbc",
         "dxgi",

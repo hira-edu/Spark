@@ -11,6 +11,37 @@ import (
 	"strings"
 )
 
+func filterGoTestFlags(args []string) []string {
+	// The config package historically parses flags during init(). `go test` injects
+	// -test.* flags before package init runs, which would otherwise cause an early exit.
+	if len(args) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	out = append(out, args[0])
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-test.") {
+			// Drop `-test.x value` pairs as well as `-test.x=value`.
+			if !strings.Contains(arg, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func hasGoTestFlags(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	return false
+}
+
 type config struct {
 	Listen    string            `json:"listen"`
 	Salt      string            `json:"salt"`
@@ -188,13 +219,40 @@ func init() {
 	flag.StringVar(&tlsDomains, `tls-domains`, ``, `comma-separated list of domains for autocert`)
 	flag.StringVar(&tlsEmail, `tls-email`, ``, `email for Let's Encrypt notifications`)
 	flag.StringVar(&tlsCacheDir, `tls-cache`, `./certs`, `directory to cache Let's Encrypt certificates`)
+
+	// Ensure `go test ./...` doesn't fail due to injected -test.* flags being parsed
+	// by this package before the testing framework has initialized.
+	origArgs := os.Args
+	runningTests := hasGoTestFlags(origArgs)
+	os.Args = filterGoTestFlags(origArgs)
 	flag.Parse()
+	os.Args = origArgs
 
 	if len(configPath) > 0 {
 		configData, err = os.ReadFile(configPath)
 		if err != nil {
 			configData, err = os.ReadFile(`Config.json`)
 			if err != nil {
+				if runningTests {
+					// Unit tests should not require a repo-local config file to exist in the
+					// current working directory. Fall back to flag defaults.
+					if salt == "" {
+						salt = "testsalt1234567890123"
+					}
+					Config = config{
+						Listen: listen,
+						Salt:   salt,
+						Auth: map[string]string{
+							username: password,
+						},
+						Log: &log{
+							Level: logLevel,
+							Path:  logPath,
+							Days:  logDays,
+						},
+					}
+					return
+				}
 				fatal(map[string]any{
 					`event`:  `CONFIG_LOAD`,
 					`status`: `fail`,

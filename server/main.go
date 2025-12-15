@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -47,7 +48,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const serverLockPath = "/tmp/rocket-server.lock"
+func serverLockPath() string {
+	// Use a platform-appropriate temp directory so the server can run on Windows/macOS/Linux
+	// (Playwright/CI E2E runs often start the server as a child process).
+	return filepath.Join(os.TempDir(), "rocket-server.lock")
+}
 
 var blocked = cmap.New[int64]()
 var lastRequest = time.Now().Unix()
@@ -60,23 +65,23 @@ func main() {
 	}
 	defer otelShutdown(context.Background())
 
-	lock := flock.New(serverLockPath)
+	lock := flock.New(serverLockPath())
 	locked, err := lock.TryLock()
 	if err != nil {
 		common.Fatal(nil, `INSTANCE_LOCK`, `fail`, err.Error(), map[string]any{
-			`path`: serverLockPath,
+			`path`: serverLockPath(),
 		})
 		return
 	}
 	if !locked {
 		common.Fatal(nil, `INSTANCE_LOCK`, `fail`, `another rocket-server instance is already running`, map[string]any{
-			`path`: serverLockPath,
+			`path`: serverLockPath(),
 		})
 		return
 	}
 	defer lock.Unlock()
 	common.Info(nil, `INSTANCE_LOCK`, `acquired`, ``, map[string]any{
-		`path`: serverLockPath,
+		`path`: serverLockPath(),
 	})
 
 	var clusterMgr *cluster.Manager

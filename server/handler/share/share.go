@@ -449,8 +449,12 @@ func CreateShare(ctx *gin.Context) {
 		expiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
 	}
 
-	// TODO: Get admin username from auth context
 	adminUser := "admin"
+	if v, ok := ctx.Get("user"); ok {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			adminUser = strings.TrimSpace(s)
+		}
+	}
 
 	// Generate per-share secret (32 bytes hex)
 	secretBytes := make([]byte, 32)

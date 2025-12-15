@@ -3,6 +3,7 @@ package audio
 import (
 	"Rocket/modules"
 	"Rocket/server/common"
+	"Rocket/utils/melody"
 	"Rocket/utils/cmap"
 	"context"
 	"encoding/base64"
@@ -111,6 +112,9 @@ func HandleAudioData(pack modules.Packet, uuid string) error {
 		return fmt.Errorf("failed to write audio data: %w", err)
 	}
 
+	// Forward raw Opus packets to any connected browser audio sessions for this uuid.
+	broadcastAudioPacket(audioUUID, audioData)
+
 	// Log every 100th packet to avoid spam
 	if int64(seq)%100 == 0 {
 		common.Debug(nil, "AUDIO_DATA_RECEIVED", uuid, "", map[string]any{
@@ -124,6 +128,24 @@ func HandleAudioData(pack modules.Packet, uuid string) error {
 
 	span.SetStatus(codes.Ok, "")
 	return nil
+}
+
+func broadcastAudioPacket(audioUUID string, packet []byte) {
+	if audioUUID == "" || len(packet) == 0 {
+		return
+	}
+	audioSessions.IterSessions(func(_ string, session *melody.Session) bool {
+		val, ok := session.Get(`Audio`)
+		if !ok {
+			return true
+		}
+		a, ok := val.(*audio)
+		if !ok || a == nil || a.uuid != audioUUID {
+			return true
+		}
+		_ = session.WriteBinary(packet)
+		return true
+	})
 }
 
 // getOrCreateStream gets an existing audio stream or creates a new one

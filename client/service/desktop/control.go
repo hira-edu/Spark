@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"os"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -25,6 +26,24 @@ func init() {
 	configQuality.Store(imageQuality)
 	configMonitor.Store(0)
 	setConfiguredCaptureBackend(CaptureBackendAuto)
+
+	// Optional startup override for capture backend selection (useful in CI/perf harnesses).
+	// Example: SPARK_CAPTURE_BACKEND=dxgi for WS tile transport (requires CPU RGBA frames).
+	if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
+		if mode, err := captureBackendFromString(raw); err != nil {
+			telemetry.LogStructured("WARN", "config: invalid SPARK_CAPTURE_BACKEND (ignored)", map[string]interface{}{
+				"value": raw,
+				"error": err.Error(),
+			})
+		} else {
+			setConfiguredCaptureBackend(mode)
+			bumpCaptureConfigEpoch()
+			telemetry.LogStructured("INFO", "config: capture backend set from env", map[string]interface{}{
+				"value":   raw,
+				"backend": captureBackendName(mode),
+			})
+		}
+	}
 }
 
 // HandleConfig processes DESKTOP_CONFIG action with atomic updates.
@@ -420,7 +439,64 @@ func HandleAudio(pack modules.Packet) error {
 	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
 		return err
 	}
-	// TODO: Implement audio streaming control
+	desktopID, _ := pack.Data[`desktop`].(string)
+	if desktopID == "" {
+		desktopID = pack.Event
+	}
+	if desktopID == "" {
+		return errInputInvalid
+	}
+
+	sess, ok := sessions.Get(desktopID)
+	if !ok || sess == nil {
+		return errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
+	}
+
+	sess.lock.Lock()
+	defer sess.lock.Unlock()
+
+	if sess.escape.Load() || sess.rtc == nil {
+		return nil
+	}
+
+	op, _ := pack.Data[`op`].(string)
+	op = strings.ToLower(strings.TrimSpace(op))
+	muted, mutedOK := pack.Data[`muted`].(bool)
+
+	applyMute := func(m bool) error {
+		if m {
+			if sess.rtc.audioStop != nil {
+				sess.rtc.audioStop()
+				sess.rtc.audioStop = nil
+			}
+			return nil
+		}
+		if !isWebRTCAudioEnabled() {
+			return nil
+		}
+		if sess.rtc.audioStop == nil && sess.rtc.rtc != nil {
+			stopFn, err := startAudioTrack(sess.rtc.rtc)
+			if err != nil {
+				return err
+			}
+			sess.rtc.audioStop = stopFn
+		}
+		return nil
+	}
+
+	switch op {
+	case "":
+		if mutedOK {
+			return applyMute(muted)
+		}
+		return nil
+	case "mute", "muted", "off", "stop":
+		return applyMute(true)
+	case "unmute", "on", "start":
+		return applyMute(false)
+	default:
+		return errInputInvalid
+	}
 	return nil
 }
 

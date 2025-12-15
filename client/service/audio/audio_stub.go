@@ -1,5 +1,5 @@
-//go:build !cgo
-// +build !cgo
+//go:build !cgo || !rocket_audio || headless
+// +build !cgo !rocket_audio headless
 
 package audio
 
