@@ -390,6 +390,45 @@ func sendReservedChunk(buf []byte, chunkBytes int64) {
 	}
 }
 
+// sendResolutionPacketImmediate sends a binary resolution packet directly to the browser/server.
+// This is called synchronously during InitDesktop to ensure the browser receives the resolution
+// BEFORE any frame data arrives. This fixes the race condition where 500+ frames could arrive
+// before the JSON DESKTOP_INIT was processed, causing hasResolutionRef.current to stay false
+// and all frames to be buffered/dropped.
+//
+// This mirrors the mock server's behavior which sends: sendInit -> sendResolution -> sendFrame
+func sendResolutionPacketImmediate(rawEvent []byte, bounds image.Rectangle) {
+	if rawEvent == nil || len(rawEvent) < 16 {
+		telemetry.LogStructured("WARN", "desktop: cannot send immediate resolution - no event ID", nil)
+		return
+	}
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
+		telemetry.LogStructured("WARN", "desktop: cannot send immediate resolution - invalid bounds", map[string]interface{}{
+			"width":  bounds.Dx(),
+			"height": bounds.Dy(),
+		})
+		return
+	}
+
+	// Build binary resolution packet (matches handleDesktop's message{t: 2} handling)
+	buf := append(append(magicBytes, opResolution), rawEvent...)
+	// Resolution packets use the same extended header as frames.
+	// frameSeq=0 marks this as non-frame metadata for the browser.
+	buf = appendFrameMeta(buf, 0, 0, 1)
+	data := make([]byte, 6)
+	binary.BigEndian.PutUint16(data[:2], 4)
+	binary.BigEndian.PutUint16(data[2:4], uint16(bounds.Dx()))
+	binary.BigEndian.PutUint16(data[4:6], uint16(bounds.Dy()))
+	buf = append(buf, data...)
+
+	sendDesktopData(buf)
+	telemetry.LogStructured("INFO", "desktop: sent IMMEDIATE resolution packet", map[string]interface{}{
+		"width":  bounds.Dx(),
+		"height": bounds.Dy(),
+		"event":  hex.EncodeToString(rawEvent[:8]) + "...",
+	})
+}
+
 // sendDesktopPacket delivers a control packet back to the server (via WS) or to Session 0 over IPC.
 func sendDesktopPacket(pack modules.Packet, rawEvent []byte) {
 	if pack.Event == `` && rawEvent != nil {
@@ -607,6 +646,13 @@ func worker() {
 		img              *image.RGBA
 		err              error
 		lastSuccessTime  time.Time
+
+		// DXGI stall detection: track consecutive errNoImage returns to trigger GDI fallback.
+		// When DXGI Output Duplication doesn't detect desktop changes (e.g., phase-locked timer
+		// windows like perfmarker), we fall back to GDI capture to ensure frames still flow.
+		noImageCount    int
+		inStallMode     bool // When true, use GDI every tick until DXGI recovers
+		fromGDIFallback bool // Set true when current frame came from GDI fallback
 
 		// Performance metrics for delta detection
 		frameCount         uint64
@@ -850,6 +896,9 @@ func worker() {
 				continue
 			}
 
+			// Reset GDI fallback flag for this capture cycle
+			fromGDIFallback = false
+
 			// Capture frame
 			if useCaptureEngine {
 				workerDiag.setStage("capture")
@@ -900,7 +949,51 @@ func worker() {
 
 			if err != nil {
 				if err == errNoImage {
-					// Screen idle - DXGI detected no changes, continue without delay
+					noImageCount++
+
+					// DXGI stall detection: If we've received too many consecutive errNoImage returns,
+					// or we're already in stall mode, use GDI fallback to ensure frames flow.
+					//
+					// - Initial threshold: ~500ms at 30 FPS (15 ticks) before entering stall mode
+					// - In stall mode: take GDI screenshot every tick to maintain frame rate
+					// - Exit stall mode: when DXGI returns a valid frame (in processFrame section)
+					const noImageFallbackThreshold = 15
+
+					useGDIFallback := false
+					if inStallMode {
+						// In stall mode: use GDI every tick
+						useGDIFallback = true
+					} else if noImageCount >= noImageFallbackThreshold && runtime.GOOS == "windows" {
+						// Enter stall mode after threshold
+						inStallMode = true
+						useGDIFallback = true
+						telemetry.LogStructured("WARN", "worker: DXGI stall detected, entering GDI fallback mode", map[string]interface{}{
+							"no_image_count": noImageCount,
+							"bounds_width":   currentBounds.Dx(),
+							"bounds_height":  currentBounds.Dy(),
+						})
+					}
+
+					if useGDIFallback {
+						// Take a GDI screenshot - this always captures the current screen state
+						// regardless of DWM dirty tracking.
+						fallbackImg, fallbackErr := screenshot.CaptureRect(currentBounds)
+						if fallbackErr == nil && fallbackImg != nil {
+							// screenshot.CaptureRect returns *image.RGBA directly
+							img = fallbackImg
+							err = nil // Clear the error so we process this frame
+							fromGDIFallback = true // Mark this frame as from GDI fallback
+
+							// Skip the normal error handling and continue to frame processing
+							goto processFrame
+						} else {
+							telemetry.LogStructured("WARN", "worker: GDI fallback capture failed", map[string]interface{}{
+								"error": fmt.Sprintf("%v", fallbackErr),
+							})
+						}
+					}
+
+					// Normal path: screen idle - DXGI detected no changes, continue without delay
 					if frame != nil {
 						frame.Close()
 						frame = nil
@@ -960,10 +1053,20 @@ func worker() {
 				continue
 			}
 
+		processFrame:
 			// Success! Reset error counters
 			numConsecutive = 0
+			noImageCount = 0
 			lastSuccessTime = tickTime
 			frameCount++
+
+			// Exit stall mode if this frame came from DXGI (not GDI fallback)
+			if inStallMode && !fromGDIFallback {
+				telemetry.LogStructured("INFO", "worker: DXGI recovered, exiting stall mode", map[string]interface{}{
+					"frame_count": frameCount,
+				})
+				inStallMode = false
+			}
 
 			// RESOLUTION CHANGE DETECTION: Check if screen bounds changed
 			newBounds := img.Rect
@@ -995,6 +1098,14 @@ func worker() {
 			var prev *image.RGBA
 			if prevVal != nil {
 				prev = prevVal.(*image.RGBA)
+			}
+
+			// Force periodic keyframes to combat phase-locking between DXGI and marker updates.
+			// Both run at ~30 FPS, so delta detection can miss marker changes. Keyframes ensure
+			// full frame data is sent, bypassing delta detection.
+			// Every 30 frames (~1/sec at 30fps) provides regular refresh without bandwidth saturation.
+			if frameCount%30 == 0 {
+				prev = nil // Force keyframe
 			}
 
 			// WS tile/canvas encoding is CPU-intensive; skip it when every active viewer has
@@ -1629,25 +1740,31 @@ func packFrameIntoChunks(rawEvent []byte, frameSeq uint32, blocks *[]*[]byte, ke
 	// This prevents partial frame drops where some chunks are sent but others are dropped,
 	// which causes partial rendering on the browser side.
 	reserved := reserveFrameBytes(int64(totalFrameSize))
-	if !reserved && !keyframe {
-		backpressureStats.totalFramesDropped.Add(1)
-		telemetry.LogStructured("WARN", "packFrameIntoChunks: dropping frame due to backpressure (atomic reservation failed)", map[string]interface{}{
-			"frame_seq":     frameSeq,
-			"frame_size":    totalFrameSize,
-			"pending_bytes": pendingFrameBytes.Load(),
-			"blocks":        numBlocks,
-			"chunks":        chunkTotal,
-		})
-		return
-	}
-	if !reserved && keyframe {
-		telemetry.LogStructured("WARN", "packFrameIntoChunks: keyframe bypassing backpressure reservation", map[string]interface{}{
-			"frame_seq":     frameSeq,
-			"frame_size":    totalFrameSize,
-			"pending_bytes": pendingFrameBytes.Load(),
-			"blocks":        numBlocks,
-			"chunks":        chunkTotal,
-		})
+	if !reserved {
+		pending := pendingFrameBytes.Load()
+		// Allow keyframes to bypass normal limit but enforce a hard cap (32MB) to prevent unbounded growth.
+		// This ensures initial sync works while preventing keyframe storms from exhausting memory.
+		const keyframeHardCap = 32 * 1024 * 1024
+		if keyframe && pending < keyframeHardCap {
+			telemetry.LogStructured("WARN", "packFrameIntoChunks: keyframe bypassing backpressure reservation", map[string]interface{}{
+				"frame_seq":     frameSeq,
+				"frame_size":    totalFrameSize,
+				"pending_bytes": pending,
+				"blocks":        numBlocks,
+				"chunks":        chunkTotal,
+			})
+		} else {
+			backpressureStats.totalFramesDropped.Add(1)
+			telemetry.LogStructured("WARN", "packFrameIntoChunks: dropping frame due to backpressure", map[string]interface{}{
+				"frame_seq":     frameSeq,
+				"frame_size":    totalFrameSize,
+				"pending_bytes": pending,
+				"blocks":        numBlocks,
+				"chunks":        chunkTotal,
+				"keyframe":      keyframe,
+			})
+			return
+		}
 	}
 
 	// Get chunk buffer from pool (OPTIMIZED: reuse allocation)
@@ -2556,7 +2673,7 @@ func InitDesktop(pack modules.Packet) error {
 	desktop := &session{
 		event:       pack.Event,
 		rawEvent:    rawEvent,
-		channel:     make(chan message, 5),
+		channel:     make(chan message, 10), // PERF: Increased from 5 to prevent blocking during frame bursts
 		lock:        &sync.Mutex{},
 		metricsStop: make(chan struct{}),
 	}
@@ -2621,16 +2738,10 @@ func InitDesktop(pack modules.Packet) error {
 		"event":        pack.Event,
 	})
 
-	// CRITICAL: Queue resolution BEFORE exposing the session to the capture worker.
-	// The capture worker can enqueue delta frames at any time; if those hit the channel
-	// before a resolution packet, the browser will buffer/flush frames and may show
-	// progressive/blocked rendering at startup. Enqueueing the resolution first ensures
-	// the browser sizes its canvas deterministically before any tiles arrive.
-	select {
-	case desktop.channel <- message{t: 2}:
-	default:
-		// Should never happen for a new session (buffer=5), but keep non-blocking semantics.
-	}
+	// Best Practice: Send binary resolution packet synchronously before exposing session.
+	// This follows the same pattern as the mock server: sendInit -> sendResolution -> sendFrame
+	// The resolution MUST arrive at the browser before any frames to ensure proper canvas sizing.
+	sendResolutionPacketImmediate(rawEvent, bounds)
 
 	// Queue an initial keyframe BEFORE the session is visible to the capture worker.
 	// This guarantees the first paint is a full sync frame, and deltas only apply after.

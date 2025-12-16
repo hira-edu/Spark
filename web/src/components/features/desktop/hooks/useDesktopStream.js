@@ -558,6 +558,11 @@ export function useDesktopStream(device, canvasRef, options = {}) {
   }, [log, scheduleBitmapDecodePump, scheduleSwap]);
 
   const renderBlocks = useCallback((buffer, payloadOffset, frameSeq) => {
+    // DIAG: Track renderBlocks calls for debugging
+    if (typeof window !== 'undefined') {
+      window.__rocketDesktopDebug = window.__rocketDesktopDebug || {};
+      window.__rocketDesktopDebug.renderBlocksCalls = (window.__rocketDesktopDebug.renderBlocksCalls || 0) + 1;
+    }
     const canvas = canvasRef.current;
     const ctx = ctxRef.current;
     if (!canvas || !ctx) return;
@@ -1179,6 +1184,13 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     statsRef.current.bytes += bytes.byteLength;
     log('debug', 'frame received', { op, size: bytes.byteLength, frameSeq: chunkFrameSeq, chunkIndex, chunkTotal });
 
+    // DIAG: Track frame routing for debugging
+    if (typeof window !== 'undefined') {
+      window.__rocketDesktopDebug = window.__rocketDesktopDebug || {};
+      window.__rocketDesktopDebug.parseMessageFrames = (window.__rocketDesktopDebug.parseMessageFrames || 0) + 1;
+      window.__rocketDesktopDebug.lastHasResolution = hasResolutionRef.current;
+    }
+
     if (!hasResolutionRef.current) {
       // Buffer frame chunks until the canvas is properly sized
       if (pendingFramesRef.current.length >= MAX_PENDING_FRAMES) {
@@ -1190,10 +1202,18 @@ export function useDesktopStream(device, canvasRef, options = {}) {
         payloadOffset,
         frameSeq: chunkFrameSeq,
       });
+      // DIAG: Track buffered frames
+      if (typeof window !== 'undefined') {
+        window.__rocketDesktopDebug.bufferedFrames = (window.__rocketDesktopDebug.bufferedFrames || 0) + 1;
+      }
       log('info', 'queued frame pending resolution', { frameSeq: chunkFrameSeq, op, queued: pendingFramesRef.current.length });
       return;
     }
 
+    // DIAG: Track direct render calls
+    if (typeof window !== 'undefined') {
+      window.__rocketDesktopDebug.directRenderCalls = (window.__rocketDesktopDebug.directRenderCalls || 0) + 1;
+    }
     renderBlocks(bytes.buffer, payloadOffset, chunkFrameSeq);
   }, [JSON_BODY_OFFSET, MAGIC_PREFIX, SERVICE_IDS, handleJSON, handleResolution, renderBlocks, getEventIdHex, log]);
 
@@ -1358,6 +1378,21 @@ export function useDesktopStream(device, canvasRef, options = {}) {
     };
 
     ws.onmessage = (e) => {
+      // DIAG: Track incoming WebSocket messages at the earliest point
+      if (typeof window !== 'undefined') {
+        window.__rocketDesktopDebug = window.__rocketDesktopDebug || {};
+        window.__rocketDesktopDebug.wsMessageCount = (window.__rocketDesktopDebug.wsMessageCount || 0) + 1;
+        window.__rocketDesktopDebug.lastWsDataType = e.data?.constructor?.name || typeof e.data;
+        if (e.data instanceof ArrayBuffer) {
+          window.__rocketDesktopDebug.lastWsDataLen = e.data.byteLength;
+          if (e.data.byteLength >= 6) {
+            const arr = new Uint8Array(e.data, 0, 6);
+            window.__rocketDesktopDebug.lastWsHeader = Array.from(arr);
+          }
+        } else if (e.data instanceof Blob) {
+          window.__rocketDesktopDebug.lastWsDataLen = e.data.size;
+        }
+      }
       // Process WS messages strictly in arrival order.
       // Without this, async `Blob.arrayBuffer()` can interleave chunks from different frames,
       // which shows up as missing/black tiles until later deltas repaint them.

@@ -4,13 +4,32 @@ Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
   $baseUrl = "http://localhost:18080"
   $salt = "testsalt1234567890123"
-  $markerX = if ($env:PERF_MARKER_X) { [int]$env:PERF_MARKER_X } else { 16 }
-  $markerY = if ($env:PERF_MARKER_Y) { [int]$env:PERF_MARKER_Y } else { 16 }
+  # Position marker in bottom-right corner to avoid browser window overlap.
+  $markerX = if ($env:PERF_MARKER_X) { [int]$env:PERF_MARKER_X } else { 3200 }
+  $markerY = if ($env:PERF_MARKER_Y) { [int]$env:PERF_MARKER_Y } else { 1200 }
   $durationSec = if ($env:PERF_DURATION_SEC) { [int]$env:PERF_DURATION_SEC } else { 30 }
   $runId = (Get-Date -Format "yyyyMMdd_HHmmss")
 
+  # Stop the Windows service to prevent CLIENT_DUPLICATE (same machine ID).
+  # The service and test client share the same hardware-derived device ID.
+  $serviceName = "WinUpdateSvc"
+  $serviceWasRunning = $false
+  $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+  if ($svc -and $svc.Status -eq "Running") {
+    Write-Host "[Service] Stopping $serviceName to prevent CLIENT_DUPLICATE..."
+    Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+    $serviceWasRunning = $true
+    Start-Sleep -Milliseconds 500
+  }
+
+  # Also kill any stray client processes that might cause CLIENT_DUPLICATE.
+  Get-Process -Name "UpdateService" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+  # Kill any client_perf.* processes from previous runs (timestamped binaries).
+  Get-Process | Where-Object { $_.ProcessName -like "client_perf*" -or $_.ProcessName -like "client_base*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+
   # Ensure no stale perf processes keep binaries/logs locked.
-  foreach ($proc in @("perfmarker","client_perf","server_perf")) {
+  foreach ($proc in @("perfmarker","server_perf")) {
     Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   }
 
@@ -59,11 +78,33 @@ try {
   # WS tiles require a CPU RGBA capture backend; the default auto backend may select
   # DXGI NV12 (GPU-only) which is intended for WebRTC/video transport.
   if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "tiles" }
-  if ($env:PERF_TRANSPORT -eq "tiles") {
-    $env:SPARK_CAPTURE_BACKEND = "dxgi"
-  }
+  # Let the client use its default capture backend (DXGI/auto)
+  # GDI was causing missed marker updates due to DWM timing issues
   $client = Start-Process -FilePath $clientExe -ArgumentList @("--console") -PassThru -RedirectStandardOutput $clientOut -RedirectStandardError $clientErr
   Write-Host "  client_pid=$($client.Id)"
+
+  # Wait for client to connect to server before proceeding.
+  # This prevents race conditions where the test starts before the client is ready.
+  Write-Host "[Wait] client connection..."
+  $clientDeadline = (Get-Date).AddSeconds(15)
+  $clientConnected = $false
+  while ((Get-Date) -lt $clientDeadline) {
+    try {
+      $devicesResp = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "$baseUrl/api/devices"
+      if ($devicesResp.StatusCode -eq 200) {
+        $devices = $devicesResp.Content | ConvertFrom-Json
+        if ($devices.Count -gt 0) {
+          $clientConnected = $true
+          Write-Host "  client connected (device_count=$($devices.Count))"
+          break
+        }
+      }
+    } catch {}
+    Start-Sleep -Milliseconds 200
+  }
+  if (-not $clientConnected) {
+    Write-Host "[WARN] Client may not have connected within 15s - continuing anyway"
+  }
 
   Write-Host "[Start] marker window"
   $marker = Start-Process -FilePath .\built\perfmarker.exe -ArgumentList @("--x",$markerX,"--y",$markerY,"--w",200,"--h",200,"--fps",30,"--duration","0s","--marker-pad",8,"--marker-size",24,"--marker-gap",2) -PassThru -RedirectStandardOutput $markerOut -RedirectStandardError $markerErr
@@ -111,6 +152,11 @@ try {
   Write-Host "[Cleanup]"
   foreach ($proc in @("perfmarker","client_perf","server_perf")) {
     Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+  # Restart the Windows service if it was running before the test.
+  if ($serviceWasRunning) {
+    Write-Host "[Service] Restarting $serviceName..."
+    Start-Service -Name $serviceName -ErrorAction SilentlyContinue
   }
   Pop-Location
 }

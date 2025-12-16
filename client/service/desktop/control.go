@@ -110,6 +110,27 @@ func HandleConfig(pack modules.Packet) error {
 		}
 	}
 
+	// Handle decoder backpressure signal from browser
+	// When the browser's decode queue is overwhelmed, temporarily reduce FPS to allow recovery
+	if bpVal, ok := pack.Data["decoder_backpressure"]; ok {
+		if bp, okBool := bpVal.(bool); okBool && bp {
+			currentFPS := configFPS.Load()
+			// Reduce FPS by 25% (minimum 10 FPS) to relieve browser pressure
+			reducedFPS := int32(float64(currentFPS) * 0.75)
+			if reducedFPS < 10 {
+				reducedFPS = 10
+			}
+			if reducedFPS < currentFPS {
+				configFPS.Store(reducedFPS)
+				updated = append(updated, "fps")
+				telemetry.LogStructured("WARN", "config: FPS reduced due to browser backpressure", map[string]interface{}{
+					"old": currentFPS,
+					"new": reducedFPS,
+				})
+			}
+		}
+	}
+
 	// Update FPS (if provided)
 	if fpsVal, ok := pack.Data["fps"]; ok {
 		var fps int32

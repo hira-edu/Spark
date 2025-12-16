@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kataras/golog"
 	"github.com/pion/webrtc/v4/pkg/media"
 	xdraw "golang.org/x/image/draw"
 )
@@ -56,6 +57,9 @@ type rtcSession struct {
 	stopped atomic.Bool
 
 	onClosed func()
+
+	// GPU fallback warning tracking (avoid log spam)
+	gpuFallbackWarned atomic.Bool
 }
 
 type rtcFrameRequest struct {
@@ -179,7 +183,10 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 		bitrate:       bitrate,
 		maxWidth:      maxWidth,
 		maxHeight:     maxHeight,
-		frameCh:       make(chan rtcFrameRequest, 3),
+		// Frame queue size aligned with Sunshine's proven 30-slot encode session queue.
+	// Larger buffer absorbs encoder latency spikes and network jitter without dropping frames.
+	// Reference: https://github.com/LizardByte/Sunshine (encode_session_ctx_queue_t capacity=30)
+	frameCh:       make(chan rtcFrameRequest, 30),
 		stopCh:        make(chan struct{}),
 		webcamStop:    webcamStop,
 		audioStop:     audioStop,
@@ -310,6 +317,7 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 		if enc, ok := r.encoder.(frameEncoder); ok {
 			sample, err := enc.EncodeFrame(req.frame, duration)
 			if err != nil {
+				golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s", err.Error(), string(r.codec))
 				r.close()
 				return
 			}
@@ -320,8 +328,15 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 			atomic.StoreInt64(&r.lastSent, now)
 			return
 		}
-		// No GPU-capable encoder for this codec.
-		return
+		// No GPU-capable encoder for this codec - fall back to CPU image if available.
+		if req.frame.Image == nil {
+			// GPU frame with no CPU fallback and no hardware encoder - cannot encode.
+			// Log once per session to avoid log spam.
+			r.logGPUFallbackWarningOnce()
+			return
+		}
+		// Fall through to CPU encoding path below using req.frame.Image.
+		golog.Debugf("[WEBRTC_ENCODE] GPU encoder unavailable, using CPU fallback codec=%s", string(r.codec))
 	}
 
 	img := req.frame.Image
@@ -418,6 +433,17 @@ func (r *rtcSession) requestKeyFrame() {
 	}
 	if requester, ok := r.encoder.(keyFrameRequester); ok {
 		requester.RequestKeyFrame()
+	}
+}
+
+// logGPUFallbackWarningOnce logs a warning once per session when GPU frames cannot be encoded
+// due to missing hardware encoder and no CPU fallback image available.
+func (r *rtcSession) logGPUFallbackWarningOnce() {
+	if r == nil {
+		return
+	}
+	if r.gpuFallbackWarned.CompareAndSwap(false, true) {
+		golog.Warnf("[WEBRTC_ENCODE] GPU frame received but no hardware encoder available and no CPU fallback image; frames will be dropped until CPU fallback is provided codec=%s", string(r.codec))
 	}
 }
 

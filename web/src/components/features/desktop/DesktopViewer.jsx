@@ -78,6 +78,7 @@ const DesktopViewer = ({
     videoRef: webrtcVideoRef,
     isActive: webrtcActive,
     controlChannel: webrtcControlChannel,
+    videoFps: webrtcVideoFps,
     start: startWebRTC,
     stop: stopWebRTC,
     handleSignalMessage,
@@ -327,10 +328,11 @@ const DesktopViewer = ({
         device={device}
         status={status}
         latency={latency}
-        fps={fps}
+        fps={webrtcActive ? webrtcVideoFps : fps}
         bandwidth={bandwidth}
         resolution={resolution}
         onClose={onClose}
+        transport={webrtcActive ? 'webrtc' : 'tiles'}
       />
 
       {/* Canvas Container */}

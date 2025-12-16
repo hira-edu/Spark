@@ -176,7 +176,7 @@ Zmodem.Header = class ZmodemHeader {
      */
     static build(name /*, args */) {
         var Ctr = FRAME_NAME_CREATOR[name];
-        if (!Ctr) throw("No frame class "" + name + "" is defined!");
+        if (!Ctr) throw("No frame class \"" + name + "\" is defined!");
 
         var args = Array.prototype.slice.call(arguments, 1);
         return new Ctr(...args);

@@ -39,7 +39,7 @@ Zmodem.Subpacket = class ZmodemSubpacket {
     static build(octets, frameend) {
         var Ctr = SUBPACKET_BUILDER[frameend];
         if (!Ctr) {
-            throw("No subpacket type "" + frameend + "" is defined! Try one of: " + Object.keys(SUBPACKET_BUILDER).join(", "));
+            throw("No subpacket type \"" + frameend + "\" is defined! Try one of: " + Object.keys(SUBPACKET_BUILDER).join(", "));
         }
 
         return new Ctr(octets);

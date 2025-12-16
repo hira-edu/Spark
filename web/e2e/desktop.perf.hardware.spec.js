@@ -249,6 +249,11 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
     decodeFailures: 0,
     lastSource: 'none',
     lastDims: null,
+    successfulReads: 0,
+    firstTs24Values: [],
+    rejectedLatencies: [],
+    lastTs24: null,
+    lastLatencyMs: null,
   };
 
   let lastSeenTs24 = null;
@@ -270,14 +275,26 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
       debug.errorReads += 1;
       if (r.error === 'decode_failed') debug.decodeFailures += 1;
     } else {
+      debug.successfulReads += 1;
       debug.lastSource = r.source || debug.lastSource;
+      debug.lastTs24 = r.ts24;
+      // Track first few ts24 values for debugging
+      if (debug.firstTs24Values.length < 10) {
+        debug.firstTs24Values.push(r.ts24);
+      }
       if (r.ts24 !== lastSeenTs24) {
         lastSeenTs24 = r.ts24;
         lastChangeAt = nowMs;
         const markerMs = unwrapTs24(nowMs, r.ts24);
         const latencyMs = nowMs - markerMs;
+        debug.lastLatencyMs = latencyMs;
         if (latencyMs >= 0 && latencyMs < 10_000) {
           samples.push({ nowMs, ts24: r.ts24, latencyMs, source: r.source });
+        } else {
+          // Track rejected latencies for debugging
+          if (debug.rejectedLatencies.length < 10) {
+            debug.rejectedLatencies.push({ ts24: r.ts24, latencyMs, nowMs, markerMs });
+          }
         }
       }
     }
@@ -305,6 +322,25 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
     readErrors: debug.errorReads,
     debug,
   };
+
+  // Get WebSocket-level diagnostics from browser
+  const diagnostics = await page.evaluate(() => {
+    const dbg = window.__rocketDesktopDebug || {};
+    return {
+      wsMessageCount: dbg.wsMessageCount || 0,
+      lastWsDataType: dbg.lastWsDataType || null,
+      lastWsDataLen: dbg.lastWsDataLen || 0,
+      lastWsHeader: dbg.lastWsHeader || null,
+      renderBlocksCalls: dbg.renderBlocksCalls || 0,
+      parseMessageFrames: dbg.parseMessageFrames || 0,
+      lastHasResolution: dbg.lastHasResolution,
+      bufferedFrames: dbg.bufferedFrames || 0,
+      directRenderCalls: dbg.directRenderCalls || 0,
+      lastRenderBlocks: dbg.lastRenderBlocks || null,
+      blockStats: dbg.blockStats || null,
+    };
+  });
+  console.log('[perf] diagnostics', JSON.stringify(diagnostics, null, 2));
 
   // Always print key diagnostics; this suite is opt-in and used for debugging.
   // eslint-disable-next-line no-console

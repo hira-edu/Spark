@@ -59,6 +59,12 @@ export function useDesktopWebRTC({
   const [status, setStatus] = useState('off'); // off | connecting | connected | failed
   const [controlChannel, setControlChannel] = useState(null);
   const [hasVideo, setHasVideo] = useState(false);
+  const [videoFps, setVideoFps] = useState(0);
+
+  // FPS tracking via requestVideoFrameCallback
+  const fpsCountRef = useRef(0);
+  const fpsIntervalRef = useRef(null);
+  const fpsCallbackRef = useRef(null);
 
   const effectiveIceServers = useMemo(() => {
     if (Array.isArray(iceServers) && iceServers.length > 0) return iceServers;
@@ -225,12 +231,59 @@ export function useDesktopWebRTC({
     }
   }, [enabled, stop]);
 
+  // FPS tracking effect using requestVideoFrameCallback
+  useEffect(() => {
+    if (!hasVideo) {
+      setVideoFps(0);
+      return;
+    }
+
+    const video = videoRef.current;
+    if (!video) {
+      setVideoFps(0);
+      return;
+    }
+
+    // Reset counter
+    fpsCountRef.current = 0;
+
+    // Use requestVideoFrameCallback if available (modern browsers)
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      const countFrame = () => {
+        fpsCountRef.current++;
+        fpsCallbackRef.current = video.requestVideoFrameCallback(countFrame);
+      };
+      fpsCallbackRef.current = video.requestVideoFrameCallback(countFrame);
+    }
+
+    // Report FPS every second
+    fpsIntervalRef.current = setInterval(() => {
+      setVideoFps(fpsCountRef.current);
+      fpsCountRef.current = 0;
+    }, 1000);
+
+    return () => {
+      if (fpsIntervalRef.current) {
+        clearInterval(fpsIntervalRef.current);
+        fpsIntervalRef.current = null;
+      }
+      if (fpsCallbackRef.current && video && typeof video.cancelVideoFrameCallback === 'function') {
+        try {
+          video.cancelVideoFrameCallback(fpsCallbackRef.current);
+        } catch (_) {}
+      }
+      fpsCallbackRef.current = null;
+      fpsCountRef.current = 0;
+    };
+  }, [hasVideo]);
+
   return {
     videoRef,
     status,
     hasVideo,
     isActive: status === 'connected' && hasVideo,
     controlChannel,
+    videoFps,
     start,
     stop,
     handleSignalMessage,
