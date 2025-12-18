@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"math"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -91,12 +92,61 @@ type DXGINV12Capturer struct {
 	adapterIndex uint
 	outputIndex  uint
 
-	vpWidth  int
-	vpHeight int
+	srcWidth  int
+	srcHeight int
+	vpWidth   int
+	vpHeight  int
 
 	lastFrameTime time.Time
 	frameCount    atomic.Uint64
 	errorCount    atomic.Uint64
+}
+
+func computeNV12OutputSize(srcW, srcH int) (int, int) {
+	maxW := parseEnvOptionalInt(envWebRTCMaxWidth, webRTCDefaultMaxW)
+	maxH := parseEnvOptionalInt(envWebRTCMaxHeight, webRTCDefaultMaxH)
+	if maxW <= 0 && maxH <= 0 {
+		return srcW, srcH
+	}
+
+	scale := 1.0
+	if maxW > 0 {
+		scale = math.Min(scale, float64(maxW)/float64(srcW))
+	}
+	if maxH > 0 {
+		scale = math.Min(scale, float64(maxH)/float64(srcH))
+	}
+	if !(scale > 0) || scale >= 1 {
+		return srcW, srcH
+	}
+	outW := int(math.Round(float64(srcW) * scale))
+	outH := int(math.Round(float64(srcH) * scale))
+	if outW%2 == 1 {
+		outW--
+	}
+	if outH%2 == 1 {
+		outH--
+	}
+	// H.264 encoders commonly require 16x16 macroblock alignment.
+	if outW >= 16 {
+		outW &^= 15
+	}
+	if outH >= 16 {
+		outH &^= 15
+	}
+	if outW < 2 {
+		outW = 2
+	}
+	if outH < 2 {
+		outH = 2
+	}
+	if outW > srcW {
+		outW = srcW
+	}
+	if outH > srcH {
+		outH = srcH
+	}
+	return outW, outH
 }
 
 // NewDXGINV12Capturer creates a GPU-accelerated screen capturer (NV12 output).
@@ -192,10 +242,13 @@ func (c *DXGINV12Capturer) initialize() error {
 	if width <= 0 || height <= 0 {
 		return fmt.Errorf("invalid NV12 size: %dx%d", width, height)
 	}
-	c.vpWidth = width
-	c.vpHeight = height
+	c.srcWidth = width
+	c.srcHeight = height
+	outW, outH := computeNV12OutputSize(width, height)
+	c.vpWidth = outW
+	c.vpHeight = outH
 
-	vp, err := NewVideoProcessor(c.device, c.deviceCtx, c.videoDevice, c.videoContext, width, height)
+	vp, err := NewVideoProcessor(c.device, c.deviceCtx, c.videoDevice, c.videoContext, width, height, outW, outH)
 	if err != nil {
 		telemetryLog("WARN", "Failed to create D3D11 video processor (DXGI NV12 capture unavailable)", map[string]interface{}{
 			"error":  err.Error(),
@@ -208,8 +261,8 @@ func (c *DXGINV12Capturer) initialize() error {
 
 	telemetryLog("INFO", "DXGI NV12 capture initialized", map[string]interface{}{
 		"display": c.displayIndex,
-		"width":   width,
-		"height":  height,
+		"width":   outW,
+		"height":  outH,
 	})
 
 	return nil
@@ -447,19 +500,24 @@ func (c *DXGINV12Capturer) Capture() (*CaptureFrame, error) {
 			if newH%2 == 1 {
 				newH--
 			}
-			if newW > 0 && newH > 0 && (newW != c.vpWidth || newH != c.vpHeight) {
+			if newW > 0 && newH > 0 && (newW != c.srcWidth || newH != c.srcHeight) {
+				outW, outH := computeNV12OutputSize(newW, newH)
 				telemetryLog("INFO", "DXGI NV12 capture resizing video processor", map[string]interface{}{
-					"display": c.displayIndex,
-					"from":    fmt.Sprintf("%dx%d", c.vpWidth, c.vpHeight),
-					"to":      fmt.Sprintf("%dx%d", newW, newH),
+					"display":     c.displayIndex,
+					"input_from":  fmt.Sprintf("%dx%d", c.srcWidth, c.srcHeight),
+					"input_to":    fmt.Sprintf("%dx%d", newW, newH),
+					"output_from": fmt.Sprintf("%dx%d", c.vpWidth, c.vpHeight),
+					"output_to":   fmt.Sprintf("%dx%d", outW, outH),
 				})
 				if c.videoProcessor != nil {
 					c.videoProcessor.Release()
 					c.videoProcessor = nil
 				}
-				c.vpWidth = newW
-				c.vpHeight = newH
-				vp, err := NewVideoProcessor(c.device, c.deviceCtx, c.videoDevice, c.videoContext, newW, newH)
+				c.srcWidth = newW
+				c.srcHeight = newH
+				c.vpWidth = outW
+				c.vpHeight = outH
+				vp, err := NewVideoProcessor(c.device, c.deviceCtx, c.videoDevice, c.videoContext, newW, newH, outW, outH)
 				if err != nil {
 					return nil, err
 				}
@@ -473,6 +531,16 @@ func (c *DXGINV12Capturer) Capture() (*CaptureFrame, error) {
 	nv12Texture, err := c.videoProcessor.ConvertBGRAToNV12(bgraTexture)
 	if err != nil {
 		c.errorCount.Add(1)
+		// Treat common DXGI reset scenarios as recoverable: reset the duplication + device
+		// and return errNoImage so the worker doesn't trip its circuit breaker.
+		var mfErr mfError
+		if errors.As(err, &mfErr) {
+			reason := d3d.HRESULT(int32(mfErr.hr))
+			if shouldResetDXGI(reason) {
+				_ = c.resetLocked(reason)
+				return nil, errNoImage
+			}
+		}
 		return nil, err
 	}
 
@@ -579,6 +647,12 @@ func createD3D11DeviceWithVideoSupport(adapter *dxgi.IDXGIAdapter1) (*iD3D11Devi
 	}
 	if device == nil || deviceCtx == nil {
 		return nil, nil, fmt.Errorf("D3D11CreateDevice returned nil device/context")
+	}
+	// D3D11 immediate contexts are not thread-safe by default. Capture and encoder readback may
+	// touch the immediate context from different locked OS threads. Enable multithread protection
+	// to avoid DXGI_ERROR_DEVICE_REMOVED and stale readbacks under concurrent use.
+	if err := enableD3D11MultithreadProtection(deviceCtx); err != nil {
+		fmt.Printf("[DXGI] failed to enable D3D11 multithread protection (capture): %v\n", err)
 	}
 	return device, deviceCtx, nil
 }

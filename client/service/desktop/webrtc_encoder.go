@@ -5,11 +5,15 @@ import (
 	"strings"
 )
 
+// ErrWebRTCEncoderTimeout signals that the encoder did not produce an output in
+// time for the current request. Callers should treat this as a dropped frame,
+// not as a fatal session error.
+var ErrWebRTCEncoderTimeout = errors.New("webrtc encoder timeout")
+
 // NewWebRTCEncoder returns an encoder for the requested codec.
 // Codec negotiation happens at SDP time, so this helper intentionally does not
 // cross-fallback to a different codec (that would desync the negotiated codec
-// from the encoder output). The caller should fall back to the legacy desktop
-// tile pipeline when the requested codec isn't available.
+// from the encoder output).
 func NewWebRTCEncoder(codec WebRTCCodec, cfg WebRTCEncoderConfig) (WebRTCEncoder, WebRTCCodec, error) {
 	requested := normalizeWebRTCCodec(codec)
 	if requested == "" {

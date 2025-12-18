@@ -25,12 +25,16 @@ const (
 	envWebRTCCodec     = "SPARK_WEBRTC_CODEC"
 	envWebRTCMaxWidth  = "SPARK_WEBRTC_MAX_WIDTH"
 	envWebRTCMaxHeight = "SPARK_WEBRTC_MAX_HEIGHT"
-	webRTCDefaultFPS   = 30
-	webRTCDefaultCodec = string(WebRTCCodecVP8)
-	webRTCDefaultBR    = 2_500_000
-	webRTCDefaultMaxW  = 1920
-	webRTCDefaultMaxH  = 1080
-	maxInputPayload    = 1 << 16
+	// envWebRTCFrameQueue controls the size of the encode/send queue used by the WebRTC session.
+	// Larger queues absorb transient encoder/network jitter but can increase latency under load.
+	// Perf/latency harnesses typically set this to 1 to prefer dropping stale frames.
+	envWebRTCFrameQueue = "SPARK_WEBRTC_FRAME_QUEUE"
+	webRTCDefaultFPS    = 30
+	webRTCDefaultCodec  = string(WebRTCCodecVP8)
+	webRTCDefaultBR     = 2_500_000
+	webRTCDefaultMaxW   = 1920
+	webRTCDefaultMaxH   = 1080
+	maxInputPayload     = 1 << 16
 )
 
 // adaptiveQualityEncoder is implemented by encoders that can react to network conditions.
@@ -148,6 +152,13 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 
 	maxWidth := parseEnvOptionalInt(envWebRTCMaxWidth, webRTCDefaultMaxW)
 	maxHeight := parseEnvOptionalInt(envWebRTCMaxHeight, webRTCDefaultMaxH)
+	queueSize := parseEnvInt(envWebRTCFrameQueue, 30)
+	if queueSize < 1 {
+		queueSize = 1
+	}
+	if queueSize > 120 {
+		queueSize = 120
+	}
 
 	encoder, actualCodec, err := NewWebRTCEncoder(codec, WebRTCEncoderConfig{
 		BitRate:          bitrate,
@@ -183,13 +194,12 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 		bitrate:       bitrate,
 		maxWidth:      maxWidth,
 		maxHeight:     maxHeight,
-		// Frame queue size aligned with Sunshine's proven 30-slot encode session queue.
-	// Larger buffer absorbs encoder latency spikes and network jitter without dropping frames.
-	// Reference: https://github.com/LizardByte/Sunshine (encode_session_ctx_queue_t capacity=30)
-	frameCh:       make(chan rtcFrameRequest, 30),
-		stopCh:        make(chan struct{}),
-		webcamStop:    webcamStop,
-		audioStop:     audioStop,
+		// Default queue size is aligned with Sunshine's proven 30-slot encode session queue.
+		// Override via SPARK_WEBRTC_FRAME_QUEUE for perf/low-latency runs.
+		frameCh:    make(chan rtcFrameRequest, queueSize),
+		stopCh:     make(chan struct{}),
+		webcamStop: webcamStop,
+		audioStop:  audioStop,
 	}
 	sess.start()
 	return sess, nil
@@ -301,9 +311,9 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 	}
 	defer req.frame.Close()
 
-	now := time.Now().UnixNano()
+	startNs := time.Now().UnixNano()
 	last := atomic.LoadInt64(&r.lastSent)
-	if last != 0 && now-last < r.targetFrameNs {
+	if last != 0 && startNs-last < r.targetFrameNs {
 		return
 	}
 
@@ -317,15 +327,29 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 		if enc, ok := r.encoder.(frameEncoder); ok {
 			sample, err := enc.EncodeFrame(req.frame, duration)
 			if err != nil {
+				if errors.Is(err, ErrWebRTCEncoderTimeout) {
+					// Treat as a dropped frame (e.g., encoder buffering / no output ready yet).
+					return
+				}
 				golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s", err.Error(), string(r.codec))
 				r.close()
 				return
 			}
-			if err := r.rtc.SendFrame(sample.Data, sample.Duration); err != nil {
+			if len(sample.Data) == 0 {
+				// Encoder produced no output (common for hardware encoders warming up).
+				// Treat as a dropped frame; do not send empty RTP.
+				return
+			}
+			sendDuration := sample.Duration
+			if sendDuration <= 0 {
+				sendDuration = duration
+			}
+			if err := r.rtc.SendFrame(sample.Data, sendDuration); err != nil {
+				golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=true", err.Error(), string(r.codec))
 				r.close()
 				return
 			}
-			atomic.StoreInt64(&r.lastSent, now)
+			atomic.StoreInt64(&r.lastSent, startNs)
 			return
 		}
 		// No GPU-capable encoder for this codec - fall back to CPU image if available.
@@ -350,14 +374,27 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 
 	sample, err := r.encoder.Encode(src, duration)
 	if err != nil {
+		if errors.Is(err, ErrWebRTCEncoderTimeout) {
+			// Treat as a dropped frame (e.g., encoder buffering / no output ready yet).
+			return
+		}
 		r.close()
 		return
 	}
-	if err := r.rtc.SendFrame(sample.Data, sample.Duration); err != nil {
+	if len(sample.Data) == 0 {
+		// Encoder produced no output. Treat as a dropped frame; do not send empty RTP.
+		return
+	}
+	sendDuration := sample.Duration
+	if sendDuration <= 0 {
+		sendDuration = duration
+	}
+	if err := r.rtc.SendFrame(sample.Data, sendDuration); err != nil {
+		golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=false", err.Error(), string(r.codec))
 		r.close()
 		return
 	}
-	atomic.StoreInt64(&r.lastSent, now)
+	atomic.StoreInt64(&r.lastSent, startNs)
 }
 
 func (r *rtcSession) scaleFrame(img *image.RGBA) *image.RGBA {

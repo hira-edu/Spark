@@ -140,6 +140,14 @@ func (dm *DXGIDeviceManager) GetManager() *iMFDXGIDeviceManager {
 	return dm.manager
 }
 
+// GetDevice returns the D3D11 device registered with this manager.
+func (dm *DXGIDeviceManager) GetDevice() *iD3D11Device {
+	if dm == nil {
+		return nil
+	}
+	return dm.device
+}
+
 // LockDevice locks the device for exclusive access.
 // Returns device handle and unlock function.
 func (dm *DXGIDeviceManager) LockDevice() (uintptr, func(), error) {
@@ -176,7 +184,7 @@ func (dm *DXGIDeviceManager) LockDevice() (uintptr, func(), error) {
 //   - Wraps NV12 GPU texture in IMFSample
 //   - No CPU download/upload
 //   - Direct GPU → Encoder path
-func (dm *DXGIDeviceManager) CreateSampleFromTexture(texture *iD3D11Texture2D) (*imfSample, error) {
+func (dm *DXGIDeviceManager) CreateSampleFromTexture(texture *iD3D11Texture2D, width, height int) (*imfSample, error) {
 	if dm == nil || dm.manager == nil {
 		return nil, fmt.Errorf("manager not initialized")
 	}
@@ -205,6 +213,12 @@ func (dm *DXGIDeviceManager) CreateSampleFromTexture(texture *iD3D11Texture2D) (
 	if err := hresultError(r0, "MFCreateDXGISurfaceBuffer"); err != nil {
 		sample.Release()
 		return nil, err
+	}
+
+	// Best-effort: set buffer length so encoders relying on IMFMediaBuffer length don't treat the
+	// sample as empty. For NV12: width * height * 3/2 bytes.
+	if width > 0 && height > 0 {
+		_ = buf.SetCurrentLength(uint32(width * height * 3 / 2))
 	}
 
 	// Add buffer to sample
@@ -244,17 +258,19 @@ func (dm *DXGIDeviceManager) ConfigureTransform(transform *imfTransform) error {
 	}
 	defer attributes.Release()
 
-	// Set MF_SA_D3D11_AWARE attribute
+	// Check if MFT supports D3D11 by reading MF_SA_D3D11_AWARE (read-only indicator).
+	// Do NOT set this attribute - it's informational, set by the MFT itself.
 	guidD3D11Aware, _ := windows.GUIDFromString("{206b4fc8-fcf9-4c51-afe3-9764369e33a0}")
+	var d3d11Aware uint32
 	r0, _, _ = syscall.SyscallN(
-		attributes.vtbl.SetUINT32,
+		attributes.vtbl.GetUINT32,
 		uintptr(unsafe.Pointer(attributes)),
 		uintptr(unsafe.Pointer(&guidD3D11Aware)),
-		1, // TRUE
+		uintptr(unsafe.Pointer(&d3d11Aware)),
 	)
-	if err := hresultError(r0, "SetUINT32(MF_SA_D3D11_AWARE)"); err != nil {
-		return err
-	}
+	// If the attribute doesn't exist or is 0, the MFT doesn't support D3D11.
+	// We still try to attach the DXGI manager - some MFTs don't set this attribute
+	// but still support D3D11 via ProcessMessage.
 
 	// Attach DXGI manager (required for D3D11-backed IMFSamples).
 	if err := transform.ProcessMessage(mftMessageSetD3DManager, uintptr(unsafe.Pointer(dm.manager))); err != nil {

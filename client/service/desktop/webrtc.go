@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
@@ -121,11 +122,18 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		return nil, err
 	}
 
+	// Configure ICE for best browser interoperability:
+	// - Enable loopback candidates for same-host (localhost) WebRTC sessions.
+	// - Allow querying remote mDNS candidates (Chromium's default behavior).
+	se := webrtc.SettingEngine{}
+	se.SetIncludeLoopbackCandidate(true)
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryOnly)
+
 	// Create API with MediaEngine and Interceptors
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithInterceptorRegistry(i),
-		// SettingEngine can be added here for advanced configuration if needed
+		webrtc.WithSettingEngine(se),
 	)
 
 	// Create PeerConnection with ICE servers and security settings

@@ -95,8 +95,10 @@ type VideoProcessor struct {
 	processor     *iD3D11VideoProcessor
 
 	// Configuration
-	inputWidth  int
-	inputHeight int
+	inputWidth   int
+	inputHeight  int
+	outputWidth  int
+	outputHeight int
 
 	// Texture pool for NV12 output (reuse to avoid allocation overhead)
 	nv12TexPool   []*iD3D11Texture2D
@@ -108,17 +110,26 @@ type VideoProcessor struct {
 // NewVideoProcessor creates a video processor for BGRA→NV12 conversion.
 func NewVideoProcessor(device *iD3D11Device, deviceCtx *iD3D11DeviceContext,
 	videoDevice *iD3D11VideoDevice, videoContext *iD3D11VideoContext,
-	width, height int) (*VideoProcessor, error) {
+	inputWidth, inputHeight int, outputWidth, outputHeight int) (*VideoProcessor, error) {
 
 	initVideoProcessorGUIDs()
+
+	if outputWidth <= 0 {
+		outputWidth = inputWidth
+	}
+	if outputHeight <= 0 {
+		outputHeight = inputHeight
+	}
 
 	vp := &VideoProcessor{
 		device:       device,
 		deviceCtx:    deviceCtx,
 		videoDevice:  videoDevice,
 		videoContext: videoContext,
-		inputWidth:   width,
-		inputHeight:  height,
+		inputWidth:   inputWidth,
+		inputHeight:  inputHeight,
+		outputWidth:  outputWidth,
+		outputHeight: outputHeight,
 		nv12TexPool:  make([]*iD3D11Texture2D, 0, 3), // Pool of 3 textures
 	}
 
@@ -139,8 +150,8 @@ func (vp *VideoProcessor) createProcessor() error {
 		InputWidth:       uint32(vp.inputWidth),
 		InputHeight:      uint32(vp.inputHeight),
 		OutputFrameRate:  struct{ Numerator, Denominator uint32 }{30, 1},
-		OutputWidth:      uint32(vp.inputWidth),
-		OutputHeight:     uint32(vp.inputHeight),
+		OutputWidth:      uint32(vp.outputWidth),
+		OutputHeight:     uint32(vp.outputHeight),
 		Usage:            0, // Playback normal (widest driver support)
 	}
 
@@ -278,14 +289,16 @@ func (vp *VideoProcessor) getOrCreateNV12Texture() (*iD3D11Texture2D, error) {
 
 	// Create new NV12 texture
 	desc := d3d11Texture2DDesc{
-		Width:          uint32(vp.inputWidth),
-		Height:         uint32(vp.inputHeight),
-		MipLevels:      1,
-		ArraySize:      1,
-		Format:         dxgiFormatNV12, // 103
-		SampleDesc:     struct{ Count, Quality uint32 }{1, 0},
-		Usage:          d3d11UsageDefault,
-		BindFlags:      d3d11BindRenderTarget,
+		Width:      uint32(vp.outputWidth),
+		Height:     uint32(vp.outputHeight),
+		MipLevels:  1,
+		ArraySize:  1,
+		Format:     dxgiFormatNV12, // 103
+		SampleDesc: struct{ Count, Quality uint32 }{1, 0},
+		Usage:      d3d11UsageDefault,
+		// Prefer a texture usable as both a video-processor output and a hardware encoder input.
+		// Some GPUs/drivers reject VIDEO_ENCODER bind on NV12; fall back to render-target only.
+		BindFlags:      d3d11BindRenderTarget | d3d11BindVideoEncoder,
 		CPUAccessFlags: d3d11CPUAccessNone,
 		MiscFlags:      0,
 	}
@@ -299,7 +312,17 @@ func (vp *VideoProcessor) getOrCreateNV12Texture() (*iD3D11Texture2D, error) {
 		uintptr(unsafe.Pointer(&tex)),
 	)
 	if err := hresultError(r0, "CreateTexture2D(NV12)"); err != nil {
-		return nil, err
+		desc.BindFlags = d3d11BindRenderTarget
+		r0, _, _ = syscall.SyscallN(
+			vp.device.vtbl.CreateTexture2D,
+			uintptr(unsafe.Pointer(vp.device)),
+			uintptr(unsafe.Pointer(&desc)),
+			0, // pInitialData (nil)
+			uintptr(unsafe.Pointer(&tex)),
+		)
+		if err2 := hresultError(r0, "CreateTexture2D(NV12 fallback)"); err2 != nil {
+			return nil, err2
+		}
 	}
 
 	return tex, nil
