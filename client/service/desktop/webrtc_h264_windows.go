@@ -1952,6 +1952,11 @@ func (e *h264Encoder) encodeLoop() {
 	// needKeyframe tracks whether the next frame should be an IDR/keyframe.
 	needKeyframe := true
 
+	// Async MFT event state. These must be declared before reinitCore since the
+	// PreRoll phase inside reinitCore needs to set them.
+	var asyncNeedInputPending bool
+	var asyncHaveOutputPending bool
+
 	// reinitCore performs the actual encoder initialization.
 	// For hardware encoding, DXGI manager should be attached FIRST (before any types).
 	reinitCore := func(w, h int, targetBitRate int, targetFPS uint32, includeInputBufferAttrs bool, useHardwareMFT bool, useDXGIMgr *DXGIDeviceManager) error {
@@ -2163,6 +2168,36 @@ func (e *h264Encoder) encodeLoop() {
 		_ = transform.ProcessMessage(mftMessageNotifyBeginStreaming, 0)
 		_ = transform.ProcessMessage(mftMessageNotifyStartOfStream, 0)
 
+		// PreRoll: For async hardware MFTs, wait for initial METransformNeedInput event.
+		// Hardware encoders with DXGI require this event before ProcessInput will succeed.
+		// Without this wait, the first ProcessInput call fails with MF_E_NOTACCEPTING.
+		if useHardwareMFT && isAsyncMFT && eventGen != nil {
+			fmt.Printf("[H264_INIT] PreRoll: waiting for initial METransformNeedInput...\n")
+			prerollDeadline := time.Now().Add(2 * time.Second)
+			prerollGotEvent := false
+			for time.Now().Before(prerollDeadline) {
+				event, err := eventGen.GetEvent(0) // BLOCKING wait
+				if err != nil {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				eventType, _ := event.GetType()
+				event.Release()
+				if eventType == meTransformNeedInput {
+					asyncNeedInputPending = true
+					prerollGotEvent = true
+					fmt.Printf("[H264_INIT] PreRoll: got METransformNeedInput, encoder ready\n")
+					break
+				} else if eventType == meTransformHaveOutput {
+					asyncHaveOutputPending = true
+					// Continue waiting for NeedInput
+				}
+			}
+			if !prerollGotEvent {
+				fmt.Printf("[H264_INIT] PreRoll: timeout waiting for METransformNeedInput\n")
+			}
+		}
+
 		if useHardwareMFT {
 			if isAsyncMFT && eventGen != nil {
 				fmt.Printf("[H264_INIT] hardware MFT: async event model enabled\n")
@@ -2247,9 +2282,6 @@ func (e *h264Encoder) encodeLoop() {
 			f.Close()
 		}
 	}
-
-	var asyncNeedInputPending bool
-	var asyncHaveOutputPending bool
 
 	drainAsyncEvents := func() {
 		if eventGen == nil {

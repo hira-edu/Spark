@@ -4,6 +4,7 @@ import (
 	"Rocket/modules"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"math"
 	"os"
@@ -64,6 +65,10 @@ type rtcSession struct {
 
 	// GPU fallback warning tracking (avoid log spam)
 	gpuFallbackWarned atomic.Bool
+
+	// Debug counters
+	enqueueCount atomic.Int64
+	sendCount    atomic.Int64
 }
 
 type rtcFrameRequest struct {
@@ -133,7 +138,18 @@ func parseEnvOptionalInt(name string, def int) int {
 	return v
 }
 
+// sessionLog writes to the WebRTC signaling debug log
+func sessionLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Print(msg)
+	if f, err := os.OpenFile("logs/webrtc_signaling.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		fmt.Fprintf(f, "[%s] %s", time.Now().Format("15:04:05.000"), msg)
+		f.Close()
+	}
+}
+
 func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rtcSession, error) {
+	sessionLog("[SESSION] newRTCSession starting, desktopID=%s, requestedCodec=%s\n", desktopID, string(codec))
 	if codec == "" {
 		envCodec := strings.ToLower(strings.TrimSpace(os.Getenv(envWebRTCCodec)))
 		if envCodec != "" {
@@ -160,13 +176,16 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 		queueSize = 120
 	}
 
+	sessionLog("[SESSION] Calling NewWebRTCEncoder codec=%s bitrate=%d\n", string(codec), bitrate)
 	encoder, actualCodec, err := NewWebRTCEncoder(codec, WebRTCEncoderConfig{
 		BitRate:          bitrate,
 		KeyFrameInterval: 60,
 	})
 	if err != nil {
+		sessionLog("[SESSION] NewWebRTCEncoder FAILED: %v\n", err)
 		return nil, err
 	}
+	sessionLog("[SESSION] NewWebRTCEncoder succeeded, actualCodec=%s\n", string(actualCodec))
 	// Attach adaptive quality manager for bitrate enforcement when available.
 	if adaptiveQualityManager != nil {
 		if enc, ok := encoder.(adaptiveQualityEncoder); ok {
@@ -263,6 +282,15 @@ func (r *rtcSession) enqueue(frame *CaptureFrame, duration time.Duration) {
 		frame.Close()
 		return
 	}
+
+	cnt := r.enqueueCount.Add(1)
+	if cnt <= 5 || cnt%300 == 0 {
+		hasGPU := frame.GPU != nil
+		hasImg := frame.Image != nil
+		fmt.Printf("[DEBUG_RTC] enqueue frame=%d hasGPU=%v hasImg=%v codec=%s\n",
+			cnt, hasGPU, hasImg, string(r.codec))
+	}
+
 	req := rtcFrameRequest{frame: frame, duration: duration}
 
 	defer func() {
@@ -317,6 +345,8 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 		return
 	}
 
+	cnt := r.sendCount.Add(1)
+
 	duration := req.duration
 	if duration <= 0 {
 		duration = time.Second / 30
@@ -325,6 +355,9 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 	// Prefer GPU path when available.
 	if req.frame.GPU != nil {
 		if enc, ok := r.encoder.(frameEncoder); ok {
+			if cnt <= 5 || cnt%300 == 0 {
+				fmt.Printf("[DEBUG_RTC] sendQueued frame=%d calling EncodeFrame (GPU path)\n", cnt)
+			}
 			sample, err := enc.EncodeFrame(req.frame, duration)
 			if err != nil {
 				if errors.Is(err, ErrWebRTCEncoderTimeout) {

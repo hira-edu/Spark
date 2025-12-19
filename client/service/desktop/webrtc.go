@@ -3,6 +3,7 @@ package desktop
 import (
 	"Rocket/client/telemetry"
 	"errors"
+	"fmt"
 	"image"
 	"os"
 	"strings"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
-	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
@@ -162,16 +162,13 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 	}
 
 	// Create video track with optimized RTP codec capability.
+	// NOTE: Don't call AddTrack here - we must wait until SetRemoteDescription
+	// processes the browser's offer so we can bind to its recvonly transceiver.
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		codecCap,
 		"screen",
 		"rocket-desktop",
 	)
-	if err != nil {
-		pc.Close()
-		return nil, err
-	}
-	sender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		pc.Close()
 		return nil, err
@@ -184,32 +181,6 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		onICE:       cfg.OnICE,
 		onInputData: cfg.OnInputData,
 	}
-
-	// Drain RTCP packets so Pion can apply feedback, and detect keyframe requests (PLI/FIR).
-	go func() {
-		for {
-			pkts, _, err := sender.ReadRTCP()
-			if err != nil {
-				return
-			}
-			if cfg.OnKeyFrame == nil {
-				continue
-			}
-			needKeyframe := false
-			for _, pkt := range pkts {
-				switch pkt.(type) {
-				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-					needKeyframe = true
-				}
-				if needKeyframe {
-					break
-				}
-			}
-			if needKeyframe {
-				cfg.OnKeyFrame()
-			}
-		}
-	}()
 	// ICE Candidate handler - fires when new candidates are discovered
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -294,6 +265,68 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		})
 	})
 	return w, nil
+}
+
+// BindVideoTrack binds the video track to the peer connection AFTER SetRemoteDescription.
+// This is necessary because the browser creates a recvonly transceiver in its offer,
+// and we must bind our sendonly track to match that transceiver. Calling AddTrack
+// before SetRemoteDescription creates a mismatched transceiver that the browser ignores.
+// Returns the RTPSender for RTCP handling (PLI/FIR keyframe requests).
+func (w *DesktopWebRTC) BindVideoTrack() (*webrtc.RTPSender, error) {
+	if w == nil {
+		return nil, errors.New("webrtc not initialized")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.peer == nil {
+		return nil, errors.New("peer connection not initialized")
+	}
+	if w.videoTrack == nil {
+		return nil, errors.New("video track not initialized")
+	}
+
+	// Log transceiver state for debugging
+	transceivers := w.peer.GetTransceivers()
+	fmt.Printf("[WebRTC] BindVideoTrack: found %d transceivers\n", len(transceivers))
+	for i, t := range transceivers {
+		dir := t.Direction()
+		kind := t.Kind()
+		sender := t.Sender()
+		receiver := t.Receiver()
+		fmt.Printf("[WebRTC] BindVideoTrack: transceiver[%d] kind=%v dir=%v sender=%v receiver=%v\n",
+			i, kind, dir, sender != nil, receiver != nil)
+	}
+
+	// After SetRemoteDescription, the browser's recvonly transceiver exists but the
+	// sender is nil until we add a track. Use AddTrack which will automatically
+	// reuse the existing transceiver that matches the track's codec.
+	//
+	// Pion's AddTrack behavior after SetRemoteDescription:
+	// - If an existing transceiver matches (same codec, direction compatible), reuses it
+	// - Creates a sender on that transceiver
+	// - The browser's recvonly transceiver becomes sendrecv or sendonly from our side
+	fmt.Printf("[WebRTC] BindVideoTrack: calling AddTrack to bind video track\n")
+	sender, err := w.peer.AddTrack(w.videoTrack)
+	if err != nil {
+		fmt.Printf("[WebRTC] BindVideoTrack: AddTrack failed: %v\n", err)
+		return nil, err
+	}
+	fmt.Printf("[WebRTC] BindVideoTrack: AddTrack succeeded, sender=%v\n", sender != nil)
+
+	// Log final transceiver state
+	transceivers = w.peer.GetTransceivers()
+	fmt.Printf("[WebRTC] BindVideoTrack: after AddTrack, found %d transceivers\n", len(transceivers))
+	for i, t := range transceivers {
+		dir := t.Direction()
+		kind := t.Kind()
+		s := t.Sender()
+		r := t.Receiver()
+		fmt.Printf("[WebRTC] BindVideoTrack: transceiver[%d] kind=%v dir=%v sender=%v receiver=%v\n",
+			i, kind, dir, s != nil, r != nil)
+	}
+
+	return sender, nil
 }
 
 func (w *DesktopWebRTC) CreateOffer() (*webrtc.SessionDescription, error) {

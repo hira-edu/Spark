@@ -3,12 +3,15 @@ package desktop
 import (
 	"Rocket/modules"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kataras/golog"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -120,17 +123,75 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		rtc.Close()
 		return nil, err
 	}
-	answer, err := rtc.CreateAnswer()
+
+	// Bind video track AFTER SetRemoteDescription so we can match the browser's
+	// recvonly transceiver. This is critical for the browser's ontrack to fire.
+	sender, err := rtc.BindVideoTrack()
 	if err != nil {
 		rtc.Close()
-		return nil, err
+		return nil, fmt.Errorf("failed to bind video track: %w", err)
 	}
 
-	rtcSess, err := newRTCSession(desktopIDStr, rtc, codec)
+	// File-based debug logging for WebRTC signaling
+	signalingLog := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Print(msg)
+		if f, err := os.OpenFile("logs/webrtc_signaling.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintf(f, "[%s] %s", time.Now().Format("15:04:05.000"), msg)
+			f.Close()
+		}
+	}
+	signalingLog("[SIGNALING] BindVideoTrack succeeded, proceeding to CreateAnswer\n")
+
+	// Setup RTCP reader to detect keyframe requests (PLI/FIR) from the browser.
+	// This goroutine drains RTCP packets and invokes OnKeyFrame when needed.
+	onKeyFrameCb := func() {
+		sessRef.lock.Lock()
+		rtcSess := sessRef.rtc
+		sessRef.lock.Unlock()
+		if rtcSess != nil {
+			rtcSess.requestKeyFrame()
+		}
+	}
+	go func() {
+		for {
+			pkts, _, err := sender.ReadRTCP()
+			if err != nil {
+				return
+			}
+			needKeyframe := false
+			for _, pkt := range pkts {
+				switch pkt.(type) {
+				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+					needKeyframe = true
+				}
+				if needKeyframe {
+					break
+				}
+			}
+			if needKeyframe {
+				onKeyFrameCb()
+			}
+		}
+	}()
+
+	signalingLog("[SIGNALING] Calling CreateAnswer...\n")
+	answer, err := rtc.CreateAnswer()
 	if err != nil {
+		signalingLog("[SIGNALING] CreateAnswer FAILED: %v\n", err)
 		rtc.Close()
 		return nil, err
 	}
+	signalingLog("[SIGNALING] CreateAnswer succeeded, SDP type=%s\n", answer.Type.String())
+
+	signalingLog("[SIGNALING] Calling newRTCSession...\n")
+	rtcSess, err := newRTCSession(desktopIDStr, rtc, codec)
+	if err != nil {
+		signalingLog("[SIGNALING] newRTCSession FAILED: %v\n", err)
+		rtc.Close()
+		return nil, err
+	}
+	signalingLog("[SIGNALING] newRTCSession succeeded\n")
 	closingSess := rtcSess
 	rtcSess.onClosed = func() {
 		sessRef.lock.Lock()
@@ -140,6 +201,7 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		sessRef.lock.Unlock()
 	}
 	sess.rtc = rtcSess
+	signalingLog("[SIGNALING] sess.rtc assigned, desktopID=%s codec=%s\n", desktopIDStr, string(codec))
 
 	return map[string]any{
 		`sdp`:  answer.SDP,

@@ -589,10 +589,12 @@ func webrtcUnsupported(pack modules.Packet, wsConn *common.Conn) {
 func webrtcOffer(pack modules.Packet, wsConn *common.Conn) {
 	resp, err := desktop.HandleWebRTCOffer(pack)
 	if err != nil {
-		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
+		// Browser is the offerer; always respond with an ANSWER so the frontend can apply
+		// the response and correlate signaling failures.
+		wsConn.SendCallback(modules.Packet{Act: `DESKTOP_WEBRTC_ANSWER`, Code: 1, Msg: err.Error()}, pack)
 		return
 	}
-	wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0, Data: resp}, pack)
+	wsConn.SendCallback(modules.Packet{Act: `DESKTOP_WEBRTC_ANSWER`, Code: 0, Data: resp}, pack)
 }
 
 func webrtcAnswer(pack modules.Packet, wsConn *common.Conn) {

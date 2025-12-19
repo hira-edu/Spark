@@ -97,6 +97,7 @@ export function useDesktopWebRTC({
   }, []);
 
   const start = useCallback(async () => {
+    console.log('[WebRTC] start called', { enabled, hasSendSignal: !!sendSignal, existingPC: !!pcRef.current });
     if (!enabled) return;
     if (typeof RTCPeerConnection === 'undefined') return;
     if (!sendSignal) return;
@@ -105,6 +106,7 @@ export function useDesktopWebRTC({
     setStatus('connecting');
     setHasVideo(false);
 
+    console.log('[WebRTC] creating PeerConnection');
     const pc = new RTCPeerConnection({ iceServers: effectiveIceServers });
     pcRef.current = pc;
     iceKeyRef.current = effectiveIceKey;
@@ -138,6 +140,7 @@ export function useDesktopWebRTC({
 
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
+      console.log('[WebRTC] connectionState:', state);
       if (state === 'connected') {
         setStatus('connected');
         return;
@@ -152,29 +155,39 @@ export function useDesktopWebRTC({
     };
 
     pc.ontrack = (e) => {
+      console.log('[WebRTC] ontrack fired', { kind: e.track?.kind, id: e.track?.id, readyState: e.track?.readyState });
       const video = videoRef.current;
-      if (!video) return;
+      if (!video) {
+        console.warn('[WebRTC] ontrack: no video element');
+        return;
+      }
       const stream = e.streams && e.streams[0] ? e.streams[0] : new MediaStream([e.track]);
       if (video.srcObject !== stream) {
         video.srcObject = stream;
+        console.log('[WebRTC] set video.srcObject');
       }
       const tryPlay = () => {
         const p = video.play?.();
         if (p && typeof p.catch === 'function') {
-          p.catch(() => {});
+          p.catch((err) => console.warn('[WebRTC] play failed:', err.message));
         }
       };
       video.onloadedmetadata = () => {
+        console.log('[WebRTC] video loadedmetadata', { w: video.videoWidth, h: video.videoHeight });
         setHasVideo(true);
         tryPlay();
       };
-      video.onplaying = () => setHasVideo(true);
+      video.onplaying = () => {
+        console.log('[WebRTC] video playing');
+        setHasVideo(true);
+      };
       tryPlay();
     };
 
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      console.log('[WebRTC] sending offer, sdp length:', offer.sdp?.length);
       await sendSignal({
         act: 'DESKTOP_WEBRTC_OFFER',
         data: {
@@ -183,7 +196,9 @@ export function useDesktopWebRTC({
           role: allowControl ? 'viewer' : 'viewer_readonly',
         },
       });
+      console.log('[WebRTC] offer sent');
     } catch (err) {
+      console.error('[WebRTC] offer failed:', err);
       stop();
     }
   }, [allowControl, effectiveIceKey, effectiveIceServers, enabled, sendSignal, stop]);
@@ -202,26 +217,35 @@ export function useDesktopWebRTC({
 
   const handleSignalMessage = useCallback((msg) => {
     const pc = pcRef.current;
-    if (!pc || !msg) return;
+    console.log('[WebRTC] handleSignalMessage', { act: msg?.act, hasPC: !!pc, hasSdp: !!msg?.data?.sdp });
+    if (!pc || !msg) {
+      console.warn('[WebRTC] handleSignalMessage: no PC or msg');
+      return;
+    }
 
     const act = msg.act;
     const code = msg.code;
     if (code && code !== 0 && (act === 'DESKTOP_WEBRTC_ANSWER' || act === 'DESKTOP_WEBRTC_ICE')) {
+      console.warn('[WebRTC] signal error:', code, msg.msg);
       stop();
       return;
     }
 
     const data = msg.data || msg;
     if (act === 'DESKTOP_WEBRTC_ANSWER' && data?.sdp) {
-      pc.setRemoteDescription({ type: data.type || 'answer', sdp: data.sdp }).catch(() => {});
+      console.log('[WebRTC] received answer, sdp length:', data.sdp?.length);
+      pc.setRemoteDescription({ type: data.type || 'answer', sdp: data.sdp })
+        .then(() => console.log('[WebRTC] remote description set'))
+        .catch((err) => console.error('[WebRTC] setRemoteDescription failed:', err));
       return;
     }
     if (act === 'DESKTOP_WEBRTC_ICE' && data?.candidate) {
+      console.log('[WebRTC] adding ICE candidate');
       pc.addIceCandidate({
         candidate: data.candidate,
         sdpMid: data.sdpMid,
         sdpMLineIndex: data.mLine ?? data.sdpMLineIndex,
-      }).catch(() => {});
+      }).catch((err) => console.error('[WebRTC] addIceCandidate failed:', err));
     }
   }, [stop]);
 

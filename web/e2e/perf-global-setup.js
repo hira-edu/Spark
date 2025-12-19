@@ -83,7 +83,7 @@ export default async function globalSetup() {
       gap: parseInt(process.env.PERF_MARKER_GAP || '2', 10) || 2,
     },
     durationSec: parseInt(process.env.PERF_DURATION_SEC || '30', 10) || 30,
-    transport: process.env.PERF_TRANSPORT || 'tiles',
+    transport: process.env.PERF_TRANSPORT || 'webrtc',
     thresholds: {
       minFps: parseFloat(process.env.PERF_MIN_FPS || '15') || 15,
       p95Ms: parseFloat(process.env.PERF_MAX_P95_MS || '150') || 150,

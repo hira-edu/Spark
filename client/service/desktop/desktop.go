@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"github.com/kbinani/screenshot"
 	"image"
+	"os"
 	"reflect"
 	"runtime"
 	"strings"
@@ -604,6 +605,7 @@ func startCaptureWorker() bool {
 }
 
 func worker() {
+	rtcDebugLog("[WORKER] worker() started\n")
 	lockedThread := false
 	// Windows capture is handled by the capture engine (dedicated locked thread),
 	// so keep the worker goroutine flexible to avoid thread-affinity issues in
@@ -1059,6 +1061,12 @@ func worker() {
 			noImageCount = 0
 			lastSuccessTime = tickTime
 			frameCount++
+			if frameCount <= 10 {
+				hasFrame := frame != nil
+				hasGPU := hasFrame && frame.GPU != nil
+				hasImg := img != nil
+				rtcDebugLog("[WORKER_FRAME] frameCount=%d hasFrame=%v hasGPU=%v hasImg=%v\n", frameCount, hasFrame, hasGPU, hasImg)
+			}
 
 			// Exit stall mode if this frame came from DXGI (not GDI fallback)
 			if inStallMode && !fromGDIFallback {
@@ -3133,11 +3141,39 @@ func cloneCaptureFrameForRTC(frame *CaptureFrame) *CaptureFrame {
 	return out
 }
 
+var broadcastRTCDebugCounter int64
+var broadcastRTCNilCounter int64
+
+// rtcDebugLog writes to the WebRTC signaling debug log file
+func rtcDebugLog(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Print(msg)
+	if f, err := os.OpenFile("logs/webrtc_signaling.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		fmt.Fprintf(f, "[%s] %s", time.Now().Format("15:04:05.000"), msg)
+		f.Close()
+	}
+}
+
 func broadcastRTC(frame *CaptureFrame, interval time.Duration) {
+	cnt := atomic.AddInt64(&broadcastRTCDebugCounter, 1)
+	// Unconditional logging for first 10 calls to verify function is reached
+	if cnt <= 10 {
+		hasFrame := frame != nil
+		hasGPU := hasFrame && frame.GPU != nil
+		hasImg := hasFrame && frame.Image != nil
+		rtcDebugLog("[BROADCAST_ENTRY] call=%d hasFrame=%v hasGPU=%v hasImg=%v\n", cnt, hasFrame, hasGPU, hasImg)
+	}
 	if frame == nil {
+		nilCnt := atomic.AddInt64(&broadcastRTCNilCounter, 1)
+		if nilCnt <= 3 || nilCnt%300 == 0 {
+			rtcDebugLog("[BROADCAST] frame=nil (nilCount=%d)\n", nilCnt)
+		}
 		return
 	}
+	sessCount := 0
+	sessWithRTC := 0
 	sessions.IterCb(func(_ string, desktop *session) bool {
+		sessCount++
 		if desktop == nil {
 			return true
 		}
@@ -3147,11 +3183,21 @@ func broadcastRTC(frame *CaptureFrame, interval time.Duration) {
 		if rtc == nil {
 			return true
 		}
+		sessWithRTC++
 		cloned := cloneCaptureFrameForRTC(frame)
 		if cloned == nil {
+			if cnt <= 5 || cnt%100 == 0 {
+				rtcDebugLog("[BROADCAST] frame=%d clone returned nil\n", cnt)
+			}
 			return true
 		}
 		rtc.enqueue(cloned, interval)
 		return true
 	})
+	if cnt <= 5 || cnt%300 == 0 {
+		hasGPU := frame.GPU != nil
+		hasImg := frame.Image != nil
+		rtcDebugLog("[BROADCAST] frame=%d sessions=%d withRTC=%d hasGPU=%v hasImg=%v\n",
+			cnt, sessCount, sessWithRTC, hasGPU, hasImg)
+	}
 }

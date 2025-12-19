@@ -77,7 +77,7 @@ try {
   $env:SPARK_DISABLE_UPDATE = "1"
   # WS tiles require a CPU RGBA capture backend; the default auto backend may select
   # DXGI NV12 (GPU-only) which is intended for WebRTC/video transport.
-  if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "tiles" }
+  if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "webrtc" }
   # Let the client use its default capture backend (DXGI/auto)
   # GDI was causing missed marker updates due to DWM timing issues
   $client = Start-Process -FilePath $clientExe -ArgumentList @("--console") -PassThru -RedirectStandardOutput $clientOut -RedirectStandardError $clientErr
@@ -142,7 +142,7 @@ try {
     $env:PERF_TEST_TIMEOUT_MS = "$([Math]::Max(180000, ($durationSec + 180) * 1000))"
     if (-not $env:PERF_MARKER_X) { $env:PERF_MARKER_X = "$markerX" }
     if (-not $env:PERF_MARKER_Y) { $env:PERF_MARKER_Y = "$markerY" }
-    if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "tiles" }
+    if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "webrtc" }
 
     npx playwright test -c playwright.perf.config.js
   } finally {
