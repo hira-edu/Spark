@@ -168,7 +168,13 @@ func GetDiskInfo() (modules.IO, error) {
 }
 
 func GetDevice() (*modules.Device, error) {
-	id, err := machineid.ProtectedID(`Rocket`)
+	// Allow overriding the machine ID app name for testing to avoid CLIENT_DUPLICATE
+	// when multiple clients run on the same machine.
+	appName := os.Getenv("SPARK_MACHINE_ID_APP_NAME")
+	if appName == "" {
+		appName = "Rocket"
+	}
+	id, err := machineid.ProtectedID(appName)
 	if err != nil {
 		id, err = machineid.ID()
 		if err != nil {

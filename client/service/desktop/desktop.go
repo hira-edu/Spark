@@ -983,7 +983,7 @@ func worker() {
 						if fallbackErr == nil && fallbackImg != nil {
 							// screenshot.CaptureRect returns *image.RGBA directly
 							img = fallbackImg
-							err = nil // Clear the error so we process this frame
+							err = nil              // Clear the error so we process this frame
 							fromGDIFallback = true // Mark this frame as from GDI fallback
 
 							// Skip the normal error handling and continue to frame processing
@@ -1077,8 +1077,16 @@ func worker() {
 			}
 
 			// RESOLUTION CHANGE DETECTION: Check if screen bounds changed
-			newBounds := img.Rect
-			if newBounds != currentBounds {
+			// Skip resolution detection if no CPU image (GPU-only frame from DXGI capture).
+			// GPU frames don't carry Rect info directly on the CPU side.
+			var newBounds image.Rectangle
+			if img != nil {
+				newBounds = img.Rect
+			} else if frame != nil && frame.GPU != nil {
+				// Use GPU texture dimensions if available
+				newBounds = image.Rect(0, 0, int(frame.GPU.Width), int(frame.GPU.Height))
+			}
+			if newBounds != currentBounds && newBounds.Dx() > 0 && newBounds.Dy() > 0 {
 				resolutionChanges++
 				oldBounds := currentBounds
 				currentBounds = newBounds
@@ -1118,7 +1126,8 @@ func worker() {
 
 			// WS tile/canvas encoding is CPU-intensive; skip it when every active viewer has
 			// switched to WebRTC (<video>) and explicitly requested suppression.
-			if anySessionNeedsWSFrames() {
+			// Also skip if we have no CPU image (GPU-only frame from DXGI capture).
+			if anySessionNeedsWSFrames() && img != nil {
 				// Delta detection with performance tracking
 				isKeyframe := prev == nil
 				diff := imageCompare(img, prev, compress)

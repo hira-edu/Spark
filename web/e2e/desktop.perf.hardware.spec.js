@@ -70,18 +70,18 @@ async function readMarkerOnce(page, markerGrid) {
       };
     })();
 
-    const decodeTs24 = (imageData) => {
+    const decodeTs24 = (imageData, region) => {
       const d = imageData?.data;
       const w = imageData?.width | 0;
       const h = imageData?.height | 0;
       if (!d || w <= 0 || h <= 0) return null;
-      if (w < grid.width || h < grid.height) return null;
+      if (!region || w < region.width || h < region.height) return null;
 
       let ts24 = 0;
-      for (let r = 0; r < grid.rows; r++) {
-        for (let c = 0; c < grid.cols; c++) {
-          const xr = c * (grid.cell + grid.gap) + Math.floor(grid.cell / 2);
-          const yr = r * (grid.cell + grid.gap) + Math.floor(grid.cell / 2);
+      for (let r = 0; r < region.rows; r++) {
+        for (let c = 0; c < region.cols; c++) {
+          const xr = c * (region.cell + region.gap) + Math.floor(region.cell / 2);
+          const yr = r * (region.cell + region.gap) + Math.floor(region.cell / 2);
           const idx = (yr * w + xr) * 4;
           const v = (d[idx] + d[idx + 1] + d[idx + 2]) / 3;
           const bit = v > 127 ? 1 : 0;
@@ -96,17 +96,66 @@ async function readMarkerOnce(page, markerGrid) {
 
     const canvas = selectCanvas();
     const video = selectVideo();
+
+    const captureDims = (() => {
+      const mw = markerGrid.monitorW | 0;
+      const mh = markerGrid.monitorH | 0;
+      if (mw > 0 && mh > 0) return { w: mw, h: mh, from: 'env' };
+
+      const text = document.body ? document.body.innerText : '';
+      const match = text.match(/\bres\s*(\d+)\s*x\s*(\d+)/i);
+      if (match) {
+        const w = parseInt(match[1], 10) || 0;
+        const h = parseInt(match[2], 10) || 0;
+        if (w > 0 && h > 0) return { w, h, from: 'text' };
+      }
+
+      const cw = canvas?.width | 0;
+      const ch = canvas?.height | 0;
+      if (cw > 0 && ch > 0) return { w: cw, h: ch, from: 'canvas' };
+
+      return { w: 0, h: 0, from: 'none' };
+    })();
+
+    const scaleRegion = (targetW, targetH) => {
+      const capW = captureDims.w | 0;
+      const capH = captureDims.h | 0;
+      if (capW <= 0 || capH <= 0 || targetW <= 0 || targetH <= 0) return null;
+      const sx = targetW / capW;
+      const sy = targetH / capH;
+      const s = Math.min(sx, sy);
+      if (!(s > 0) || s >= 1) return null;
+
+      const cell = Math.max(6, Math.round(grid.cell * s));
+      const gap = Math.max(0, Math.round(grid.gap * s));
+      const left = Math.round(grid.left * s);
+      const top = Math.round(grid.top * s);
+      const width = grid.cols * cell + (grid.cols - 1) * gap;
+      const height = grid.rows * cell + (grid.rows - 1) * gap;
+
+      return { cols: grid.cols, rows: grid.rows, cell, gap, left, top, width, height, scale: s };
+    };
+
     const dims = {
       canvas: canvas ? { w: canvas.width || 0, h: canvas.height || 0 } : null,
       video: video ? { w: video.videoWidth || 0, h: video.videoHeight || 0 } : null,
+      capture: captureDims,
       region: { left: grid.left, top: grid.top, w: grid.width, h: grid.height },
     };
 
     const tryReadVideo = () => {
       if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) return { ok: false, error: 'no_video' };
-      if (grid.left < 0 || grid.top < 0) return { ok: false, error: 'bad_coords' };
-      if (grid.left + grid.width > video.videoWidth) return { ok: false, error: 'oob_video_x' };
-      if (grid.top + grid.height > video.videoHeight) return { ok: false, error: 'oob_video_y' };
+
+      let region = grid;
+      if (region.left < 0 || region.top < 0) return { ok: false, error: 'bad_coords' };
+      if (region.left + region.width > video.videoWidth || region.top + region.height > video.videoHeight) {
+        const scaled = scaleRegion(video.videoWidth, video.videoHeight);
+        if (scaled && scaled.left + scaled.width <= video.videoWidth && scaled.top + scaled.height <= video.videoHeight) {
+          region = scaled;
+        }
+      }
+      if (region.left + region.width > video.videoWidth) return { ok: false, error: 'oob_video_x' };
+      if (region.top + region.height > video.videoHeight) return { ok: false, error: 'oob_video_y' };
 
       const offscreen = window.__rocketPerfOffscreen || (window.__rocketPerfOffscreen = document.createElement('canvas'));
       const offctx = offscreen.getContext('2d');
@@ -117,8 +166,8 @@ async function readMarkerOnce(page, markerGrid) {
       }
       offctx.drawImage(video, 0, 0);
       try {
-        const img = offctx.getImageData(grid.left, grid.top, grid.width, grid.height);
-        const ts24 = decodeTs24(img);
+        const img = offctx.getImageData(region.left, region.top, region.width, region.height);
+        const ts24 = decodeTs24(img, region);
         return ts24 === null ? { ok: false, error: 'decode_failed', dims } : { ok: true, ts24, source: 'webrtc-video', dims };
       } catch {
         return { ok: false, error: 'getImageData_failed', dims };
@@ -127,15 +176,23 @@ async function readMarkerOnce(page, markerGrid) {
 
     const tryReadCanvas = () => {
       if (!canvas || canvas.width <= 0 || canvas.height <= 0) return { ok: false, error: 'no_canvas' };
-      if (grid.left < 0 || grid.top < 0) return { ok: false, error: 'bad_coords' };
-      if (grid.left + grid.width > canvas.width) return { ok: false, error: 'oob_canvas_x' };
-      if (grid.top + grid.height > canvas.height) return { ok: false, error: 'oob_canvas_y' };
+
+      let region = grid;
+      if (region.left < 0 || region.top < 0) return { ok: false, error: 'bad_coords' };
+      if (region.left + region.width > canvas.width || region.top + region.height > canvas.height) {
+        const scaled = scaleRegion(canvas.width, canvas.height);
+        if (scaled && scaled.left + scaled.width <= canvas.width && scaled.top + scaled.height <= canvas.height) {
+          region = scaled;
+        }
+      }
+      if (region.left + region.width > canvas.width) return { ok: false, error: 'oob_canvas_x' };
+      if (region.top + region.height > canvas.height) return { ok: false, error: 'oob_canvas_y' };
 
       const ctx = canvas.getContext('2d');
       if (!ctx) return { ok: false, error: 'no_2d' };
       try {
-        const img = ctx.getImageData(grid.left, grid.top, grid.width, grid.height);
-        const ts24 = decodeTs24(img);
+        const img = ctx.getImageData(region.left, region.top, region.width, region.height);
+        const ts24 = decodeTs24(img, region);
         return ts24 === null ? { ok: false, error: 'decode_failed', dims } : { ok: true, ts24, source: 'tiles-canvas', dims };
       } catch {
         return { ok: false, error: 'getImageData_failed', dims };

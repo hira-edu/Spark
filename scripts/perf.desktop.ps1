@@ -3,7 +3,9 @@ $ErrorActionPreference = "Stop"
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
   $baseUrl = "http://localhost:18080"
-  $salt = "testsalt1234567890123"
+  # Use a unique salt per test run to avoid CLIENT_DUPLICATE conflicts with the installed Windows service.
+  # The service has its own embedded config with a different salt/device ID.
+  $salt = "perf_" + (Get-Date -Format "yyyyMMddHHmmss")
   # Position marker in bottom-right corner to avoid browser window overlap.
   $markerX = if ($env:PERF_MARKER_X) { [int]$env:PERF_MARKER_X } else { 3200 }
   $markerY = if ($env:PERF_MARKER_Y) { [int]$env:PERF_MARKER_Y } else { 1200 }
@@ -75,6 +77,14 @@ try {
 
   Write-Host "[Start] client (--console, disable auto-update)"
   $env:SPARK_DISABLE_UPDATE = "1"
+  # Use unique machine ID app name to avoid CLIENT_DUPLICATE conflicts with the installed Windows service.
+  $env:SPARK_MACHINE_ID_APP_NAME = "RocketPerf_$runId"
+  # Perf harness: keep overlay disabled (it forces CPU readback paths).
+  $env:SPARK_PERF_MARKER_OVERLAY = "0"
+  # Prefer lowest-latency queueing for WebRTC perf (drop stale frames instead of buffering them).
+  $env:SPARK_WEBRTC_FRAME_QUEUE = "1"
+  # Prefer direct DXGI -> hardware MFT input when available.
+  $env:SPARK_WEBRTC_H264_DXGI = "1"
   # WS tiles require a CPU RGBA capture backend; the default auto backend may select
   # DXGI NV12 (GPU-only) which is intended for WebRTC/video transport.
   if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "webrtc" }

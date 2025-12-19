@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kataras/golog"
@@ -81,14 +82,18 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	// Capture session reference for callbacks
 	sessRef := sess
 	desktopIDStr := desktopID.(string)
+	var ownedRTC atomic.Pointer[DesktopWebRTC]
 	iceServers := parseICEServers(pack.Data)
 	rtc, err := NewDesktopWebRTC(WebRTCConfig{
 		Configuration: webrtc.Configuration{ICEServers: iceServers},
 		Codec:         codec,
 		OnState: func(state webrtc.PeerConnectionState) {
 			if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+				// Guard against stale callbacks from a previous PeerConnection/offer.
+				// Only clear the current session if it still belongs to this DesktopWebRTC instance.
+				current := ownedRTC.Load()
 				sessRef.lock.Lock()
-				if sessRef.rtc != nil {
+				if sessRef.rtc != nil && sessRef.rtc.rtc == current {
 					sessRef.rtc.close()
 					sessRef.rtc = nil
 				}
@@ -115,6 +120,7 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	ownedRTC.Store(rtc)
 
 	if err := rtc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: sdpType,

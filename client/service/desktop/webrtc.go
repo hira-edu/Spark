@@ -156,7 +156,7 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		codecCap = webrtc.RTPCodecCapability{
 			MimeType:     mimeType,
 			ClockRate:    90000,
-			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640028",
 			RTCPFeedback: nil, // default interceptors add feedback
 		}
 	}
