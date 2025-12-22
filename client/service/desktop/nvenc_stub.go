@@ -3,11 +3,17 @@
 package desktop
 
 import (
+	"errors"
 	"image"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/media"
 )
+
+// loadNVENC returns an error on non-Windows platforms.
+func loadNVENC() error {
+	return errors.New("NVENC not available on this platform")
+}
 
 // NVENCEncoder is a stub for non-Windows platforms.
 type NVENCEncoder struct{}
