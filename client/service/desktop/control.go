@@ -356,6 +356,8 @@ skipCapture:
 				jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
 			}
 			newCodec = jpeg
+		case "jpeg-turbo", "turbo":
+			newCodec = NewLibjpegTurboCodec(quality)
 		case "png", "lossless":
 			newCodec = NewPNGCodecFast()
 		case "webp":
@@ -369,7 +371,7 @@ skipCapture:
 		case "h264", "h.264":
 			newCodec = NewHardwareCodec(CodecTypeH264, quality, getHardwareSupport())
 		default:
-			errors = append(errors, "codec: unsupported type (use: raw, jpeg, webp, avif, vp8, vp9, h264)")
+			errors = append(errors, "codec: unsupported type (use: raw, jpeg, jpeg-turbo, webp, avif, vp8, vp9, h264)")
 			goto skipCodec
 		}
 
