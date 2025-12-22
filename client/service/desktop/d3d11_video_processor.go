@@ -272,6 +272,8 @@ func (vp *VideoProcessor) ConvertBGRAToNV12(bgraTex *iD3D11Texture2D) (*iD3D11Te
 		return nil, err
 	}
 
+	ctx := (*iD3D11DeviceContextExt)(unsafe.Pointer(vp.deviceCtx))
+	ctx.Flush()
 	return nv12Tex, nil
 }
 
@@ -280,27 +282,35 @@ func (vp *VideoProcessor) getOrCreateNV12Texture() (*iD3D11Texture2D, error) {
 	vp.nv12PoolMutex.Lock()
 	defer vp.nv12PoolMutex.Unlock()
 
+	// DISABLED: Texture pooling disabled for debugging AMD encoder issues.
+	// The encoder might hold references to textures, causing issues when we reuse them.
+	// TODO: Re-enable pooling once AMD encoding is fixed.
+	/*
 	// Try to get from pool
 	if len(vp.nv12TexPool) > 0 {
 		tex := vp.nv12TexPool[len(vp.nv12TexPool)-1]
 		vp.nv12TexPool = vp.nv12TexPool[:len(vp.nv12TexPool)-1]
 		return tex, nil
 	}
+	*/
 
 	// Create new NV12 texture
+	// D3D11_BIND_RENDER_TARGET (0x20) is required for video processor output.
+	// D3D11_BIND_VIDEO_ENCODER (0x200000) is preferred for hardware encoder input.
+	// D3D11_RESOURCE_MISC_SHARED (0x2) allows sharing across D3D11 contexts (required by some AMD encoders).
+	// Some GPUs don't support VIDEO_ENCODER with RENDER_TARGET, so we fall back if needed.
+	const d3d11ResourceMiscShared = 0x2
 	desc := d3d11Texture2DDesc{
-		Width:      uint32(vp.outputWidth),
-		Height:     uint32(vp.outputHeight),
-		MipLevels:  1,
-		ArraySize:  1,
-		Format:     dxgiFormatNV12, // 103
-		SampleDesc: struct{ Count, Quality uint32 }{1, 0},
-		Usage:      d3d11UsageDefault,
-		// Prefer a texture usable as both a video-processor output and a hardware encoder input.
-		// Some GPUs/drivers reject VIDEO_ENCODER bind on NV12; fall back to render-target only.
+		Width:          uint32(vp.outputWidth),
+		Height:         uint32(vp.outputHeight),
+		MipLevels:      1,
+		ArraySize:      1,
+		Format:         dxgiFormatNV12, // 103
+		SampleDesc:     struct{ Count, Quality uint32 }{1, 0},
+		Usage:          d3d11UsageDefault,
 		BindFlags:      d3d11BindRenderTarget | d3d11BindVideoEncoder,
 		CPUAccessFlags: d3d11CPUAccessNone,
-		MiscFlags:      0,
+		MiscFlags:      d3d11ResourceMiscShared,
 	}
 
 	var tex *iD3D11Texture2D
@@ -311,17 +321,19 @@ func (vp *VideoProcessor) getOrCreateNV12Texture() (*iD3D11Texture2D, error) {
 		0, // pInitialData (nil)
 		uintptr(unsafe.Pointer(&tex)),
 	)
-	if err := hresultError(r0, "CreateTexture2D(NV12)"); err != nil {
+	if hresultError(r0, "") != nil {
+		// Fallback: some GPUs don't support VIDEO_ENCODER + RENDER_TARGET combination.
+		// Try with just RENDER_TARGET.
 		desc.BindFlags = d3d11BindRenderTarget
 		r0, _, _ = syscall.SyscallN(
 			vp.device.vtbl.CreateTexture2D,
 			uintptr(unsafe.Pointer(vp.device)),
 			uintptr(unsafe.Pointer(&desc)),
-			0, // pInitialData (nil)
+			0,
 			uintptr(unsafe.Pointer(&tex)),
 		)
-		if err2 := hresultError(r0, "CreateTexture2D(NV12 fallback)"); err2 != nil {
-			return nil, err2
+		if err := hresultError(r0, "CreateTexture2D(NV12) fallback"); err != nil {
+			return nil, err
 		}
 	}
 
@@ -334,6 +346,11 @@ func (vp *VideoProcessor) ReturnTexture(tex *iD3D11Texture2D) {
 		return
 	}
 
+	// DISABLED: Pooling disabled for debugging AMD encoder issues.
+	// Always release textures immediately instead of pooling.
+	tex.Release()
+
+	/*
 	vp.nv12PoolMutex.Lock()
 	defer vp.nv12PoolMutex.Unlock()
 
@@ -344,6 +361,7 @@ func (vp *VideoProcessor) ReturnTexture(tex *iD3D11Texture2D) {
 		// Pool full, release texture
 		tex.Release()
 	}
+	*/
 }
 
 // Release cleans up video processor resources.

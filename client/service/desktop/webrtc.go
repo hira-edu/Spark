@@ -56,12 +56,17 @@ var defaultTURNServers = []struct {
 var ErrVPXUnavailable = errors.New("vpx encoder not built (enable cgo, install libvpx, and build with -tags vpx)")
 var ErrH264Unavailable = errors.New("h264 encoder not available on this platform")
 
+// Debug counter for tiles DC state logging
+var tilesDCStateLogCounter atomic.Uint64
+
 // DesktopWebRTC mirrors the JPEG cadence by emitting samples on a video track and
 // reuses the DESKTOP_INPUT data channel for input forwarding.
 type DesktopWebRTC struct {
 	peer              *webrtc.PeerConnection
 	videoTrack        *webrtc.TrackLocalStaticSample
 	inputDC           *webrtc.DataChannel
+	perfDC            *webrtc.DataChannel
+	tilesDC           *webrtc.DataChannel // Data channel for tile frames (lower latency than WS)
 	onState           func(webrtc.PeerConnectionState)
 	onICE             func(*webrtc.ICECandidate)
 	onInputData       func([]byte)
@@ -74,6 +79,7 @@ type DesktopWebRTC struct {
 type WebRTCConfig struct {
 	Configuration webrtc.Configuration
 	Codec         WebRTCCodec // h264/vp8/vp9 (defaults chosen by caller)
+	VideoFmtpLine string      // Optional SDP fmtp line for the video track.
 	OnState       func(webrtc.PeerConnectionState)
 	OnICE         func(*webrtc.ICECandidate)
 	OnInputData   func([]byte)
@@ -92,6 +98,10 @@ const (
 type WebRTCEncoderConfig struct {
 	BitRate          int // bits per second; defaults to ~900kbps when zero
 	KeyFrameInterval int // keyframe interval in frames; defaults to 60 when zero
+	// Negotiated H.264 parameters (for hardware encoder validation).
+	H264ProfileID  uint8
+	H264Constraint uint8
+	H264LevelID    uint8
 }
 
 // WebRTCEncoder encodes RGBA frames into WebRTC-ready samples (H.264/VP8/VP9).
@@ -105,10 +115,35 @@ type WebRTCEncoder interface {
 func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 	cfg.Configuration = applyICEFromEnv(cfg.Configuration)
 
-	// Setup MediaEngine with VP8/VP9 codecs for video
+	// Setup MediaEngine with only the codecs we intend to negotiate.
 	m := &webrtc.MediaEngine{}
-	if err := m.RegisterDefaultCodecs(); err != nil {
-		return nil, err
+	if cfg.Codec == WebRTCCodecH264 {
+		fmtpLine := cfg.VideoFmtpLine
+		if fmtpLine == "" {
+			fmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+		}
+		videoRTCPFeedback := []webrtc.RTCPFeedback{
+			{Type: "goog-remb"},
+			{Type: "transport-cc"},
+			{Type: "ccm", Parameter: "fir"},
+			{Type: "nack"},
+			{Type: "nack", Parameter: "pli"},
+		}
+		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{
+				MimeType:     webrtc.MimeTypeH264,
+				ClockRate:    90000,
+				SDPFmtpLine:  fmtpLine,
+				RTCPFeedback: videoRTCPFeedback,
+			},
+			PayloadType: 102,
+		}, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := m.RegisterDefaultCodecs(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Setup Interceptor Registry for SRTP encryption and RTCP feedback
@@ -142,6 +177,49 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		return nil, err
 	}
 
+	// Create perf metadata channel
+	perfDC, err := pc.CreateDataChannel("perf-metadata", nil)
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("create perf-metadata channel: %w", err)
+	}
+	perfDC.OnOpen(func() {
+		sessionLog("[PERF] perf-metadata channel opened\n")
+	})
+	perfDC.OnClose(func() {
+		sessionLog("[PERF] perf-metadata channel closed\n")
+	})
+	perfDC.OnError(func(err error) {
+		sessionLog("[PERF] perf-metadata channel error: %v\n", err)
+	})
+
+	// Create tiles data channel for low-latency tile delivery.
+	// Unordered delivery is faster and tiles have sequence numbers for reassembly.
+	ordered := false
+	tilesDC, err := pc.CreateDataChannel("desktop-tiles", &webrtc.DataChannelInit{
+		Ordered: &ordered,
+	})
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("create desktop-tiles channel: %w", err)
+	}
+	tilesDC.OnOpen(func() {
+		sessionLog("[TILES] desktop-tiles channel opened\n")
+		telemetry.LogStructured("INFO", "webrtc: tiles data channel opened", map[string]interface{}{
+			"readyState": tilesDC.ReadyState().String(),
+		})
+	})
+	tilesDC.OnClose(func() {
+		sessionLog("[TILES] desktop-tiles channel closed\n")
+		telemetry.LogStructured("INFO", "webrtc: tiles data channel closed", nil)
+	})
+	tilesDC.OnError(func(err error) {
+		sessionLog("[TILES] desktop-tiles channel error: %v\n", err)
+		telemetry.LogStructured("ERROR", "webrtc: tiles data channel error", map[string]interface{}{
+			"error": err.Error(),
+		})
+	})
+
 	// Use configured codec, default to VP8
 	mimeType := webrtc.MimeTypeVP8
 	codecCap := webrtc.RTPCodecCapability{
@@ -153,10 +231,14 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 		codecCap.MimeType = mimeType
 	case WebRTCCodecH264:
 		mimeType = webrtc.MimeTypeH264
+		fmtpLine := cfg.VideoFmtpLine
+		if fmtpLine == "" {
+			fmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+		}
 		codecCap = webrtc.RTPCodecCapability{
 			MimeType:     mimeType,
 			ClockRate:    90000,
-			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640028",
+			SDPFmtpLine:  fmtpLine,
 			RTCPFeedback: nil, // default interceptors add feedback
 		}
 	}
@@ -177,6 +259,8 @@ func NewDesktopWebRTC(cfg WebRTCConfig) (*DesktopWebRTC, error) {
 	w := &DesktopWebRTC{
 		peer:        pc,
 		videoTrack:  videoTrack,
+		perfDC:      perfDC,
+		tilesDC:     tilesDC,
 		onState:     cfg.OnState,
 		onICE:       cfg.OnICE,
 		onInputData: cfg.OnInputData,
@@ -456,6 +540,18 @@ func (w *DesktopWebRTC) SendFrame(frame []byte, d time.Duration) error {
 	return w.videoTrack.WriteSample(media.Sample{Data: frame, Duration: d})
 }
 
+// Input buffering stats for monitoring
+var inputStats struct {
+	sent      atomic.Uint64
+	retried   atomic.Uint64
+	dropped   atomic.Uint64
+}
+
+// GetInputStats returns input send/retry/drop counts for monitoring
+func GetInputStats() (sent, retried, dropped uint64) {
+	return inputStats.sent.Load(), inputStats.retried.Load(), inputStats.dropped.Load()
+}
+
 func (w *DesktopWebRTC) SendInput(payload []byte) error {
 	if w == nil {
 		return errors.New("webrtc not initialized")
@@ -471,13 +567,155 @@ func (w *DesktopWebRTC) SendInput(payload []byte) error {
 	if w.inputDC.ReadyState() != webrtc.DataChannelStateOpen {
 		return errors.New("input channel not open")
 	}
-	// Check backpressure before sending (WebRTC best practice)
-	// Drop input if buffer > 256KB to prevent memory explosion
-	const maxBufferedAmount = 256 * 1024
-	if w.inputDC.BufferedAmount() > maxBufferedAmount {
-		return errors.New("data channel congested, dropping input")
+
+	// Backpressure handling with retry (instead of immediate drop)
+	// For real-time input, we retry briefly before dropping
+	const (
+		maxBufferedAmount = 256 * 1024 // 256KB max buffer
+		maxRetries        = 5          // Up to 5 retries
+		retryInterval     = 10 * time.Millisecond
+	)
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if w.inputDC.BufferedAmount() <= maxBufferedAmount {
+			if err := w.inputDC.Send(payload); err != nil {
+				return err
+			}
+			inputStats.sent.Add(1)
+			if attempt > 0 {
+				inputStats.retried.Add(1)
+			}
+			return nil
+		}
+
+		// Buffer congested - wait briefly before retry
+		if attempt < maxRetries {
+			time.Sleep(retryInterval)
+		}
 	}
-	return w.inputDC.Send(payload)
+
+	// Still congested after retries - drop and log
+	inputStats.dropped.Add(1)
+	dropped := inputStats.dropped.Load()
+	if dropped <= 5 || dropped%100 == 0 {
+		telemetry.LogStructured("WARN", "webrtc: input dropped after retries", map[string]any{
+			"buffered_kb":   w.inputDC.BufferedAmount() / 1024,
+			"total_dropped": dropped,
+			"payload_size":  len(payload),
+		})
+	}
+	return errors.New("data channel congested, input dropped after retries")
+}
+
+// SendPerfMetadata sends performance metadata over the dedicated data channel.
+func (w *DesktopWebRTC) SendPerfMetadata(payload []byte) error {
+	if w == nil {
+		return errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return nil // Fail silently if closed
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.perfDC == nil {
+		return errors.New("perf data channel not initialized")
+	}
+	if w.perfDC.ReadyState() != webrtc.DataChannelStateOpen {
+		return nil // Fail silently if not open
+	}
+	// Avoid blocking the encoder pipeline by dropping if congested.
+	const maxBufferedAmount = 65536
+	if w.perfDC.BufferedAmount() > maxBufferedAmount {
+		return nil // Fail silently
+	}
+	return w.perfDC.Send(payload)
+}
+
+// TilesChannelReady returns true if the tiles data channel is open and ready.
+func (w *DesktopWebRTC) TilesChannelReady() bool {
+	if w == nil || w.closed.Load() {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.tilesDC == nil {
+		return false
+	}
+	ready := w.tilesDC.ReadyState() == webrtc.DataChannelStateOpen
+	// Log channel state periodically for debugging
+	if !ready {
+		dcStateLogCount := tilesDCStateLogCounter.Add(1)
+		if dcStateLogCount <= 3 || dcStateLogCount%200 == 0 {
+			telemetry.LogStructured("DEBUG", "webrtc: tiles DC not ready", map[string]interface{}{
+				"readyState": w.tilesDC.ReadyState().String(),
+				"count":      dcStateLogCount,
+			})
+		}
+	}
+	return ready
+}
+
+// SendTileBlock sends a single tile block over the tiles data channel.
+// Returns error if channel is not ready or congested.
+func (w *DesktopWebRTC) SendTileBlock(block []byte) error {
+	if w == nil {
+		return errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return errors.New("webrtc closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.tilesDC == nil {
+		return errors.New("tiles data channel not initialized")
+	}
+	if w.tilesDC.ReadyState() != webrtc.DataChannelStateOpen {
+		return errors.New("tiles data channel not open")
+	}
+	// Backpressure: drop tiles if channel is congested.
+	// This is acceptable since newer tiles will replace older ones.
+	const maxBufferedAmount = 512 * 1024 // 512KB buffer limit
+	if w.tilesDC.BufferedAmount() > maxBufferedAmount {
+		return errors.New("tiles data channel congested")
+	}
+	return w.tilesDC.Send(block)
+}
+
+// SendTiles sends multiple tile blocks over the tiles data channel.
+// Returns the number of blocks successfully sent.
+func (w *DesktopWebRTC) SendTiles(blocks []*[]byte) (int, error) {
+	if w == nil {
+		return 0, errors.New("webrtc not initialized")
+	}
+	if w.closed.Load() {
+		return 0, errors.New("webrtc closed")
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.tilesDC == nil {
+		return 0, errors.New("tiles data channel not initialized")
+	}
+	if w.tilesDC.ReadyState() != webrtc.DataChannelStateOpen {
+		return 0, errors.New("tiles data channel not open")
+	}
+
+	sent := 0
+	for _, block := range blocks {
+		if block == nil {
+			continue
+		}
+		// Backpressure check per block
+		const maxBufferedAmount = 512 * 1024
+		if w.tilesDC.BufferedAmount() > maxBufferedAmount {
+			// Stop sending if congested, return what we sent
+			return sent, nil
+		}
+		if err := w.tilesDC.Send(*block); err != nil {
+			return sent, err
+		}
+		sent++
+	}
+	return sent, nil
 }
 
 // AddTrack allows callers to attach additional media tracks (webcam/audio).

@@ -40,7 +40,11 @@ func normalizeWebRTCCodec(codec WebRTCCodec) WebRTCCodec {
 }
 
 func newWebRTCEncoderForCodec(codec WebRTCCodec, cfg WebRTCEncoderConfig) (WebRTCEncoder, error) {
-	switch normalizeWebRTCCodec(codec) {
+	normalized := normalizeWebRTCCodec(codec)
+	if isWindowsSinglePipeline() && normalized != WebRTCCodecH264 {
+		return nil, errors.New("webrtc encoder locked to h264 on windows")
+	}
+	switch normalized {
 	case WebRTCCodecH264:
 		return NewH264Encoder(cfg)
 	case WebRTCCodecVP8, WebRTCCodecVP9:

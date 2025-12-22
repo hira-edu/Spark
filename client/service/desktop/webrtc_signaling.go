@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"Rocket/client/ipc"
 	"Rocket/modules"
 	"errors"
 	"fmt"
@@ -22,6 +23,9 @@ const (
 )
 
 var errWebRTCUnsupported = errors.New(`${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`)
+var ErrWebRTCForwarded = errors.New("webrtc forwarded to bridge")
+var localICELogCount atomic.Uint64
+var remoteICELogCount atomic.Uint64
 
 func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	if !isWebRTCEnabled() {
@@ -39,6 +43,12 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	if !isValidSDP(sdpStr) {
 		return nil, errInputInvalid
 	}
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
+		if err != nil {
+			return nil, err
+		}
+		return nil, ErrWebRTCForwarded
+	}
 	sdpType := webrtc.SDPTypeOffer
 	if t, ok := pack.GetData(`type`, reflect.String); ok {
 		if parsed, err := parseSDPType(t.(string)); err == nil {
@@ -52,6 +62,16 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	sess, ok := sessions.Get(desktopID.(string))
 	if !ok {
 		return nil, errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
+	}
+
+	// File-based debug logging for WebRTC signaling
+	signalingLog := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Print(msg)
+		if f, err := os.OpenFile("logs/webrtc_signaling.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintf(f, "[%s] %s", time.Now().Format("15:04:05.000"), msg)
+			f.Close()
+		}
 	}
 
 	// Hold lock for entire session modification to prevent TOCTOU race
@@ -78,6 +98,18 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 			codec = WebRTCCodecVP8
 		}
 	}
+	if isWindowsSinglePipeline() {
+		codec = WebRTCCodecH264
+	}
+
+	var h264Sel h264FmtpSelection
+	if codec == WebRTCCodecH264 {
+		var selErr error
+		h264Sel, selErr = selectH264FmtpFromOffer(sdpStr)
+		if selErr != nil {
+			return nil, fmt.Errorf("h264 negotiation failed: %w", selErr)
+		}
+	}
 
 	// Capture session reference for callbacks
 	sessRef := sess
@@ -87,7 +119,9 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 	rtc, err := NewDesktopWebRTC(WebRTCConfig{
 		Configuration: webrtc.Configuration{ICEServers: iceServers},
 		Codec:         codec,
+		VideoFmtpLine: h264Sel.FmtpLine,
 		OnState: func(state webrtc.PeerConnectionState) {
+			signalingLog("[SIGNALING] PC state=%s\n", state.String())
 			if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 				// Guard against stale callbacks from a previous PeerConnection/offer.
 				// Only clear the current session if it still belongs to this DesktopWebRTC instance.
@@ -121,6 +155,12 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		return nil, err
 	}
 	ownedRTC.Store(rtc)
+	rtc.onICEStateChange = func(state webrtc.ICEConnectionState) {
+		signalingLog("[SIGNALING] ICE state=%s\n", state.String())
+	}
+	rtc.onSignalingChange = func(state webrtc.SignalingState) {
+		signalingLog("[SIGNALING] signaling state=%s\n", state.String())
+	}
 
 	if err := rtc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: sdpType,
@@ -138,14 +178,9 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		return nil, fmt.Errorf("failed to bind video track: %w", err)
 	}
 
-	// File-based debug logging for WebRTC signaling
-	signalingLog := func(format string, args ...interface{}) {
-		msg := fmt.Sprintf(format, args...)
-		fmt.Print(msg)
-		if f, err := os.OpenFile("logs/webrtc_signaling.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-			fmt.Fprintf(f, "[%s] %s", time.Now().Format("15:04:05.000"), msg)
-			f.Close()
-		}
+	if codec == WebRTCCodecH264 && h264Sel.FmtpLine != "" {
+		signalingLog("[SIGNALING] H264 fmtp selected: %s profile=0x%02x constraint=0x%02x level=0x%02x\n",
+			h264Sel.FmtpLine, h264Sel.ProfileID, h264Sel.Constraint, h264Sel.LevelID)
 	}
 	signalingLog("[SIGNALING] BindVideoTrack succeeded, proceeding to CreateAnswer\n")
 
@@ -167,9 +202,35 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 			}
 			needKeyframe := false
 			for _, pkt := range pkts {
-				switch pkt.(type) {
+				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 					needKeyframe = true
+				case *rtcp.ReceiverEstimatedMaximumBitrate:
+					// REMB packet - update adaptive quality manager with receiver's bandwidth estimate
+					// This is the most reliable signal for network congestion
+					sessRef.lock.Lock()
+					if sessRef.rtc != nil && sessRef.rtc.qualityManager != nil {
+						sessRef.rtc.qualityManager.UpdateREMB(int64(p.Bitrate))
+					}
+					sessRef.lock.Unlock()
+				case *rtcp.ReceiverReport:
+					// Extract packet loss from receiver reports for quality adaptation
+					sessRef.lock.Lock()
+					if sessRef.rtc != nil && sessRef.rtc.qualityManager != nil {
+						for _, rr := range p.Reports {
+							// FractionLost is 0-255 (0-100% loss)
+							lossPercent := float64(rr.FractionLost) / 255.0 * 100.0
+							if lossPercent > 0 {
+								// Update with loss info (RTT comes from elsewhere)
+								sessRef.rtc.qualityManager.UpdateNetworkMetrics(
+									sessRef.rtc.qualityManager.rttMs.Load(),
+									lossPercent,
+									sessRef.rtc.qualityManager.queueDepthBytes.Load(),
+								)
+							}
+						}
+					}
+					sessRef.lock.Unlock()
 				}
 				if needKeyframe {
 					break
@@ -189,9 +250,12 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		return nil, err
 	}
 	signalingLog("[SIGNALING] CreateAnswer succeeded, SDP type=%s\n", answer.Type.String())
+	if videoLines := extractVideoSDPLines(answer.SDP); videoLines != "" {
+		signalingLog("[SIGNALING] Answer SDP (video):\n%s\n", videoLines)
+	}
 
 	signalingLog("[SIGNALING] Calling newRTCSession...\n")
-	rtcSess, err := newRTCSession(desktopIDStr, rtc, codec)
+	rtcSess, err := newRTCSession(desktopIDStr, rtc, codec, h264Sel)
 	if err != nil {
 		signalingLog("[SIGNALING] newRTCSession FAILED: %v\n", err)
 		rtc.Close()
@@ -229,6 +293,12 @@ func HandleWebRTCAnswer(pack modules.Packet) error {
 	sdpStr := sdp.(string)
 	if !isValidSDP(sdpStr) {
 		return errInputInvalid
+	}
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
+		if err != nil {
+			return err
+		}
+		return ErrWebRTCForwarded
 	}
 	sdpType := webrtc.SDPTypeAnswer
 	if t, ok := pack.GetData(`type`, reflect.String); ok {
@@ -273,6 +343,12 @@ func HandleWebRTCIce(pack modules.Packet) error {
 	if !isValidICECandidate(candidateStr) {
 		return errInputInvalid
 	}
+	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
+		if err != nil {
+			return err
+		}
+		return ErrWebRTCForwarded
+	}
 	desktopID, ok := pack.GetData(`desktop`, reflect.String)
 	if !ok {
 		return errInputInvalid
@@ -287,6 +363,15 @@ func HandleWebRTCIce(pack modules.Packet) error {
 
 	if sess.escape.Load() || sess.rtc == nil {
 		return errors.New(`${i18n|DESKTOP.SESSION_CLOSED}`)
+	}
+
+	count := remoteICELogCount.Add(1)
+	if count <= 5 || count%50 == 0 {
+		preview := candidateStr
+		if len(preview) > 120 {
+			preview = preview[:120] + "..."
+		}
+		sessionLog("[SIGNALING] remote ICE candidate #%d: %s\n", count, preview)
 	}
 
 	init := webrtc.ICECandidateInit{
@@ -304,7 +389,11 @@ func HandleWebRTCIce(pack modules.Packet) error {
 		val := uint16(line.(float64))
 		init.SDPMLineIndex = &val
 	}
-	return sess.rtc.rtc.AddICECandidate(init)
+	if err := sess.rtc.rtc.AddICECandidate(init); err != nil {
+		sessionLog("[SIGNALING] AddICECandidate failed: %v\n", err)
+		return err
+	}
+	return nil
 }
 
 func notifyICE(desktopID string, c *webrtc.ICECandidate) {
@@ -322,6 +411,15 @@ func notifyICE(desktopID string, c *webrtc.ICECandidate) {
 	candidate := strings.TrimSpace(json.Candidate)
 	if candidate == "" || len(candidate) > maxCandidateLength {
 		return
+	}
+
+	count := localICELogCount.Add(1)
+	if count <= 5 || count%50 == 0 {
+		preview := candidate
+		if len(preview) > 120 {
+			preview = preview[:120] + "..."
+		}
+		sessionLog("[SIGNALING] local ICE candidate #%d: %s\n", count, preview)
 	}
 
 	// Deliver ICE candidates back to the browser via the server desktop event (Event=desktop uuid).
@@ -450,4 +548,33 @@ func parseICEServers(data map[string]any) []webrtc.ICEServer {
 	}
 
 	return servers
+}
+
+func extractVideoSDPLines(sdpStr string) string {
+	if sdpStr == "" {
+		return ""
+	}
+	lines := strings.Split(sdpStr, "\n")
+	inVideo := false
+	out := make([]string, 0, 8)
+	for _, raw := range lines {
+		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "m=") {
+			inVideo = strings.HasPrefix(line, "m=video")
+			if inVideo {
+				out = append(out, line)
+			}
+			continue
+		}
+		if !inVideo {
+			continue
+		}
+		if strings.HasPrefix(line, "a=rtpmap") || strings.HasPrefix(line, "a=fmtp") || strings.HasPrefix(line, "a=rtcp-fb") {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }

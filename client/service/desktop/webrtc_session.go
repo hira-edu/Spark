@@ -8,13 +8,13 @@ import (
 	"image"
 	"math"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/kataras/golog"
+	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	xdraw "golang.org/x/image/draw"
 )
@@ -44,18 +44,21 @@ type adaptiveQualityEncoder interface {
 }
 
 type rtcSession struct {
-	desktopID     string
-	rtc           *DesktopWebRTC
-	encoder       WebRTCEncoder
-	targetFrameNs int64
-	lastSent      int64
-	codec         WebRTCCodec
-	bitrate       int
-	maxWidth      int
-	maxHeight     int
-	scaleBuf      *image.RGBA
-	webcamStop    func()
-	audioStop     func()
+	desktopID      string
+	rtc            *DesktopWebRTC
+	encoder        WebRTCEncoder
+	targetFrameNs  int64
+	lastSent       int64
+	codec          WebRTCCodec
+	bitrate        int
+	maxWidth       int
+	maxHeight      int
+	scaleBuf       *image.RGBA
+	webcamStop     func()
+	audioStop      func()
+	h264ProfileID  uint8
+	h264Constraint uint8
+	h264LevelID    uint8
 
 	frameCh chan rtcFrameRequest
 	stopCh  chan struct{}
@@ -63,12 +66,22 @@ type rtcSession struct {
 
 	onClosed func()
 
+	// Adaptive quality management (REMB-driven bitrate adaptation)
+	qualityManager *AdaptiveQualityManager
+
 	// GPU fallback warning tracking (avoid log spam)
 	gpuFallbackWarned atomic.Bool
 
 	// Debug counters
 	enqueueCount atomic.Int64
 	sendCount    atomic.Int64
+
+	encodeErrorLogged atomic.Bool
+	sendErrorLogged   atomic.Bool
+
+	// Codec fallback tracking
+	consecutiveEncodeErrors atomic.Int32
+	codecFallbackTriggered  atomic.Bool
 }
 
 type rtcFrameRequest struct {
@@ -77,6 +90,9 @@ type rtcFrameRequest struct {
 }
 
 func isWebRTCEnabled() bool {
+	if isWindowsSinglePipeline() {
+		return true
+	}
 	val := strings.TrimSpace(os.Getenv(envWebRTCEnabled))
 	if val == "" {
 		return true
@@ -90,6 +106,9 @@ func isWebRTCEnabled() bool {
 }
 
 func isWebRTCWebcamEnabled() bool {
+	if isWindowsSinglePipeline() {
+		return false
+	}
 	val := strings.TrimSpace(os.Getenv("SPARK_WEBRTC_WEBCAM"))
 	if val == "" {
 		return true
@@ -103,6 +122,9 @@ func isWebRTCWebcamEnabled() bool {
 }
 
 func isWebRTCAudioEnabled() bool {
+	if isWindowsSinglePipeline() {
+		return false
+	}
 	val := strings.TrimSpace(os.Getenv("SPARK_WEBRTC_AUDIO"))
 	if val == "" {
 		return true
@@ -148,18 +170,9 @@ func sessionLog(format string, args ...interface{}) {
 	}
 }
 
-func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rtcSession, error) {
+func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec, h264Sel h264FmtpSelection) (*rtcSession, error) {
 	sessionLog("[SESSION] newRTCSession starting, desktopID=%s, requestedCodec=%s\n", desktopID, string(codec))
-	if codec == "" {
-		envCodec := strings.ToLower(strings.TrimSpace(os.Getenv(envWebRTCCodec)))
-		if envCodec != "" {
-			codec = WebRTCCodec(envCodec)
-		} else if runtime.GOOS == "windows" {
-			codec = WebRTCCodecH264
-		} else {
-			codec = WebRTCCodec(webRTCDefaultCodec)
-		}
-	}
+	codec = WebRTCCodecH264
 	bitrate := parseEnvInt(envWebRTCBitrate, webRTCDefaultBR)
 	fps := parseEnvInt(envWebRTCFPS, webRTCDefaultFPS)
 	if fps <= 0 {
@@ -180,6 +193,9 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 	encoder, actualCodec, err := NewWebRTCEncoder(codec, WebRTCEncoderConfig{
 		BitRate:          bitrate,
 		KeyFrameInterval: 60,
+		H264ProfileID:    h264Sel.ProfileID,
+		H264Constraint:   h264Sel.Constraint,
+		H264LevelID:      h264Sel.LevelID,
 	})
 	if err != nil {
 		sessionLog("[SESSION] NewWebRTCEncoder FAILED: %v\n", err)
@@ -193,32 +209,31 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec) (*rt
 		}
 	}
 	var webcamStop func()
-	if isWebRTCWebcamEnabled() {
-		if stopFn, err := startWebcamTrack(rtc); err == nil {
-			webcamStop = stopFn
-		}
-	}
 	var audioStop func()
-	if isWebRTCAudioEnabled() {
-		if stopFn, err := startAudioTrack(rtc); err == nil {
-			audioStop = stopFn
-		}
-	}
+
+	// Create per-session quality manager for REMB-driven adaptation
+	// This allows each session to adapt independently based on its network conditions
+	sessionQualityManager := NewAdaptiveQualityManager()
+
 	sess := &rtcSession{
-		desktopID:     desktopID,
-		rtc:           rtc,
-		encoder:       encoder,
-		targetFrameNs: int64(time.Second / time.Duration(fps)),
-		codec:         actualCodec,
-		bitrate:       bitrate,
-		maxWidth:      maxWidth,
-		maxHeight:     maxHeight,
+		desktopID:      desktopID,
+		rtc:            rtc,
+		encoder:        encoder,
+		targetFrameNs:  int64(time.Second / time.Duration(fps)),
+		codec:          actualCodec,
+		bitrate:        bitrate,
+		maxWidth:       maxWidth,
+		maxHeight:      maxHeight,
+		h264ProfileID:  h264Sel.ProfileID,
+		h264Constraint: h264Sel.Constraint,
+		h264LevelID:    h264Sel.LevelID,
 		// Default queue size is aligned with Sunshine's proven 30-slot encode session queue.
 		// Override via SPARK_WEBRTC_FRAME_QUEUE for perf/low-latency runs.
-		frameCh:    make(chan rtcFrameRequest, queueSize),
-		stopCh:     make(chan struct{}),
-		webcamStop: webcamStop,
-		audioStop:  audioStop,
+		frameCh:        make(chan rtcFrameRequest, queueSize),
+		stopCh:         make(chan struct{}),
+		webcamStop:     webcamStop,
+		audioStop:      audioStop,
+		qualityManager: sessionQualityManager,
 	}
 	sess.start()
 	return sess, nil
@@ -339,6 +354,12 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 	}
 	defer req.frame.Close()
 
+	connState := r.rtc.ConnectionState()
+	if connState == webrtc.PeerConnectionStateFailed || connState == webrtc.PeerConnectionStateClosed {
+		return
+	}
+	iceState := r.rtc.ICEConnectionState()
+
 	startNs := time.Now().UnixNano()
 	last := atomic.LoadInt64(&r.lastSent)
 	if last != 0 && startNs-last < r.targetFrameNs {
@@ -346,10 +367,97 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 	}
 
 	cnt := r.sendCount.Add(1)
+	if connState != webrtc.PeerConnectionStateConnected {
+		if cnt <= 5 || cnt%300 == 0 {
+			sessionLog("[SESSION] sendQueued: peer not connected (state=%s ice=%s), continuing\n",
+				connState.String(), iceState.String())
+		}
+	}
 
 	duration := req.duration
 	if duration <= 0 {
 		duration = time.Second / 30
+	}
+
+	if isWindowsSinglePipeline() {
+		if req.frame.GPU == nil || req.frame.GPU.Backend != "dxgi_nv12" {
+			r.logGPUFallbackWarningOnce()
+			return
+		}
+		enc, ok := r.encoder.(frameEncoder)
+		if !ok {
+			if r.encodeErrorLogged.CompareAndSwap(false, true) {
+				sessionLog("[SESSION] EncodeFrame unavailable in single-pipeline mode\n")
+			}
+			r.close()
+			return
+		}
+		if cnt <= 5 || cnt%300 == 0 {
+			sessionLog("[SESSION] frame=%d calling EncodeFrame (GPU-only)\n", cnt)
+		}
+		sample, err := enc.EncodeFrame(req.frame, duration)
+		if err != nil {
+			// Track consecutive encode errors for potential codec fallback
+			errCount := r.consecutiveEncodeErrors.Add(1)
+
+			if errors.Is(err, ErrWebRTCEncoderTimeout) {
+				if cnt <= 5 || cnt%300 == 0 {
+					sessionLog("[SESSION] frame=%d ErrWebRTCEncoderTimeout (dropped, single-pipeline)\n", cnt)
+				}
+				// Timeout errors don't close session but may trigger fallback
+				// Reduced threshold since encoder now has internal recovery at 3 errors
+				if errCount >= 5 && r.codecFallbackTriggered.CompareAndSwap(false, true) {
+					golog.Warnf("[WEBRTC_ENCODE] codec fallback recommended: %d consecutive timeouts, codec=%s", errCount, string(r.codec))
+					// TODO: Implement actual codec switch to VP8/VP9 when H.264 consistently fails
+					// For now, log and reduce quality via adaptive quality manager
+					if r.qualityManager != nil {
+						r.qualityManager.UpdateNetworkMetrics(500, 10.0, 1024*1024) // Force quality downgrade
+					}
+				}
+				return
+			}
+			if r.encodeErrorLogged.CompareAndSwap(false, true) {
+				sessionLog("[SESSION] EncodeFrame failed: %v\n", err)
+			}
+			golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s consecutiveErrors=%d", err.Error(), string(r.codec), errCount)
+
+			// After 5 consecutive hard errors, close session
+			if errCount >= 5 {
+				r.close()
+			}
+			return
+		}
+		// Reset error counter on successful encode
+		r.consecutiveEncodeErrors.Store(0)
+		if len(sample.Data) == 0 {
+			if cnt <= 5 || cnt%300 == 0 {
+				sessionLog("[SESSION] frame=%d empty sample (encoder warmup)\n", cnt)
+			}
+			return
+		}
+		sendDuration := sample.Duration
+		if sendDuration <= 0 {
+			sendDuration = duration
+		}
+		if cnt <= 5 || cnt%300 == 0 {
+			sessionLog("[SESSION] frame=%d sending %d bytes via RTP\n", cnt, len(sample.Data))
+		}
+		if err := r.rtc.SendFrame(sample.Data, sendDuration); err != nil {
+			state := r.rtc.ConnectionState()
+			if state == webrtc.PeerConnectionStateConnected {
+				if r.sendErrorLogged.CompareAndSwap(false, true) {
+					sessionLog("[SESSION] SendFrame failed (gpu=true): %v\n", err)
+				}
+				golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=true", err.Error(), string(r.codec))
+				r.close()
+			}
+			return
+		}
+		if cnt <= 5 || cnt%300 == 0 {
+			sessionLog("[SESSION] frame=%d sent successfully\n", cnt)
+		}
+		atomic.StoreInt64(&r.lastSent, startNs)
+		return
 	}
 
 	// Prefer GPU path when available.
@@ -362,7 +470,13 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 			if err != nil {
 				if errors.Is(err, ErrWebRTCEncoderTimeout) {
 					// Treat as a dropped frame (e.g., encoder buffering / no output ready yet).
+					if cnt <= 5 || cnt%300 == 0 {
+						sessionLog("[SESSION] frame=%d ErrWebRTCEncoderTimeout (dropped)\n", cnt)
+					}
 					return
+				}
+				if r.encodeErrorLogged.CompareAndSwap(false, true) {
+					sessionLog("[SESSION] EncodeFrame failed: %v\n", err)
 				}
 				golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s", err.Error(), string(r.codec))
 				r.close()
@@ -377,9 +491,29 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 			if sendDuration <= 0 {
 				sendDuration = duration
 			}
+			// Send perf metadata BEFORE video frame for accurate latency measurement.
+			// This ensures the browser has the capture timestamp before it renders the frame.
+			if req.frame.CaptureTimeNs > 0 {
+				tsMs := req.frame.CaptureTimeNs / 1_000_000
+				payload, err := json.Marshal(map[string]any{
+					"captureTs": tsMs,
+				})
+				if err == nil {
+					if cnt <= 10 || cnt%100 == 0 {
+						sessionLog("[PERF] sending perf metadata: captureTs=%d\n", tsMs)
+					}
+					r.rtc.SendPerfMetadata(payload)
+				}
+			}
 			if err := r.rtc.SendFrame(sample.Data, sendDuration); err != nil {
-				golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=true", err.Error(), string(r.codec))
-				r.close()
+				state := r.rtc.ConnectionState()
+				if state == webrtc.PeerConnectionStateConnected {
+					if r.sendErrorLogged.CompareAndSwap(false, true) {
+						sessionLog("[SESSION] SendFrame failed (gpu=true): %v\n", err)
+					}
+					golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=true", err.Error(), string(r.codec))
+					r.close()
+				}
 				return
 			}
 			atomic.StoreInt64(&r.lastSent, startNs)
@@ -411,6 +545,9 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 			// Treat as a dropped frame (e.g., encoder buffering / no output ready yet).
 			return
 		}
+		if r.encodeErrorLogged.CompareAndSwap(false, true) {
+			sessionLog("[SESSION] Encode (cpu) failed: %v\n", err)
+		}
 		r.close()
 		return
 	}
@@ -422,9 +559,28 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 	if sendDuration <= 0 {
 		sendDuration = duration
 	}
+	// Send perf metadata BEFORE video frame for accurate latency measurement.
+	if req.frame.CaptureTimeNs > 0 {
+		tsMs := req.frame.CaptureTimeNs / 1_000_000
+		payload, err := json.Marshal(map[string]any{
+			"captureTs": tsMs,
+		})
+		if err == nil {
+			if cnt <= 10 || cnt%100 == 0 {
+				sessionLog("[PERF] sending perf metadata: captureTs=%d\n", tsMs)
+			}
+			r.rtc.SendPerfMetadata(payload)
+		}
+	}
 	if err := r.rtc.SendFrame(sample.Data, sendDuration); err != nil {
-		golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=false", err.Error(), string(r.codec))
-		r.close()
+		state := r.rtc.ConnectionState()
+		if state == webrtc.PeerConnectionStateConnected {
+			if r.sendErrorLogged.CompareAndSwap(false, true) {
+				sessionLog("[SESSION] SendFrame failed (gpu=false): %v\n", err)
+			}
+			golog.Warnf("[WEBRTC_SEND] SendFrame failed error=%s codec=%s gpu=false", err.Error(), string(r.codec))
+			r.close()
+		}
 		return
 	}
 	atomic.StoreInt64(&r.lastSent, startNs)
@@ -564,16 +720,25 @@ func handleRTCInput(desktopID string, payload []byte) error {
 			delete(data, `allowControl`)
 			return HandleConfig(modules.Packet{Act: act, Event: desktopID, Data: data})
 		case `DESKTOP_CLIPBOARD`:
+			if isWindowsSinglePipeline() {
+				return errInputUnsupported
+			}
 			if !sess.allowControl.Load() {
 				return errInputUnsupported
 			}
 			return HandleClipboard(modules.Packet{Act: act, Event: desktopID, Data: data})
 		case `DESKTOP_FILE_DROP`:
+			if isWindowsSinglePipeline() {
+				return errInputUnsupported
+			}
 			if !sess.allowControl.Load() {
 				return errInputUnsupported
 			}
 			return HandleFileDrop(modules.Packet{Act: act, Event: desktopID, Data: data})
 		case `DESKTOP_AUDIO`:
+			if isWindowsSinglePipeline() {
+				return errInputUnsupported
+			}
 			if !sess.allowControl.Load() {
 				return errInputUnsupported
 			}

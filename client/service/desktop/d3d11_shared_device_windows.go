@@ -249,6 +249,9 @@ func (s *iDXGISurface) Unmap() {
 
 // NewNV12ReadbackContext creates a context for reading NV12 GPU textures to CPU.
 func NewNV12ReadbackContext(device *iD3D11Device) (*NV12ReadbackContext, error) {
+	if envIsTruthy("SPARK_H264_HW_ONLY") {
+		return nil, fmt.Errorf("NV12ReadbackContext is disabled in hardware-only mode (SPARK_H264_HW_ONLY)")
+	}
 	if device == nil {
 		return nil, fmt.Errorf("nil device")
 	}

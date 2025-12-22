@@ -544,7 +544,7 @@ func (c *DXGINV12Capturer) Capture() (*CaptureFrame, error) {
 		return nil, err
 	}
 
-	release := acquireNV12Lease(c.videoProcessor, nv12Texture)
+	release := acquireNV12Lease(c.videoProcessor.ReturnTexture, nv12Texture)
 
 	c.frameCount.Add(1)
 	c.lastFrameTime = time.Now()
@@ -694,6 +694,16 @@ func (d *iD3D11Device) QueryInterface(iid *windows.GUID) (unsafe.Pointer, error)
 		return nil, err
 	}
 	return result, nil
+}
+
+// GetDeviceRemovedReason returns the reason code if the device has been removed.
+// Returns 0 (S_OK) if the device is operating normally.
+func (d *iD3D11Device) GetDeviceRemovedReason() int32 {
+	if d == nil || d.vtbl == nil {
+		return -1
+	}
+	r0, _, _ := syscall.SyscallN(d.vtbl.GetDeviceRemovedReason, uintptr(unsafe.Pointer(d)))
+	return int32(r0)
 }
 
 type iD3D11DeviceContext struct {

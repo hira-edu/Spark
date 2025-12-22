@@ -24,6 +24,11 @@ type AdaptiveQualityManager struct {
 	packetLossRate  atomic.Uint32 // Packet loss as percentage * 100 (e.g., 150 = 1.5%)
 	queueDepthBytes atomic.Int64  // Pending bytes in send queue
 
+	// REMB (Receiver Estimated Maximum Bitrate) from RTCP feedback
+	// This is the most reliable bandwidth estimate from the receiver
+	rembBitrate   atomic.Int64 // REMB bitrate in bps (0 = not received)
+	rembUpdatedAt atomic.Int64 // Unix nano timestamp of last REMB update
+
 	// Quality parameters (atomic for lock-free updates)
 	currentJPEGQuality atomic.Int32 // Current JPEG quality (1-100)
 	currentBitrate     atomic.Int32 // Current bitrate in bps
@@ -37,6 +42,7 @@ type AdaptiveQualityManager struct {
 	qualityUpgrades   atomic.Uint64 // Count of quality increases
 	qualityDowngrades atomic.Uint64 // Count of quality decreases
 	droppedFrames     atomic.Uint64 // Frames dropped due to size/backpressure
+	rembDowngrades    atomic.Uint64 // Count of downgrades due to REMB limit
 }
 
 // Quality tier constants based on 2025 ABR best practices
@@ -100,6 +106,24 @@ func (aqm *AdaptiveQualityManager) UpdateQueueDepth(queueBytes int64) {
 	aqm.queueDepthBytes.Store(queueBytes)
 }
 
+// UpdateREMB updates the Receiver Estimated Maximum Bitrate from RTCP feedback.
+// This is the most reliable bandwidth estimate and should be used to cap the bitrate.
+func (aqm *AdaptiveQualityManager) UpdateREMB(bitrateBps int64) {
+	aqm.rembBitrate.Store(bitrateBps)
+	aqm.rembUpdatedAt.Store(time.Now().UnixNano())
+}
+
+// GetREMB returns the current REMB value and whether it's still valid (updated within 5s).
+func (aqm *AdaptiveQualityManager) GetREMB() (bitrateBps int64, valid bool) {
+	bitrateBps = aqm.rembBitrate.Load()
+	if bitrateBps == 0 {
+		return 0, false
+	}
+	updatedAt := aqm.rembUpdatedAt.Load()
+	age := time.Duration(time.Now().UnixNano() - updatedAt)
+	return bitrateBps, age < 5*time.Second
+}
+
 // Adapt analyzes current network conditions and adjusts quality parameters if needed.
 // Returns true if quality was changed. Uses hysteresis to prevent oscillation.
 func (aqm *AdaptiveQualityManager) Adapt() bool {
@@ -131,15 +155,38 @@ func (aqm *AdaptiveQualityManager) Adapt() bool {
 	var newBitrate int32
 	var changed bool
 
+	// Check REMB (receiver-estimated max bitrate) first - this is the most reliable signal
+	rembBps, rembValid := aqm.GetREMB()
+	var rembCappedTier int32 = -1 // -1 means no cap
+	if rembValid && rembBps > 0 {
+		// Determine max quality tier allowed by REMB
+		if rembBps >= BitrateHigh {
+			rembCappedTier = JPEGQualityHigh
+		} else if rembBps >= BitrateMedium {
+			rembCappedTier = JPEGQualityMedium
+		} else {
+			rembCappedTier = JPEGQualityLow
+		}
+	}
+
 	// Determine target tier based on score with hysteresis
 	// Upgrade threshold: 70+ (avoid premature upgrades)
 	// Downgrade threshold: 40- (quick response to degradation)
 	if score >= 70 && currentQuality < JPEGQualityHigh {
-		// Upgrade to high quality
-		newQuality = JPEGQualityHigh
-		newBitrate = BitrateHigh
-		aqm.qualityUpgrades.Add(1)
-		changed = true
+		// Upgrade to high quality (if REMB allows)
+		if rembCappedTier < 0 || rembCappedTier >= JPEGQualityHigh {
+			newQuality = JPEGQualityHigh
+			newBitrate = BitrateHigh
+			aqm.qualityUpgrades.Add(1)
+			changed = true
+		} else if rembCappedTier >= JPEGQualityMedium && currentQuality < JPEGQualityMedium {
+			// REMB caps us at medium, but we can still upgrade from low
+			newQuality = JPEGQualityMedium
+			newBitrate = BitrateMedium
+			aqm.qualityUpgrades.Add(1)
+			aqm.rembDowngrades.Add(1) // Count as REMB-capped
+			changed = true
+		}
 	} else if score >= 50 && score < 70 {
 		// Medium quality range
 		if currentQuality != JPEGQualityMedium {
@@ -157,6 +204,20 @@ func (aqm *AdaptiveQualityManager) Adapt() bool {
 		newQuality = JPEGQualityLow
 		newBitrate = BitrateLow
 		aqm.qualityDowngrades.Add(1)
+		changed = true
+	}
+
+	// Apply REMB cap even if score-based logic didn't trigger a change
+	if !changed && rembCappedTier >= 0 && currentQuality > rembCappedTier {
+		// REMB says we're sending too fast - downgrade
+		if rembCappedTier >= JPEGQualityMedium {
+			newQuality = JPEGQualityMedium
+			newBitrate = BitrateMedium
+		} else {
+			newQuality = JPEGQualityLow
+			newBitrate = BitrateLow
+		}
+		aqm.rembDowngrades.Add(1)
 		changed = true
 	}
 

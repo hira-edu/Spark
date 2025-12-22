@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/StackExchange/wmi"
-	"golang.org/x/sys/windows"
 )
 
 type wmiVideoController struct {
@@ -17,16 +16,8 @@ type wmiVideoController struct {
 func platformHardwareProbe() *HardwareCodecSupport {
 	support := &HardwareCodecSupport{}
 
-	if err := windows.NewLazySystemDLL("mfplat.dll").Load(); err == nil {
+	if err := loadNVENC(); err == nil {
 		support.H264Available = true
-	}
-
-	hevcDLLs := []string{"mfhevcenc.dll", "mfh265enc.dll"}
-	for _, dll := range hevcDLLs {
-		if err := windows.NewLazySystemDLL(dll).Load(); err == nil {
-			support.H265Available = true
-			break
-		}
 	}
 
 	var controllers []wmiVideoController
@@ -37,16 +28,12 @@ func platformHardwareProbe() *HardwareCodecSupport {
 			case strings.Contains(vendor, "nvidia"):
 				support.VP8Available = true
 				support.VP9Available = true
-				support.H264Available = true
-				support.H265Available = true
 			case strings.Contains(vendor, "amd"), strings.Contains(vendor, "radeon"):
 				support.VP8Available = true
 				support.VP9Available = true
-				support.H264Available = true
 			case strings.Contains(vendor, "intel"):
 				support.VP8Available = true
 				support.VP9Available = true
-				support.H264Available = true
 			}
 		}
 	}
