@@ -53,6 +53,21 @@ function Guest() {
 	const inputActiveRef = useRef(false);
 	const focusRef = useRef(false);
 	const allowControlRef = useRef(false);
+	// Toast spam prevention: track last toast to avoid duplicates within 3 seconds
+	const lastToastRef = useRef({ at: 0, msg: '' });
+
+	// Show toast with spam prevention (same message within 3s is suppressed)
+	const showToast = (type, msg) => {
+		const now = Date.now();
+		const last = lastToastRef.current;
+		if (last.msg === msg && now - last.at < 3000) return;
+		lastToastRef.current = { at: now, msg };
+		if (type === 'warning') message.warning(msg);
+		else if (type === 'error') message.error(msg);
+		else if (type === 'success') message.success(msg);
+		else message.info(msg);
+	};
+
 	const handleMouseLeave = () => { focusRef.current = false; };
 	const handleCanvasFocus = () => { focusRef.current = true; };
 	const handleCanvasBlur = () => { focusRef.current = false; };
@@ -361,7 +376,7 @@ function Guest() {
 		try {
 			if (data?.act === 'DESKTOP_WEBRTC_ANSWER') {
 				if (data.code && data.code !== 0) {
-					message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+					showToast('warning', data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
 					stopWebRTC();
 					return;
 				}
@@ -376,15 +391,15 @@ function Guest() {
 				return;
 			}
 			if (data?.act === 'DESKTOP_INPUT' && data.code && data.code !== 0) {
-				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				showToast('warning', data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
 				return;
 			}
 			if (data?.act === 'WARN') {
-				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				showToast('warning', data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
 				return;
 			}
 			if (data?.act === 'QUIT') {
-				message.warning(data.msg ? translate(data.msg) : i18n.t('COMMON.UNKNOWN_ERROR'));
+				showToast('warning', data.msg ? translate(data.msg) : i18n.t('DESKTOP.SESSION_CLOSED'));
 				setStatus('disconnected');
 				cleanupAll();
 			}

@@ -148,13 +148,16 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 			appendMode(CaptureBackendNVFBC)
 		}
 	} else {
-		// Prefer GPU-native NV12 in non-bridge mode for best performance.
-		appendMode(CaptureBackendDXGI_NV12) // Try GPU-native NV12 first
+		// DISABLED: GPU-native NV12 produces GPU-only frames which require hardware H.264 encoding.
+		// Hardware encoding fails on AMD GPUs (MEError after first frame), so we skip it for now.
+		// Use standard DXGI (produces CPU images for tile encoding) as the primary path.
+		// TODO: Re-enable DXGI_NV12 when hardware encoder issues are fixed across Intel/AMD/NVIDIA.
+		// appendMode(CaptureBackendDXGI_NV12) // DISABLED - hardware encoder broken on AMD
 		if nvfbcSupported() {
 			appendMode(CaptureBackendNVFBC)
 		}
-		appendMode(CaptureBackendDXGI) // Fallback to standard DXGI
-		appendMode(CaptureBackendGDI)
+		appendMode(CaptureBackendDXGI) // Standard DXGI - produces CPU images
+		appendMode(CaptureBackendGDI)  // Fallback
 	}
 
 	if len(final) == 0 {
@@ -845,6 +848,26 @@ func (s *Screen) Init(displayIndex uint, rect image.Rectangle) {
 			release()
 		}
 		return err
+	}
+
+	if isWindowsSinglePipeline() {
+		dxgiNV12 := &ScreenDXGINV12{displayIndex: displayIndex, rect: rect}
+		if err := tryInit("dxgi_nv12", func() error { return dxgiNV12.Init(displayIndex, rect) }, dxgiNV12.Release); err != nil {
+			telemetry.LogStructured("ERROR", "DXGI NV12 initialization failed (single pipeline)", map[string]interface{}{
+				"display": displayIndex,
+				"error":   err.Error(),
+			})
+			return
+		}
+		s.screen = dxgiNV12
+		setActiveCaptureBackend("dxgi_nv12")
+		setCaptureD3D11Device(dxgiNV12.GetD3D11Device())
+		telemetry.LogStructured("INFO", "Desktop capture initialized (DXGI NV12 only)", map[string]interface{}{
+			"display": displayIndex,
+			"rect":    rect.String(),
+			"backend": "dxgi_nv12",
+		})
+		return
 	}
 
 	desired := getConfiguredCaptureBackend()

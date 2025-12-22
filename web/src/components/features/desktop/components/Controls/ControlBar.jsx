@@ -1,7 +1,5 @@
 import React from 'react';
 import { DesktopOutlined } from '@ant-design/icons';
-import CodecSelector from './CodecSelector';
-import QualitySlider from './QualitySlider';
 import FPSSelector from './FPSSelector';
 import InputToggle from './InputToggle';
 import ActionButtons from './ActionButtons';
@@ -25,12 +23,6 @@ const KeyboardIcon = () => (
  * ControlBar - Bottom control bar for desktop viewer
  */
 const ControlBar = ({
-  codec,
-  onCodecChange,
-  quality,
-  onQualityChange,
-  qualityAuto,
-  onQualityAutoChange,
   targetFps,
   onFpsChange,
   allowControl = true,
@@ -39,7 +31,6 @@ const ControlBar = ({
   keyboardEnabled,
   onKeyboardToggle,
   onScreenshot,
-  onClipboard,
   isFullscreen,
   onFullscreen,
   monitors = [],
@@ -50,20 +41,6 @@ const ControlBar = ({
   return (
     <div className="control-bar">
       <div className="control-bar-left">
-        <CodecSelector
-          value={codec}
-          onChange={onCodecChange}
-          disabled={disabled}
-        />
-        <div className="control-divider" />
-        <QualitySlider
-          value={quality}
-          onChange={onQualityChange}
-          auto={codec === 'jpeg' ? qualityAuto : false}
-          onAutoChange={codec === 'jpeg' ? onQualityAutoChange : undefined}
-          disabled={disabled || codec !== 'jpeg'}
-        />
-        <div className="control-divider" />
         <FPSSelector
           value={targetFps}
           onChange={onFpsChange}
@@ -107,8 +84,6 @@ const ControlBar = ({
         />
         <ActionButtons
           onScreenshot={onScreenshot}
-          onClipboard={onClipboard}
-          clipboardDisabled={!allowControl}
           isFullscreen={isFullscreen}
           onFullscreen={onFullscreen}
           disabled={disabled}

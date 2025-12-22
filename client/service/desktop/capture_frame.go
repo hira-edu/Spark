@@ -6,8 +6,9 @@ import "image"
 // CPU callers should read Image (if non-nil) while GPU-aware codecs can inspect
 // GPU to leverage zero-copy pipelines.
 type CaptureFrame struct {
-	Image *image.RGBA
-	GPU   *GPUFrame
+	Image         *image.RGBA
+	GPU           *GPUFrame
+	CaptureTimeNs int64
 }
 
 // GPUFrame carries metadata about a GPU surface returned by a capture backend.

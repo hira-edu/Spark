@@ -37,9 +37,9 @@ function preferH264Codec(transceiver) {
   const h264 = codecs.filter((c) => (c?.mimeType || '').toLowerCase() === 'video/h264');
   if (h264.length === 0) return;
 
-  const rest = codecs.filter((c) => (c?.mimeType || '').toLowerCase() !== 'video/h264');
   try {
-    transceiver.setCodecPreferences([...h264, ...rest]);
+    // Hard-lock to H.264 to match the Windows hardware pipeline.
+    transceiver.setCodecPreferences(h264);
   } catch (_) {
     // Codec preference is best-effort; ignore browsers that reject custom ordering.
   }
@@ -50,16 +50,29 @@ export function useDesktopWebRTC({
   allowControl = true,
   sendSignal = null,
   iceServers = null,
+  onTileData = null, // Callback for tile data received via WebRTC data channel
 } = {}) {
   const videoRef = useRef(null);
   const pcRef = useRef(null);
   const dcRef = useRef(null);
+  const tilesDcRef = useRef(null); // Desktop-tiles data channel
   const iceKeyRef = useRef('');
+  const pendingIceRef = useRef([]);
+  const perfStatsRef = useRef({ lastCaptureTs: 0, samples: [] });
+  const startingRef = useRef(false); // Guard against concurrent start() calls
+  const onTileDataRef = useRef(onTileData); // Ref to avoid stale closures
 
   const [status, setStatus] = useState('off'); // off | connecting | connected | failed
   const [controlChannel, setControlChannel] = useState(null);
+  const [tilesChannel, setTilesChannel] = useState(null); // Tiles data channel state
   const [hasVideo, setHasVideo] = useState(false);
   const [videoFps, setVideoFps] = useState(0);
+  const [latencyMs, setLatencyMs] = useState(0);
+
+  // Keep onTileData ref updated
+  useEffect(() => {
+    onTileDataRef.current = onTileData;
+  }, [onTileData]);
 
   // FPS tracking via requestVideoFrameCallback
   const fpsCountRef = useRef(0);
@@ -76,12 +89,23 @@ export function useDesktopWebRTC({
     setStatus('off');
     setHasVideo(false);
     setControlChannel(null);
+    setTilesChannel(null);
+    setLatencyMs(0);
+    perfStatsRef.current = { lastCaptureTs: 0, samples: [] };
     iceKeyRef.current = '';
+    pendingIceRef.current = [];
+    startingRef.current = false; // Allow restart after stop
 
     const dc = dcRef.current;
     dcRef.current = null;
     if (dc) {
       try { dc.close(); } catch (_) {}
+    }
+
+    const tilesDc = tilesDcRef.current;
+    tilesDcRef.current = null;
+    if (tilesDc) {
+      try { tilesDc.close(); } catch (_) {}
     }
 
     const pc = pcRef.current;
@@ -97,11 +121,17 @@ export function useDesktopWebRTC({
   }, []);
 
   const start = useCallback(async () => {
-    console.log('[WebRTC] start called', { enabled, hasSendSignal: !!sendSignal, existingPC: !!pcRef.current });
+    console.log('[WebRTC] start called', { enabled, hasSendSignal: !!sendSignal, existingPC: !!pcRef.current, starting: startingRef.current });
     if (!enabled) return;
     if (typeof RTCPeerConnection === 'undefined') return;
     if (!sendSignal) return;
     if (pcRef.current) return;
+    // Prevent concurrent start() calls - use ref to guard against React effect re-runs
+    if (startingRef.current) {
+      console.log('[WebRTC] start already in progress, skipping');
+      return;
+    }
+    startingRef.current = true;
 
     setStatus('connecting');
     setHasVideo(false);
@@ -125,6 +155,58 @@ export function useDesktopWebRTC({
       setControlChannel(null);
     };
     dc.onerror = () => {};
+
+    // Data channel handler (receives perf-metadata and desktop-tiles from server)
+    pc.ondatachannel = (e) => {
+      const { channel } = e;
+      if (!channel) return;
+      console.log(`[WebRTC] ondatachannel: ${channel.label}`);
+
+      // Handle perf-metadata channel
+      if (channel.label === 'perf-metadata') {
+        channel.onmessage = (msg) => {
+          try {
+            const { captureTs } = JSON.parse(msg.data);
+            if (typeof captureTs === 'number' && captureTs > 0) {
+              perfStatsRef.current.lastCaptureTs = captureTs;
+            }
+          } catch (err) {
+            console.error(`[PERF] onmessage error: ${err.message}`);
+          }
+        };
+        return;
+      }
+
+      // Handle desktop-tiles channel (low-latency tile delivery)
+      if (channel.label === 'desktop-tiles') {
+        channel.binaryType = 'arraybuffer';
+        tilesDcRef.current = channel;
+        setTilesChannel(channel);
+
+        channel.onmessage = (msg) => {
+          // Forward tile data to callback
+          if (onTileDataRef.current && msg.data) {
+            try {
+              onTileDataRef.current(msg.data);
+            } catch (err) {
+              console.error(`[TILES] onmessage error: ${err.message}`);
+            }
+          }
+        };
+
+        channel.onclose = () => {
+          if (tilesDcRef.current === channel) {
+            tilesDcRef.current = null;
+          }
+          setTilesChannel(null);
+        };
+
+        channel.onerror = (err) => {
+          console.error(`[TILES] channel error:`, err);
+        };
+        return;
+      }
+    };
 
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
@@ -203,12 +285,18 @@ export function useDesktopWebRTC({
     }
   }, [allowControl, effectiveIceKey, effectiveIceServers, enabled, sendSignal, stop]);
 
-  // If ICE servers arrive late (e.g., TURN credentials), restart an in-progress
-  // connection attempt so the new config can actually be applied.
+  // If ICE servers change while connecting and ICE has already failed,
+  // restart with the new config (e.g., TURN credentials arrived).
+  // Do NOT restart if ICE is still "checking" - let the current attempt complete.
+  // This prevents double-offer race conditions when config arrives during active negotiation.
   useEffect(() => {
     const pc = pcRef.current;
     if (!pc) return;
+    // Already connected - no need to restart
     if (pc.connectionState === 'connected') return;
+    // Only restart if ICE actually failed - checking/new means connection may still succeed
+    if (pc.iceConnectionState !== 'failed' && pc.iceConnectionState !== 'disconnected') return;
+    // ICE key changed and ICE failed - restart with new config
     if (iceKeyRef.current && iceKeyRef.current !== effectiveIceKey) {
       stop();
       start();
@@ -234,18 +322,38 @@ export function useDesktopWebRTC({
     const data = msg.data || msg;
     if (act === 'DESKTOP_WEBRTC_ANSWER' && data?.sdp) {
       console.log('[WebRTC] received answer, sdp length:', data.sdp?.length);
+      if (pc.signalingState !== 'have-local-offer') {
+        console.warn('[WebRTC] ignoring answer in signaling state:', pc.signalingState);
+        return;
+      }
       pc.setRemoteDescription({ type: data.type || 'answer', sdp: data.sdp })
-        .then(() => console.log('[WebRTC] remote description set'))
+        .then(() => {
+          console.log('[WebRTC] remote description set');
+          const pending = pendingIceRef.current;
+          if (pending.length) {
+            pendingIceRef.current = [];
+            pending.forEach((candidate) => {
+              pc.addIceCandidate(candidate)
+                .catch((err) => console.error('[WebRTC] addIceCandidate failed:', err));
+            });
+          }
+        })
         .catch((err) => console.error('[WebRTC] setRemoteDescription failed:', err));
       return;
     }
     if (act === 'DESKTOP_WEBRTC_ICE' && data?.candidate) {
       console.log('[WebRTC] adding ICE candidate');
-      pc.addIceCandidate({
+      const candidate = {
         candidate: data.candidate,
         sdpMid: data.sdpMid,
         sdpMLineIndex: data.mLine ?? data.sdpMLineIndex,
-      }).catch((err) => console.error('[WebRTC] addIceCandidate failed:', err));
+      };
+      if (!pc.remoteDescription) {
+        pendingIceRef.current.push(candidate);
+        return;
+      }
+      pc.addIceCandidate(candidate)
+        .catch((err) => console.error('[WebRTC] addIceCandidate failed:', err));
     }
   }, [stop]);
 
@@ -255,32 +363,47 @@ export function useDesktopWebRTC({
     }
   }, [enabled, stop]);
 
-  // FPS tracking effect using requestVideoFrameCallback
+  // FPS and latency tracking effect
   useEffect(() => {
     if (!hasVideo) {
       setVideoFps(0);
+      setLatencyMs(0);
       return;
     }
 
     const video = videoRef.current;
     if (!video) {
       setVideoFps(0);
+      setLatencyMs(0);
       return;
     }
 
-    // Reset counter
-    fpsCountRef.current = 0;
+    // Expose perf stats on window for e2e tests
+    window.__rocketPerfMetrics = perfStatsRef.current;
 
-    // Use requestVideoFrameCallback if available (modern browsers)
+    fpsCountRef.current = 0;
+    perfStatsRef.current.samples = [];
+
     if (typeof video.requestVideoFrameCallback === 'function') {
       const countFrame = () => {
         fpsCountRef.current++;
+        const now = Date.now();
+        const captureTs = perfStatsRef.current.lastCaptureTs;
+        if (captureTs > 0) {
+          const latency = now - captureTs;
+          if (latency >= 0 && latency < 10000) {
+            if (perfStatsRef.current.samples.length < 10) {
+              console.log(`[PERF] latency sample: ${latency} (now=${now}, capture=${captureTs})`);
+            }
+            perfStatsRef.current.samples.push(latency);
+            setLatencyMs(latency);
+          }
+        }
         fpsCallbackRef.current = video.requestVideoFrameCallback(countFrame);
       };
       fpsCallbackRef.current = video.requestVideoFrameCallback(countFrame);
     }
 
-    // Report FPS every second
     fpsIntervalRef.current = setInterval(() => {
       setVideoFps(fpsCountRef.current);
       fpsCountRef.current = 0;
@@ -298,6 +421,10 @@ export function useDesktopWebRTC({
       }
       fpsCallbackRef.current = null;
       fpsCountRef.current = 0;
+      perfStatsRef.current = { lastCaptureTs: 0, samples: [] };
+      if (window.__rocketPerfMetrics === perfStatsRef.current) {
+        delete window.__rocketPerfMetrics;
+      }
     };
   }, [hasVideo]);
 
@@ -307,7 +434,10 @@ export function useDesktopWebRTC({
     hasVideo,
     isActive: status === 'connected' && hasVideo,
     controlChannel,
+    tilesChannel, // WebRTC data channel for low-latency tile delivery
     videoFps,
+    latencyMs,
+    perfStats: perfStatsRef.current,
     start,
     stop,
     handleSignalMessage,

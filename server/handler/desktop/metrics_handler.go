@@ -25,6 +25,7 @@ func GetDesktopMetrics(ctx *gin.Context) {
 			Data: gin.H{
 				"metrics":  envelope,
 				"counters": desktopCounterSnapshot(),
+				"latency":  GetLatencyMetrics(),
 			},
 		})
 		return
@@ -35,6 +36,15 @@ func GetDesktopMetrics(ctx *gin.Context) {
 		Data: gin.H{
 			"metrics":  nil,
 			"counters": desktopCounterSnapshot(),
+			"latency":  GetLatencyMetrics(),
 		},
+	})
+}
+
+// GetLatencyHistograms returns latency histogram data in Prometheus-compatible format.
+func GetLatencyHistograms(ctx *gin.Context) {
+	ctx.JSON(http.StatusOK, modules.Packet{
+		Code: 0,
+		Data: GetLatencyMetrics(),
 	})
 }

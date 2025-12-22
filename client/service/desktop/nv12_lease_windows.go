@@ -9,22 +9,22 @@ import (
 )
 
 type nv12Lease struct {
-	vp   *VideoProcessor
-	tex  *iD3D11Texture2D
-	refs atomic.Int32
+	release func(*iD3D11Texture2D)
+	tex     *iD3D11Texture2D
+	refs    atomic.Int32
 }
 
 var nv12Leases sync.Map // map[uintptr]*nv12Lease
 
-func acquireNV12Lease(vp *VideoProcessor, tex *iD3D11Texture2D) func() {
-	if vp == nil || tex == nil {
+func acquireNV12Lease(releaseFn func(*iD3D11Texture2D), tex *iD3D11Texture2D) func() {
+	if releaseFn == nil || tex == nil {
 		return func() {}
 	}
 
 	key := uintptr(unsafe.Pointer(tex))
 	actual, loaded := nv12Leases.LoadOrStore(key, &nv12Lease{
-		vp:  vp,
-		tex: tex,
+		release: releaseFn,
+		tex:     tex,
 	})
 	lease := actual.(*nv12Lease)
 	if !loaded {
@@ -38,7 +38,9 @@ func acquireNV12Lease(vp *VideoProcessor, tex *iD3D11Texture2D) func() {
 			return
 		}
 		nv12Leases.Delete(key)
-		lease.vp.ReturnTexture(lease.tex)
+		if lease.release != nil {
+			lease.release(lease.tex)
+		}
 	}
 }
 
@@ -58,6 +60,8 @@ func retainNV12Lease(tex *iD3D11Texture2D) func() {
 			return
 		}
 		nv12Leases.Delete(key)
-		lease.vp.ReturnTexture(lease.tex)
+		if lease.release != nil {
+			lease.release(lease.tex)
+		}
 	}
 }

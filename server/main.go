@@ -35,7 +35,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "Rocket/server/embed/statik"
+	_ "Rocket/server/embed/web"
 	"Rocket/utils"
 	"Rocket/utils/melody"
 	"net/http"

@@ -13,6 +13,7 @@ import (
 	"Rocket/client/service/webcam"
 	"Rocket/client/telemetry"
 	"Rocket/modules"
+	"errors"
 	"github.com/kataras/golog"
 	"net/url"
 	"os/exec"
@@ -588,6 +589,9 @@ func webrtcUnsupported(pack modules.Packet, wsConn *common.Conn) {
 
 func webrtcOffer(pack modules.Packet, wsConn *common.Conn) {
 	resp, err := desktop.HandleWebRTCOffer(pack)
+	if errors.Is(err, desktop.ErrWebRTCForwarded) {
+		return
+	}
 	if err != nil {
 		// Browser is the offerer; always respond with an ANSWER so the frontend can apply
 		// the response and correlate signaling failures.
@@ -599,6 +603,10 @@ func webrtcOffer(pack modules.Packet, wsConn *common.Conn) {
 
 func webrtcAnswer(pack modules.Packet, wsConn *common.Conn) {
 	if err := desktop.HandleWebRTCAnswer(pack); err != nil {
+		if errors.Is(err, desktop.ErrWebRTCForwarded) {
+			wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0}, pack)
+			return
+		}
 		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
 		return
 	}
@@ -607,6 +615,10 @@ func webrtcAnswer(pack modules.Packet, wsConn *common.Conn) {
 
 func webrtcICE(pack modules.Packet, wsConn *common.Conn) {
 	if err := desktop.HandleWebRTCIce(pack); err != nil {
+		if errors.Is(err, desktop.ErrWebRTCForwarded) {
+			wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 0}, pack)
+			return
+		}
 		wsConn.SendCallback(modules.Packet{Act: pack.Act, Code: 1, Msg: err.Error()}, pack)
 		return
 	}

@@ -38,6 +38,14 @@ type desktop struct {
 	srcConn    *melody.Session
 	deviceConn *melody.Session
 	frameCount uint64 // diagnostic counter for frame relay monitoring
+
+	// Session binding for security (prevents session hijacking)
+	clientIP   string // Initial client IP address
+	userAgent  string // Initial User-Agent header
+	createdAt  int64  // Unix timestamp of session creation
+
+	// Circuit breaker for frame delivery (prevents cascading failures)
+	circuitBreaker CircuitBreaker
 }
 
 var desktopSessions = melody.New()
@@ -46,6 +54,82 @@ var frameRelayStats struct {
 	failures  atomic.Uint64
 	lastLog   atomic.Int64
 }
+
+// CircuitBreaker implements the circuit breaker pattern for frame delivery.
+// Prevents cascading failures by temporarily pausing operations when error rate is high.
+type CircuitBreaker struct {
+	failures     atomic.Int32 // Consecutive failure count
+	lastFailure  atomic.Int64 // Unix timestamp of last failure
+	state        atomic.Int32 // 0=closed (normal), 1=open (blocking), 2=half-open (testing)
+	openUntil    atomic.Int64 // Unix timestamp when circuit should try half-open
+}
+
+const (
+	circuitBreakerClosed   = 0
+	circuitBreakerOpen     = 1
+	circuitBreakerHalfOpen = 2
+
+	circuitBreakerThreshold  = 5               // Failures before opening
+	circuitBreakerOpenTimeMs = 5000            // 5 seconds open before half-open
+	circuitBreakerHalfOpenOK = 3               // Successes in half-open to close
+)
+
+// Allow returns true if the circuit allows the operation.
+func (cb *CircuitBreaker) Allow() bool {
+	state := cb.state.Load()
+	if state == circuitBreakerClosed {
+		return true
+	}
+	if state == circuitBreakerOpen {
+		// Check if we should transition to half-open
+		if utils.Unix*1000 >= cb.openUntil.Load() {
+			cb.state.Store(circuitBreakerHalfOpen)
+			cb.failures.Store(0)
+			return true
+		}
+		return false
+	}
+	// Half-open: allow one request to test
+	return true
+}
+
+// RecordSuccess records a successful operation.
+func (cb *CircuitBreaker) RecordSuccess() {
+	state := cb.state.Load()
+	if state == circuitBreakerHalfOpen {
+		// In half-open, count successes
+		count := cb.failures.Add(-1) // Use negative to count successes
+		if count <= -circuitBreakerHalfOpenOK {
+			cb.state.Store(circuitBreakerClosed)
+			cb.failures.Store(0)
+		}
+	} else {
+		cb.failures.Store(0)
+	}
+}
+
+// RecordFailure records a failed operation.
+func (cb *CircuitBreaker) RecordFailure() {
+	count := cb.failures.Add(1)
+	cb.lastFailure.Store(utils.Unix)
+
+	state := cb.state.Load()
+	if state == circuitBreakerHalfOpen {
+		// In half-open, any failure opens the circuit
+		cb.state.Store(circuitBreakerOpen)
+		cb.openUntil.Store(utils.Unix*1000 + circuitBreakerOpenTimeMs)
+	} else if count >= circuitBreakerThreshold {
+		cb.state.Store(circuitBreakerOpen)
+		cb.openUntil.Store(utils.Unix*1000 + circuitBreakerOpenTimeMs)
+	}
+}
+
+// IsOpen returns true if the circuit is open (blocking).
+func (cb *CircuitBreaker) IsOpen() bool {
+	return cb.state.Load() == circuitBreakerOpen
+}
+
+// Per-session circuit breaker is stored in the desktop struct
 var desktopTelemetry struct {
 	handshakeAttempts  atomic.Uint64
 	handshakeSuccesses atomic.Uint64
@@ -206,13 +290,14 @@ const sessionAllowControlKey = `DesktopAllowControl`
 
 func init() {
 	desktopSessions.Config.MaxMessageSize = common.MaxMessageSize
-	// Extended timeouts for desktop streaming stability:
-	// - PongWait: 120s (up from 60s default) to handle network jitter
-	// - WriteWait: 30s (up from 10s) for large frame writes
-	// - PingPeriod: 90s (3/4 of PongWait) per WebSocket best practices
-	desktopSessions.Config.PongWait = 120 * time.Second
+	// Reduced timeouts for faster failure detection:
+	// - PongWait: 45s (down from 120s) for quicker disconnect detection
+	// - WriteWait: 30s for large frame writes
+	// - PingPeriod: 30s (2/3 of PongWait) per WebSocket best practices
+	// Note: WSHealthCheck also runs with its own 20s ping / 30s pong timeout
+	desktopSessions.Config.PongWait = 45 * time.Second
 	desktopSessions.Config.WriteWait = 30 * time.Second
-	desktopSessions.Config.PingPeriod = 90 * time.Second
+	desktopSessions.Config.PingPeriod = 30 * time.Second
 	// Disable permessage-deflate compression (RFC 7692).
 	// Desktop payloads are already compressed (JPEG/etc); RFC 7692 adds CPU + latency.
 	desktopSessions.EnableCompress(false)
@@ -352,16 +437,35 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 			if utility.IsFrameOp(data[5]) {
 				// Frame data - track and forward to browser
 				desktop.frameCount++
+
+				// Circuit breaker: skip frame if circuit is open (too many failures)
+				if !desktop.circuitBreaker.Allow() {
+					// Circuit is open - drop frame to prevent cascading failures
+					if desktop.frameCount%100 == 0 {
+						common.Warn(nil, `[FRAME_RELAY_CIRCUIT_OPEN]`, ``, `Dropping frame due to circuit breaker`, map[string]any{
+							`desktop_uuid`: desktop.uuid[:8] + `...`,
+							`frame_count`:  desktop.frameCount,
+						})
+					}
+					return
+				}
+
 				if err := desktop.srcConn.WriteBinary(data); err != nil {
+					desktop.circuitBreaker.RecordFailure()
 					common.Warn(nil, `[FRAME_RELAY_ERROR]`, ``, `Failed to write frame to browser`, map[string]any{
-						`desktop_uuid`: desktop.uuid[:8] + `...`,
-						`error`:        err.Error(),
-						`frame_count`:  desktop.frameCount,
-						`data_size`:    len(data),
+						`desktop_uuid`:   desktop.uuid[:8] + `...`,
+						`error`:          err.Error(),
+						`frame_count`:    desktop.frameCount,
+						`data_size`:      len(data),
+						`circuit_open`:   desktop.circuitBreaker.IsOpen(),
 					})
 					recordDesktopFrameRelayFailure(desktop.uuid, len(data))
 				} else {
+					desktop.circuitBreaker.RecordSuccess()
 					frameRelayStats.forwarded.Add(1)
+					// Update LastPack on successful frame send to prevent false idle disconnects
+					// (WSHealthCheck uses LastPack to detect idle connections)
+					desktop.srcConn.Set(`LastPack`, utils.Unix)
 					// Log every 100th frame for monitoring
 					if desktop.frameCount%100 == 0 {
 						common.Info(nil, `[FRAME_RELAY_STATS]`, ``, `Frame relay statistics`, map[string]any{
@@ -498,9 +602,8 @@ func desktopEventWrapper(desktop *desktop) common.EventCallback {
 				sendPack(modules.Packet{Act: `CURSOR_UPDATE`, Data: validated}, desktop.srcConn)
 			}
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
-			if pack.Code != 0 {
-				sendPack(pack, desktop.srcConn)
-			}
+			// Clipboard/file drop/audio control are disabled in the simplified desktop pipeline.
+			return
 		case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, `DESKTOP_WEBRTC_ICE`:
 			sendPack(pack, desktop.srcConn)
 		}
@@ -622,11 +725,21 @@ func onDesktopConnect(session *melody.Session) {
 	})
 
 	desktopUUID := utils.GetStrUUID()
+
+	// Capture session binding info for security validation
+	userAgent := ""
+	if ua, ok := session.Get(`UserAgent`); ok {
+		userAgent = ua.(string)
+	}
+
 	desktop := &desktop{
 		uuid:       desktopUUID,
 		device:     deviceID,
 		srcConn:    session,
 		deviceConn: deviceConn,
+		clientIP:   clientIP,
+		userAgent:  userAgent,
+		createdAt:  utils.Unix,
 	}
 	session.Set(`Desktop`, desktop)
 	session.Set(sessionAllowControlKey, true)
@@ -696,6 +809,22 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		return
 	}
 	desktop := val.(*desktop)
+
+	// Session binding validation: detect potential session hijacking
+	currentIP := `unknown`
+	if addr, ok := session.Get(`Address`); ok {
+		currentIP = addr.(string)
+	}
+	if desktop.clientIP != "" && desktop.clientIP != currentIP {
+		// IP changed during session - could indicate session hijacking
+		// Log warning but don't disconnect (could be legitimate NAT change)
+		common.Warn(session, `DESKTOP_SECURITY`, `ip_change`, `client IP changed during session`, map[string]any{
+			`desktop`:     desktop.uuid[:8] + `...`,
+			`original_ip`: desktop.clientIP,
+			`current_ip`:  currentIP,
+			`session_age`: utils.Unix - desktop.createdAt,
+		})
+	}
 
 	common.Info(session, `[SERVER_DESKTOP_CHECKING_PROTOCOL]`, ``, `Checking binary protocol`, map[string]any{
 		`data_len`: len(data),
@@ -864,40 +993,13 @@ func onDesktopMessage(session *melody.Session, data []byte) {
 		common.SendPack(modules.Packet{Act: `DESKTOP_CONFIG`, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
 		return
 	case `DESKTOP_CLIPBOARD`:
-		if !allowControlEnabled(session) {
-			blockControlAction(session, desktop, pack.Act)
-			return
-		}
-		if payload, ok := normalizeClipboard(pack.Data); ok {
-			payload[`desktop`] = desktop.uuid
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
-			return
-		}
-		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 	case `DESKTOP_FILE_DROP`:
-		if !allowControlEnabled(session) {
-			blockControlAction(session, desktop, pack.Act)
-			return
-		}
-		if payload, ok := normalizeFileDrop(pack.Data); ok {
-			payload[`desktop`] = desktop.uuid
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
-			return
-		}
-		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 	case `DESKTOP_AUDIO`:
-		if !allowControlEnabled(session) {
-			blockControlAction(session, desktop, pack.Act)
-			return
-		}
-		if payload, ok := normalizeAudioControl(pack.Data); ok {
-			payload[`desktop`] = desktop.uuid
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktop.uuid}, desktop.deviceConn)
-			return
-		}
-		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 	case `DESKTOP_WEBRTC_OFFER`:
 		if payload, ok := normalizeSDP(pack.Data); ok {

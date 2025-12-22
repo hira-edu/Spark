@@ -55,9 +55,8 @@ try {
   go build -o .\built\perfmarker.exe .\cmd\perfmarker
 
   Write-Host "[Start] server"
-  $server = Start-Process -FilePath .\built\server_perf.exe -ArgumentList @("-config",".\config.e2e.json") -PassThru -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
-  Write-Host "  server_pid=$($server.Id)"
-
+  Start-Process -FilePath .\built\server_perf.exe -ArgumentList @("-config",".\config.e2e.json")
+  
   $deadline = (Get-Date).AddSeconds(20)
   $serverReady = $false
   while ((Get-Date) -lt $deadline) {
@@ -68,7 +67,7 @@ try {
     Start-Sleep -Milliseconds 200
   }
   if (-not $serverReady) {
-    throw "Server did not become ready at $baseUrl within 20s (pid=$($server.Id)). See $serverOut / $serverErr"
+    throw "Server did not become ready at $baseUrl within 20s"
   }
 
   Write-Host "[Build] configured client binary"
@@ -90,8 +89,7 @@ try {
   if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "webrtc" }
   # Let the client use its default capture backend (DXGI/auto)
   # GDI was causing missed marker updates due to DWM timing issues
-  $client = Start-Process -FilePath $clientExe -ArgumentList @("--console") -PassThru -RedirectStandardOutput $clientOut -RedirectStandardError $clientErr
-  Write-Host "  client_pid=$($client.Id)"
+  Start-Process -FilePath $clientExe -ArgumentList @("--console")
 
   # Wait for client to connect to server before proceeding.
   # This prevents race conditions where the test starts before the client is ready.
@@ -116,29 +114,6 @@ try {
     Write-Host "[WARN] Client may not have connected within 15s - continuing anyway"
   }
 
-  Write-Host "[Start] marker window"
-  $marker = Start-Process -FilePath .\built\perfmarker.exe -ArgumentList @("--x",$markerX,"--y",$markerY,"--w",200,"--h",200,"--fps",30,"--duration","0s","--marker-pad",8,"--marker-size",24,"--marker-gap",2) -PassThru -RedirectStandardOutput $markerOut -RedirectStandardError $markerErr
-  Write-Host "  marker_pid=$($marker.Id)"
-
-  # Parse marker "READY ..." line to get the actual on-screen coords (DPI-aware).
-  $readyDeadline = (Get-Date).AddSeconds(5)
-  while ((Get-Date) -lt $readyDeadline) {
-    if (Test-Path $markerOut) {
-      $matchLine = (Select-String -Path $markerOut -Pattern '^READY\\s+x=' -ErrorAction SilentlyContinue | Select-Object -First 1).Line
-      $line = if ($matchLine) { $matchLine } else { (Get-Content $markerOut -Tail 1 -ErrorAction SilentlyContinue) }
-      if ($line -and $line -match '^READY\\s+x=(\\d+)\\s+y=(\\d+)\\s+w=(\\d+)\\s+h=(\\d+)\\s+fps=(\\d+)\\s+marker_pad=(\\d+)\\s+marker_size=(\\d+)\\s+marker_gap=(\\d+)') {
-        $env:PERF_MARKER_X = $Matches[1]
-        $env:PERF_MARKER_Y = $Matches[2]
-        $env:PERF_MARKER_PAD = $Matches[6]
-        $env:PERF_MARKER_SIZE = $Matches[7]
-        $env:PERF_MARKER_GAP = $Matches[8]
-        Write-Host "  marker_ready x=$($Matches[1]) y=$($Matches[2]) pad=$($Matches[6]) size=$($Matches[7]) gap=$($Matches[8])"
-        break
-      }
-    }
-    Start-Sleep -Milliseconds 100
-  }
-
   Write-Host "[Run] Playwright perf test (set PERF_HEADED=1 for headed)"
   Push-Location "web"
   try {
@@ -150,8 +125,6 @@ try {
     $env:PERF_HEADED = $env:PERF_HEADED  # pass-through
     $env:PERF_DURATION_SEC = "$durationSec"
     $env:PERF_TEST_TIMEOUT_MS = "$([Math]::Max(180000, ($durationSec + 180) * 1000))"
-    if (-not $env:PERF_MARKER_X) { $env:PERF_MARKER_X = "$markerX" }
-    if (-not $env:PERF_MARKER_Y) { $env:PERF_MARKER_Y = "$markerY" }
     if (-not $env:PERF_TRANSPORT) { $env:PERF_TRANSPORT = "webrtc" }
 
     npx playwright test -c playwright.perf.config.js

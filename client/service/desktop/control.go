@@ -27,6 +27,16 @@ func init() {
 	configMonitor.Store(0)
 	setConfiguredCaptureBackend(CaptureBackendAuto)
 
+	if isWindowsSinglePipeline() {
+		setConfiguredCaptureBackend(CaptureBackendDXGI_NV12)
+		setFallbackOrder([]CaptureBackendMode{CaptureBackendDXGI_NV12})
+		bumpCaptureConfigEpoch()
+		telemetry.LogStructured("INFO", "config: capture backend locked to dxgi_nv12", map[string]interface{}{
+			"backend": captureBackendName(CaptureBackendDXGI_NV12),
+		})
+		return
+	}
+
 	// Optional startup override for capture backend selection (useful in CI/perf harnesses).
 	// Example: SPARK_CAPTURE_BACKEND=dxgi for WS tile transport (requires CPU RGBA frames).
 	if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
@@ -69,6 +79,7 @@ func HandleConfig(pack modules.Packet) error {
 	var selectedBounds image.Rectangle
 	qualityAutoSet := false
 	qualityAutoEnabled := false
+	singlePipeline := isWindowsSinglePipeline()
 
 	// Update allowControl (per session toggle)
 	if allowVal, ok := pack.Data["allowControl"]; ok {
@@ -91,6 +102,10 @@ func HandleConfig(pack modules.Packet) error {
 	// Update transport preference (per-session). When set to "webrtc", the device will stop
 	// sending WS tile/canvas frames for this session (WebRTC <video> becomes the primary path).
 	if transportVal, ok := pack.Data["transport"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "transport: locked to webrtc")
+			goto skipTransport
+		}
 		transport, okStr := transportVal.(string)
 		if !okStr {
 			errors = append(errors, "transport: invalid type")
@@ -109,6 +124,7 @@ func HandleConfig(pack modules.Packet) error {
 			}
 		}
 	}
+skipTransport:
 
 	// Handle decoder backpressure signal from browser
 	// When the browser's decode queue is overwhelmed, temporarily reduce FPS to allow recovery
@@ -156,6 +172,10 @@ skipFPS:
 
 	// Update adaptive quality mode (if provided)
 	if autoVal, ok := pack.Data["quality_auto"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "quality_auto: ignored in webrtc-only mode")
+			goto skipQualityAuto
+		}
 		auto, okBool := autoVal.(bool)
 		if !okBool {
 			errors = append(errors, "quality_auto: invalid type")
@@ -176,9 +196,14 @@ skipFPS:
 			warnings = append(warnings, "quality_auto: adaptive quality unavailable")
 		}
 	}
+skipQualityAuto:
 
 	// Update quality (if provided)
 	if qualityVal, ok := pack.Data["quality"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "quality: ignored in webrtc-only mode")
+			goto skipQuality
+		}
 		if qualityAutoSet && qualityAutoEnabled {
 			// In auto mode, ignore explicit quality values so adaptive quality can operate.
 			// The UI should omit "quality" when "quality_auto" is true, but handle mixed payloads safely.
@@ -280,6 +305,10 @@ skipMonitor:
 
 	// Update capture backend preference (nvfbc, dxgi, gdi, etc.)
 	if captureVal, ok := pack.Data["capture"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "capture: locked to dxgi_nv12")
+			goto skipCapture
+		}
 		captureStr, ok := captureVal.(string)
 		if !ok {
 			errors = append(errors, "capture: invalid type (expected string)")
@@ -304,6 +333,10 @@ skipCapture:
 
 	// Update codec (if provided)
 	if codecVal, ok := pack.Data["codec"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "codec: locked to h264")
+			goto skipCodec
+		}
 		codecName, ok := codecVal.(string)
 		if !ok {
 			errors = append(errors, "codec: invalid type")
@@ -439,6 +472,9 @@ func HandleClipboard(pack modules.Packet) error {
 	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
 		return err
 	}
+	if isWindowsSinglePipeline() {
+		return errInputUnsupported
+	}
 	// Clipboard sync is platform-specific; acknowledge receipt for now.
 	telemetry.LogStructured("DEBUG", "clipboard control received", map[string]interface{}{
 		"event": pack.Event,
@@ -450,6 +486,9 @@ func HandleFileDrop(pack modules.Packet) error {
 	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
 		return err
 	}
+	if isWindowsSinglePipeline() {
+		return errInputUnsupported
+	}
 	telemetry.LogStructured("DEBUG", "file drop control received", map[string]interface{}{
 		"files": pack.Data[`files`],
 	})
@@ -459,6 +498,9 @@ func HandleFileDrop(pack modules.Packet) error {
 func HandleAudio(pack modules.Packet) error {
 	if forwarded, err := relayDesktopCommand(pack, ipc.MsgTypeDesktopPacket); forwarded {
 		return err
+	}
+	if isWindowsSinglePipeline() {
+		return errInputUnsupported
 	}
 	desktopID, _ := pack.Data[`desktop`].(string)
 	if desktopID == "" {

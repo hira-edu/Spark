@@ -997,54 +997,15 @@ func onGuestMessage(session *melody.Session, data []byte) {
 		return
 
 	case `DESKTOP_CLIPBOARD`:
-		if guest.viewOnly {
-			common.Warn(session, `[SERVER_SHARE_CLIPBOARD_BLOCKED]`, ``, `View-only guest attempted clipboard`, map[string]any{
-				`share_id`: shareIDStr,
-			})
-			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
-			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
-			return
-		}
-		if payload, ok := normalizeClipboard(pack.Data); ok {
-			payload[`desktop`] = desktopUUID
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
-			return
-		}
-		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 
 	case `DESKTOP_FILE_DROP`:
-		if guest.viewOnly {
-			common.Warn(session, `[SERVER_SHARE_FILEDROP_BLOCKED]`, ``, `View-only guest attempted file drop`, map[string]any{
-				`share_id`: shareIDStr,
-			})
-			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
-			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
-			return
-		}
-		if payload, ok := normalizeFileDrop(pack.Data); ok {
-			payload[`desktop`] = desktopUUID
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
-			return
-		}
-		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 
 	case `DESKTOP_AUDIO`:
-		if guest.viewOnly {
-			common.Warn(session, `[SERVER_SHARE_AUDIO_BLOCKED]`, ``, `View-only guest attempted audio control`, map[string]any{
-				`share_id`: shareIDStr,
-			})
-			recordShareViewOnlyBlock(session, pack.Act, shareIDStr)
-			sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|SHARE.VIEW_ONLY}`}, session)
-			return
-		}
-		if payload, ok := normalizeAudioControl(pack.Data); ok {
-			payload[`desktop`] = desktopUUID
-			common.SendPack(modules.Packet{Act: pack.Act, Data: payload, Event: desktopUUID.(string)}, guest.deviceConn)
-			return
-		}
-		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|COMMON.INVALID_PARAMETER}`}, session)
+		sendGuestPack(modules.Packet{Act: pack.Act, Code: 1, Msg: `${i18n|DESKTOP.UNSUPPORTED_PLATFORM}`}, session)
 		return
 
 	case `DESKTOP_WEBRTC_OFFER`:
@@ -1186,9 +1147,8 @@ func guestEventWrapper(guest *guestDesktop, desktopUUID string) common.EventCall
 		case `DESKTOP_CONFIG_ACK`:
 			sendGuestPack(modules.Packet{Act: `DESKTOP_CONFIG_ACK`, Code: pack.Code, Data: pack.Data, Msg: pack.Msg}, guest.srcConn)
 		case `DESKTOP_CLIPBOARD`, `DESKTOP_AUDIO`, `DESKTOP_FILE_DROP`:
-			if pack.Code != 0 {
-				sendGuestPack(pack, guest.srcConn)
-			}
+			// Clipboard/file drop/audio control are disabled in the simplified desktop pipeline.
+			return
 		case `DESKTOP_WEBRTC_OFFER`, `DESKTOP_WEBRTC_ANSWER`, `DESKTOP_WEBRTC_ICE`:
 			sendGuestPack(pack, guest.srcConn)
 		}

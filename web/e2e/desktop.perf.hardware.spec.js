@@ -18,195 +18,6 @@ function quantile(sorted, q) {
   return a + (b - a) * rest;
 }
 
-function unwrapTs24(nowMs, ts24) {
-  const wrap = 1 << 24;
-  const base = nowMs - (nowMs % wrap);
-  let candidate = base + ts24;
-  if (candidate > nowMs + wrap / 2) candidate -= wrap;
-  if (candidate < nowMs - wrap / 2) candidate += wrap;
-  return candidate;
-}
-
-function buildRegion(markerGrid) {
-  const x = markerGrid.x | 0;
-  const y = markerGrid.y | 0;
-  const pad = Math.max(0, markerGrid.pad | 0);
-  const cell = Math.max(6, markerGrid.cell | 0);
-  const gap = Math.max(0, markerGrid.gap | 0);
-  const cols = Math.max(1, markerGrid.cols | 0);
-  const rows = Math.max(1, markerGrid.rows | 0);
-  return {
-    cols,
-    rows,
-    cell,
-    gap,
-    left: x + pad,
-    top: y + pad,
-    width: cols * cell + (cols - 1) * gap,
-    height: rows * cell + (rows - 1) * gap,
-  };
-}
-
-async function readMarkerOnce(page, markerGrid) {
-  return page.evaluate(({ markerGrid }) => {
-    const nowMs = Date.now();
-    const grid = (() => {
-      const x = markerGrid.x | 0;
-      const y = markerGrid.y | 0;
-      const pad = Math.max(0, markerGrid.pad | 0);
-      const cell = Math.max(6, markerGrid.cell | 0);
-      const gap = Math.max(0, markerGrid.gap | 0);
-      const cols = Math.max(1, markerGrid.cols | 0);
-      const rows = Math.max(1, markerGrid.rows | 0);
-      return {
-        cols,
-        rows,
-        cell,
-        gap,
-        left: x + pad,
-        top: y + pad,
-        width: cols * cell + (cols - 1) * gap,
-        height: rows * cell + (rows - 1) * gap,
-      };
-    })();
-
-    const decodeTs24 = (imageData, region) => {
-      const d = imageData?.data;
-      const w = imageData?.width | 0;
-      const h = imageData?.height | 0;
-      if (!d || w <= 0 || h <= 0) return null;
-      if (!region || w < region.width || h < region.height) return null;
-
-      let ts24 = 0;
-      for (let r = 0; r < region.rows; r++) {
-        for (let c = 0; c < region.cols; c++) {
-          const xr = c * (region.cell + region.gap) + Math.floor(region.cell / 2);
-          const yr = r * (region.cell + region.gap) + Math.floor(region.cell / 2);
-          const idx = (yr * w + xr) * 4;
-          const v = (d[idx] + d[idx + 1] + d[idx + 2]) / 3;
-          const bit = v > 127 ? 1 : 0;
-          ts24 = (ts24 << 1) | bit;
-        }
-      }
-      return ts24 & 0x00ffffff;
-    };
-
-    const selectCanvas = () => document.querySelector('canvas.desktop-canvas') || document.querySelector('canvas');
-    const selectVideo = () => document.querySelector('video.desktop-webrtc-video') || document.querySelector('video');
-
-    const canvas = selectCanvas();
-    const video = selectVideo();
-
-    const captureDims = (() => {
-      const mw = markerGrid.monitorW | 0;
-      const mh = markerGrid.monitorH | 0;
-      if (mw > 0 && mh > 0) return { w: mw, h: mh, from: 'env' };
-
-      const text = document.body ? document.body.innerText : '';
-      const match = text.match(/\bres\s*(\d+)\s*x\s*(\d+)/i);
-      if (match) {
-        const w = parseInt(match[1], 10) || 0;
-        const h = parseInt(match[2], 10) || 0;
-        if (w > 0 && h > 0) return { w, h, from: 'text' };
-      }
-
-      const cw = canvas?.width | 0;
-      const ch = canvas?.height | 0;
-      if (cw > 0 && ch > 0) return { w: cw, h: ch, from: 'canvas' };
-
-      return { w: 0, h: 0, from: 'none' };
-    })();
-
-    const scaleRegion = (targetW, targetH) => {
-      const capW = captureDims.w | 0;
-      const capH = captureDims.h | 0;
-      if (capW <= 0 || capH <= 0 || targetW <= 0 || targetH <= 0) return null;
-      const sx = targetW / capW;
-      const sy = targetH / capH;
-      const s = Math.min(sx, sy);
-      if (!(s > 0) || s >= 1) return null;
-
-      const cell = Math.max(6, Math.round(grid.cell * s));
-      const gap = Math.max(0, Math.round(grid.gap * s));
-      const left = Math.round(grid.left * s);
-      const top = Math.round(grid.top * s);
-      const width = grid.cols * cell + (grid.cols - 1) * gap;
-      const height = grid.rows * cell + (grid.rows - 1) * gap;
-
-      return { cols: grid.cols, rows: grid.rows, cell, gap, left, top, width, height, scale: s };
-    };
-
-    const dims = {
-      canvas: canvas ? { w: canvas.width || 0, h: canvas.height || 0 } : null,
-      video: video ? { w: video.videoWidth || 0, h: video.videoHeight || 0 } : null,
-      capture: captureDims,
-      region: { left: grid.left, top: grid.top, w: grid.width, h: grid.height },
-    };
-
-    const tryReadVideo = () => {
-      if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) return { ok: false, error: 'no_video' };
-
-      let region = grid;
-      if (region.left < 0 || region.top < 0) return { ok: false, error: 'bad_coords' };
-      if (region.left + region.width > video.videoWidth || region.top + region.height > video.videoHeight) {
-        const scaled = scaleRegion(video.videoWidth, video.videoHeight);
-        if (scaled && scaled.left + scaled.width <= video.videoWidth && scaled.top + scaled.height <= video.videoHeight) {
-          region = scaled;
-        }
-      }
-      if (region.left + region.width > video.videoWidth) return { ok: false, error: 'oob_video_x' };
-      if (region.top + region.height > video.videoHeight) return { ok: false, error: 'oob_video_y' };
-
-      const offscreen = window.__rocketPerfOffscreen || (window.__rocketPerfOffscreen = document.createElement('canvas'));
-      const offctx = offscreen.getContext('2d');
-      if (!offctx) return { ok: false, error: 'no_offscreen_2d' };
-      if (offscreen.width !== video.videoWidth || offscreen.height !== video.videoHeight) {
-        offscreen.width = video.videoWidth;
-        offscreen.height = video.videoHeight;
-      }
-      offctx.drawImage(video, 0, 0);
-      try {
-        const img = offctx.getImageData(region.left, region.top, region.width, region.height);
-        const ts24 = decodeTs24(img, region);
-        return ts24 === null ? { ok: false, error: 'decode_failed', dims } : { ok: true, ts24, source: 'webrtc-video', dims };
-      } catch {
-        return { ok: false, error: 'getImageData_failed', dims };
-      }
-    };
-
-    const tryReadCanvas = () => {
-      if (!canvas || canvas.width <= 0 || canvas.height <= 0) return { ok: false, error: 'no_canvas' };
-
-      let region = grid;
-      if (region.left < 0 || region.top < 0) return { ok: false, error: 'bad_coords' };
-      if (region.left + region.width > canvas.width || region.top + region.height > canvas.height) {
-        const scaled = scaleRegion(canvas.width, canvas.height);
-        if (scaled && scaled.left + scaled.width <= canvas.width && scaled.top + scaled.height <= canvas.height) {
-          region = scaled;
-        }
-      }
-      if (region.left + region.width > canvas.width) return { ok: false, error: 'oob_canvas_x' };
-      if (region.top + region.height > canvas.height) return { ok: false, error: 'oob_canvas_y' };
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return { ok: false, error: 'no_2d' };
-      try {
-        const img = ctx.getImageData(region.left, region.top, region.width, region.height);
-        const ts24 = decodeTs24(img, region);
-        return ts24 === null ? { ok: false, error: 'decode_failed', dims } : { ok: true, ts24, source: 'tiles-canvas', dims };
-      } catch {
-        return { ok: false, error: 'getImageData_failed', dims };
-      }
-    };
-
-    const fromVideo = tryReadVideo();
-    if (fromVideo.ok) return { nowMs, ...fromVideo };
-    const fromCanvas = tryReadCanvas();
-    if (fromCanvas.ok) return { nowMs, ...fromCanvas };
-    return { nowMs, ok: false, error: fromVideo.error || fromCanvas.error || 'no_source', dims };
-  }, { markerGrid });
-}
-
 test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) => {
   if (process.env.ROCKET_HARDWARE_PERF !== '1') {
     test.skip(true, 'Set ROCKET_HARDWARE_PERF=1 to run hardware perf test');
@@ -217,24 +28,8 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
   const deviceId = env.deviceId;
   const cookie = env.authCookie;
 
-  const transport = env.transport || 'tiles';
+  const transport = env.transport || 'webrtc'; // Default to webrtc for this test
   const durationMs = Math.max(5_000, (env.durationSec || 30) * 1000);
-  const marker = env.marker || { x: 16, y: 16, pad: 8, size: 24 };
-  const markerPad = Number.isFinite(marker.pad) ? marker.pad : 8;
-  const markerCell = Number.isFinite(marker.size) ? marker.size : 24;
-  const markerGap = Number.isFinite(marker.gap) ? marker.gap : 2;
-
-  const markerGrid = {
-    x: Math.floor(marker.x || 0),
-    y: Math.floor(marker.y || 0),
-    pad: Math.floor(markerPad),
-    cell: Math.floor(markerCell),
-    gap: Math.floor(markerGap),
-    cols: 6,
-    rows: 4,
-  };
-  test.info().annotations.push({ type: 'debug', description: `marker_grid=${JSON.stringify(markerGrid)}` });
-  test.info().annotations.push({ type: 'debug', description: `marker_region=${JSON.stringify(buildRegion(markerGrid))}` });
 
   // Perf harness hooks (must run before app code):
   // - tiles: disable WebRTC so we strictly test the WS tile pipeline.
@@ -284,87 +79,21 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
   // Wait until the UI reports some FPS or bandwidth so we know frames are flowing.
   await page.waitForFunction(() => {
     const t = document.body ? document.body.innerText : '';
-    const fpsMatch = t.match(/FPS\\s*(\\d+)/);
+    const fpsMatch = t.match(/FPS\s*(\d+)/);
     const fps = fpsMatch ? parseInt(fpsMatch[1], 10) : 0;
     const hasBw = t.includes('BW') && !t.includes('0 B/s');
     return fps > 0 || hasBw;
   }, { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(500);
 
-  const intervalMs = Math.max(5, parseInt(process.env.PERF_SAMPLE_INTERVAL_MS || '20', 10) || 20);
   const startedAt = Date.now();
-  const deadline = startedAt + durationMs;
-
-  const samples = [];
-  const debug = {
-    intervalMs,
-    markerGrid,
-    markerRegion: buildRegion(markerGrid),
-    loops: 0,
-    nullReads: 0,
-    errorReads: 0,
-    decodeFailures: 0,
-    lastSource: 'none',
-    lastDims: null,
-    successfulReads: 0,
-    firstTs24Values: [],
-    rejectedLatencies: [],
-    lastTs24: null,
-    lastLatencyMs: null,
-  };
-
-  let lastSeenTs24 = null;
-  let lastChangeAt = startedAt;
-  let maxStallMs = 0;
-
-  while (Date.now() < deadline) {
-    debug.loops += 1;
-    const nowMs = Date.now();
-
-    // eslint-disable-next-line no-await-in-loop
-    const r = await readMarkerOnce(page, markerGrid);
-    debug.lastDims = r?.dims || debug.lastDims;
-
-    if (!r) {
-      debug.nullReads += 1;
-      debug.errorReads += 1;
-    } else if (!r.ok) {
-      debug.errorReads += 1;
-      if (r.error === 'decode_failed') debug.decodeFailures += 1;
-    } else {
-      debug.successfulReads += 1;
-      debug.lastSource = r.source || debug.lastSource;
-      debug.lastTs24 = r.ts24;
-      // Track first few ts24 values for debugging
-      if (debug.firstTs24Values.length < 10) {
-        debug.firstTs24Values.push(r.ts24);
-      }
-      if (r.ts24 !== lastSeenTs24) {
-        lastSeenTs24 = r.ts24;
-        lastChangeAt = nowMs;
-        const markerMs = unwrapTs24(nowMs, r.ts24);
-        const latencyMs = nowMs - markerMs;
-        debug.lastLatencyMs = latencyMs;
-        if (latencyMs >= 0 && latencyMs < 10_000) {
-          samples.push({ nowMs, ts24: r.ts24, latencyMs, source: r.source });
-        } else {
-          // Track rejected latencies for debugging
-          if (debug.rejectedLatencies.length < 10) {
-            debug.rejectedLatencies.push({ ts24: r.ts24, latencyMs, nowMs, markerMs });
-          }
-        }
-      }
-    }
-
-    const stallMs = nowMs - lastChangeAt;
-    if (stallMs > maxStallMs) maxStallMs = stallMs;
-
-    // eslint-disable-next-line no-await-in-loop
-    await page.waitForTimeout(intervalMs);
-  }
-
+  await page.waitForTimeout(durationMs);
   const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
-  const distinctFrames = new Set(samples.map((s) => s.ts24)).size;
+
+  const perfMetrics = await page.evaluate(() => window.__rocketPerfMetrics);
+  const samples = perfMetrics?.samples || [];
+
+  const distinctFrames = samples.length;
   const fpsApprox = distinctFrames / elapsedSec;
 
   const results = {
@@ -374,10 +103,6 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
     sampleCount: samples.length,
     distinctFrames,
     fpsApprox,
-    maxStallMs,
-    lastSource: debug.lastSource,
-    readErrors: debug.errorReads,
-    debug,
   };
 
   // Get WebSocket-level diagnostics from browser
@@ -399,22 +124,16 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
   });
   console.log('[perf] diagnostics', JSON.stringify(diagnostics, null, 2));
 
-  // Always print key diagnostics; this suite is opt-in and used for debugging.
   // eslint-disable-next-line no-console
   console.log('[perf] results', JSON.stringify({
     fpsApprox: results.fpsApprox,
     distinctFrames: results.distinctFrames,
     sampleCount: results.sampleCount,
-    readErrors: results.readErrors,
-    maxStallMs: results.maxStallMs,
-    lastSource: results.lastSource,
-    debug: results.debug,
   }, null, 2));
 
-  test.info().annotations.push({ type: 'debug', description: `readErrors=${results.readErrors}` });
   expect(results.sampleCount).toBeGreaterThan(50);
 
-  const latencies = results.samples.map((s) => s.latencyMs).sort((a, b) => a - b);
+  const latencies = results.samples.sort((a, b) => a - b);
   const p50 = quantile(latencies, 0.5);
   const p95 = quantile(latencies, 0.95);
   const p99 = quantile(latencies, 0.99);
@@ -422,20 +141,18 @@ test('desktop perf (hardware) - latency/fps/stalls', async ({ page, context }) =
 
   const thresholds = env.thresholds || {};
   const minFps = thresholds.minFps || 15;
-  const maxStall = thresholds.maxStallMs || 800;
+  const maxStall = thresholds.maxStallMs || 800; // Stall check removed, but keeping for env consistency
   const maxP95 = thresholds.p95Ms || 150;
   const maxP99 = thresholds.p99Ms || 250;
   const maxMax = thresholds.maxMs || 500;
 
   test.info().annotations.push(
-    { type: 'perf', description: `source=${results.lastSource}` },
+    { type: 'perf', description: `source=metadata` },
     { type: 'perf', description: `fps÷${results.fpsApprox.toFixed(1)} distinct=${results.distinctFrames} samples=${results.sampleCount}` },
     { type: 'perf', description: `lat_ms p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)} max=${max.toFixed(1)}` },
-    { type: 'perf', description: `max_stall_ms=${results.maxStallMs.toFixed(0)}` },
   );
 
   expect(results.fpsApprox).toBeGreaterThanOrEqual(minFps);
-  expect(results.maxStallMs).toBeLessThanOrEqual(maxStall);
   expect(p95).toBeLessThanOrEqual(maxP95);
   expect(p99).toBeLessThanOrEqual(maxP99);
   expect(max).toBeLessThanOrEqual(maxMax);

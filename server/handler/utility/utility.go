@@ -548,7 +548,7 @@ func WSHealthCheck(container *melody.Melody, sender Sender) {
 	const (
 		PingIntervalSeconds = 20  // Send PING every 20 seconds (RFC 6455 recommendation)
 		MaxIdleSeconds      = 300 // Close connection after 5 minutes of no activity
-		PongTimeoutSeconds  = 10  // Wait up to 10 seconds for PONG response
+		PongTimeoutSeconds  = 30  // Wait up to 30 seconds for PONG response (increased from 10s to handle background tabs, frame writes, and network latency)
 	)
 
 	// ping sends a PING packet and records timestamp for RTT measurement

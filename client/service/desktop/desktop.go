@@ -119,6 +119,7 @@ var adaptiveQualityManager = NewAdaptiveQualityManager() // Global adaptive qual
 var lastRTTMs atomic.Int64                               // Optional RTT estimator for adaptive quality
 var globalChannelHighWater atomic.Uint64                 // Tracks highest queue depth across sessions
 var globalFrameSeq atomic.Uint32                         // Monotonic capture frame sequence (shared across sessions)
+var tilesDCNotReadyCounter atomic.Uint64                 // Counts frames where tiles DC wasn't ready (debug)
 
 // UpdateRTT ingests RTT measurements (milliseconds) for adaptive quality tuning.
 func UpdateRTT(rttMs int64) {
@@ -649,13 +650,6 @@ func worker() {
 		err              error
 		lastSuccessTime  time.Time
 
-		// DXGI stall detection: track consecutive errNoImage returns to trigger GDI fallback.
-		// When DXGI Output Duplication doesn't detect desktop changes (e.g., phase-locked timer
-		// windows like perfmarker), we fall back to GDI capture to ensure frames still flow.
-		noImageCount    int
-		inStallMode     bool // When true, use GDI every tick until DXGI recovers
-		fromGDIFallback bool // Set true when current frame came from GDI fallback
-
 		// Performance metrics for delta detection
 		frameCount         uint64
 		fullFrameCount     uint64
@@ -668,6 +662,12 @@ func worker() {
 		currentBounds     image.Rectangle
 		resolutionChanges uint64
 	)
+
+	// Initialize parallel block encoder pool
+	// Uses NumCPU/2 workers to parallelize JPEG encoding across cores
+	encoderPool := NewBlockEncoderPool(0) // 0 = auto-detect worker count
+	encoderPool.Start()
+	defer encoderPool.Stop()
 
 	// Initialize monitor selection and bounds.
 	// Prefer the already-resolved bounds from InitDesktop to avoid repeated monitor enumeration.
@@ -692,8 +692,11 @@ func worker() {
 	workerDiag.setStage("bounds_ready")
 
 	makeEngineBackends := func(desired CaptureBackendMode) []CaptureBackendMode {
-		// Always allow fallback/rotation on Windows so the worker can recover from
-		// backend init/capture hangs (common in bridge/service scenarios).
+		if isWindowsSinglePipeline() {
+			return []CaptureBackendMode{CaptureBackendDXGI_NV12}
+		}
+
+		// Allow fallback/rotation so the worker can recover from backend init/capture hangs.
 		out := make([]CaptureBackendMode, 0, 4)
 		add := func(mode CaptureBackendMode) {
 			for _, existing := range out {
@@ -898,9 +901,6 @@ func worker() {
 				continue
 			}
 
-			// Reset GDI fallback flag for this capture cycle
-			fromGDIFallback = false
-
 			// Capture frame
 			if useCaptureEngine {
 				workerDiag.setStage("capture")
@@ -942,6 +942,13 @@ func worker() {
 					workerDiag.lastCaptureOKUnixNs.Store(time.Now().UnixNano())
 				}
 			}
+
+			// Add capture timestamp to the frame.
+			// Use actual capture end time (not ticker time) for accurate latency measurement.
+			if frame != nil {
+				frame.CaptureTimeNs = workerDiag.lastCaptureEndNs.Load()
+			}
+
 			workerDiag.setStage("post_capture")
 			if frame != nil {
 				img = frame.Image
@@ -951,51 +958,7 @@ func worker() {
 
 			if err != nil {
 				if err == errNoImage {
-					noImageCount++
-
-					// DXGI stall detection: If we've received too many consecutive errNoImage returns,
-					// or we're already in stall mode, use GDI fallback to ensure frames flow.
-					//
-					// - Initial threshold: ~500ms at 30 FPS (15 ticks) before entering stall mode
-					// - In stall mode: take GDI screenshot every tick to maintain frame rate
-					// - Exit stall mode: when DXGI returns a valid frame (in processFrame section)
-					const noImageFallbackThreshold = 15
-
-					useGDIFallback := false
-					if inStallMode {
-						// In stall mode: use GDI every tick
-						useGDIFallback = true
-					} else if noImageCount >= noImageFallbackThreshold && runtime.GOOS == "windows" {
-						// Enter stall mode after threshold
-						inStallMode = true
-						useGDIFallback = true
-						telemetry.LogStructured("WARN", "worker: DXGI stall detected, entering GDI fallback mode", map[string]interface{}{
-							"no_image_count": noImageCount,
-							"bounds_width":   currentBounds.Dx(),
-							"bounds_height":  currentBounds.Dy(),
-						})
-					}
-
-					if useGDIFallback {
-						// Take a GDI screenshot - this always captures the current screen state
-						// regardless of DWM dirty tracking.
-						fallbackImg, fallbackErr := screenshot.CaptureRect(currentBounds)
-						if fallbackErr == nil && fallbackImg != nil {
-							// screenshot.CaptureRect returns *image.RGBA directly
-							img = fallbackImg
-							err = nil              // Clear the error so we process this frame
-							fromGDIFallback = true // Mark this frame as from GDI fallback
-
-							// Skip the normal error handling and continue to frame processing
-							goto processFrame
-						} else {
-							telemetry.LogStructured("WARN", "worker: GDI fallback capture failed", map[string]interface{}{
-								"error": fmt.Sprintf("%v", fallbackErr),
-							})
-						}
-					}
-
-					// Normal path: screen idle - DXGI detected no changes, continue without delay
+					// Screen idle - DXGI detected no changes, continue without delay.
 					if frame != nil {
 						frame.Close()
 						frame = nil
@@ -1055,10 +1018,8 @@ func worker() {
 				continue
 			}
 
-		processFrame:
 			// Success! Reset error counters
 			numConsecutive = 0
-			noImageCount = 0
 			lastSuccessTime = tickTime
 			frameCount++
 			if frameCount <= 10 {
@@ -1066,14 +1027,6 @@ func worker() {
 				hasGPU := hasFrame && frame.GPU != nil
 				hasImg := img != nil
 				rtcDebugLog("[WORKER_FRAME] frameCount=%d hasFrame=%v hasGPU=%v hasImg=%v\n", frameCount, hasFrame, hasGPU, hasImg)
-			}
-
-			// Exit stall mode if this frame came from DXGI (not GDI fallback)
-			if inStallMode && !fromGDIFallback {
-				telemetry.LogStructured("INFO", "worker: DXGI recovered, exiting stall mode", map[string]interface{}{
-					"frame_count": frameCount,
-				})
-				inStallMode = false
 			}
 
 			// RESOLUTION CHANGE DETECTION: Check if screen bounds changed
@@ -1128,9 +1081,9 @@ func worker() {
 			// switched to WebRTC (<video>) and explicitly requested suppression.
 			// Also skip if we have no CPU image (GPU-only frame from DXGI capture).
 			if anySessionNeedsWSFrames() && img != nil {
-				// Delta detection with performance tracking
+				// Delta detection with performance tracking (parallel encoding via pool)
 				isKeyframe := prev == nil
-				diff := imageCompare(img, prev, compress)
+				diff := imageCompare(img, prev, compress, encoderPool)
 
 				// Track metrics for performance monitoring
 				if prev == nil {
@@ -1948,6 +1901,9 @@ func broadcastResolutionChange(newBounds image.Rectangle) {
 }
 
 func anySessionNeedsWSFrames() bool {
+	if isWindowsSinglePipeline() {
+		return false
+	}
 	needed := false
 	sessions.IterCb(func(_ string, desktop *session) bool {
 		if desktop == nil || desktop.escape.Load() {
@@ -2260,14 +2216,16 @@ func quitAllDesktop(info string) {
 // 2. Subsequent frames: block-level delta detection
 // 3. Short-circuit: identical blocks are skipped entirely (no encoding)
 // 4. Resync: automatically handles resolution changes via nil prev
-func imageCompare(img, prev *image.RGBA, compress int) []*[]byte {
+//
+// The pool parameter enables parallel block encoding. If nil, encoding is sequential.
+func imageCompare(img, prev *image.RGBA, compress int, pool *BlockEncoderPool) []*[]byte {
 	// Full-frame path: first frame or resync (no previous frame)
 	if prev == nil {
 		telemetry.LogStructured("DEBUG", "imageCompare: full-frame path (first frame or resync)", map[string]interface{}{
 			"width":  img.Rect.Dx(),
 			"height": img.Rect.Dy(),
 		})
-		return splitFullImage(img, compress)
+		return splitFullImage(img, compress, pool)
 	}
 
 	// Delta detection: find changed blocks at block granularity
@@ -2278,35 +2236,45 @@ func imageCompare(img, prev *image.RGBA, compress int) []*[]byte {
 		return make([]*[]byte, 0)
 	}
 
-	result := make([]*[]byte, 0, len(diff))
-
 	// Image origin offset for coordinate translation
 	// Multi-monitor setups may have non-zero origins
 	originX := img.Rect.Min.X
 	originY := img.Rect.Min.Y
 
-	// Encode only the changed blocks
-	for _, rect := range diff {
+	// Build source and output rect arrays for parallel encoding
+	srcRects := make([]image.Rectangle, len(diff))
+	outRects := make([]image.Rectangle, len(diff))
+
+	for i, rect := range diff {
 		// getDiff returns 0-based rectangles, but getImageBlock needs image-space coords
 		// Translate to image coordinate space for pixel extraction
-		srcRect := image.Rect(
+		srcRects[i] = image.Rect(
 			rect.Min.X+originX,
 			rect.Min.Y+originY,
 			rect.Max.X+originX,
 			rect.Max.Y+originY,
 		)
+		// Output rects use browser canvas coordinates (0-based)
+		outRects[i] = rect
+	}
 
-		block, blockCodecType := getImageBlock(img, srcRect)
-		// makeImageBlock receives the 0-based rect for browser canvas coordinates
-		// (browser canvas always starts at 0,0)
-		block = makeImageBlock(block, rect, blockCodecType)
+	// Use parallel encoding if pool is available
+	if pool != nil {
+		return pool.EncodeBlocks(img, srcRects, outRects)
+	}
+
+	// Fallback: sequential encoding (for backward compatibility)
+	result := make([]*[]byte, 0, len(diff))
+	for i := range diff {
+		block, blockCodecType := getImageBlock(img, srcRects[i])
+		block = makeImageBlock(block, outRects[i], blockCodecType)
 		result = append(result, &block)
 	}
 
 	return result
 }
 
-func splitFullImage(img *image.RGBA, compress int) []*[]byte {
+func splitFullImage(img *image.RGBA, compress int, pool *BlockEncoderPool) []*[]byte {
 	if img == nil {
 		return nil
 	}
@@ -2319,7 +2287,6 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 	}
 	blocksX := (imgWidth + tileSize - 1) / tileSize
 	blocksY := (imgHeight + tileSize - 1) / tileSize
-	result := make([]*[]byte, 0, blocksX*blocksY)
 
 	// Store origin offset for coordinate normalization
 	// Multi-monitor setups may have non-zero origins (e.g., secondary monitor at X=1920)
@@ -2336,6 +2303,10 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 			"height":   imgHeight,
 		})
 	}
+
+	// Build source and output rect arrays for parallel encoding
+	srcRects := make([]image.Rectangle, 0, blocksX*blocksY)
+	outRects := make([]image.Rectangle, 0, blocksX*blocksY)
 
 	// Strict scanline ordering: send blocks in sequential row-major order.
 	// With double-buffering in the browser, all blocks render to an off-screen canvas
@@ -2355,18 +2326,27 @@ func splitFullImage(img *image.RGBA, compress int) []*[]byte {
 			}
 
 			// Source rectangle in image coordinates (for pixel extraction)
-			srcRect := image.Rect(x, y, x+blockW, y+blockH)
+			srcRects = append(srcRects, image.Rect(x, y, x+blockW, y+blockH))
 
 			// Destination rectangle normalized to (0,0) origin (for browser canvas)
 			// This is CRITICAL for multi-monitor support - browser canvas starts at (0,0)
 			normalizedX := x - originX
 			normalizedY := y - originY
-			dstRect := image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH)
-
-			block, blockCodecType := getImageBlock(img, srcRect)
-			block = makeImageBlock(block, dstRect, blockCodecType) // Use normalized coords for header
-			result = append(result, &block)
+			outRects = append(outRects, image.Rect(normalizedX, normalizedY, normalizedX+blockW, normalizedY+blockH))
 		}
+	}
+
+	// Use parallel encoding if pool is available
+	if pool != nil {
+		return pool.EncodeBlocks(img, srcRects, outRects)
+	}
+
+	// Fallback: sequential encoding
+	result := make([]*[]byte, 0, len(srcRects))
+	for i := range srcRects {
+		block, blockCodecType := getImageBlock(img, srcRects[i])
+		block = makeImageBlock(block, outRects[i], blockCodecType)
+		result = append(result, &block)
 	}
 	return result
 }
@@ -2650,6 +2630,7 @@ func InitDesktop(pack modules.Packet) error {
 	if uuid == `` {
 		return errors.New(`${i18n|COMMON.INVALID_PARAMETER}`)
 	}
+	singlePipeline := isWindowsSinglePipeline()
 
 	// Apply optional initialization parameters (monitor/fps/quality/codec)
 	if val, ok := pack.GetData(`monitor`, reflect.Float64); ok {
@@ -2658,32 +2639,34 @@ func InitDesktop(pack modules.Packet) error {
 	if val, ok := pack.GetData(`fps`, reflect.Float64); ok {
 		configFPS.Store(clampFPSValue(int32(val.(float64))))
 	}
-	if val, ok := pack.GetData(`quality`, reflect.Float64); ok {
-		configQuality.Store(clampQualityValue(int32(val.(float64))))
-		// Refresh JPEG codec quality if active
-		if _, ok := GetCodec().(*JPEGCodec); ok {
-			newCodec := NewJPEGCodec(int(configQuality.Load()))
-			if adaptiveQualityManager != nil {
-				newCodec.EnableAdaptiveQuality(adaptiveQualityManager)
+	if !singlePipeline {
+		if val, ok := pack.GetData(`quality`, reflect.Float64); ok {
+			configQuality.Store(clampQualityValue(int32(val.(float64))))
+			// Refresh JPEG codec quality if active
+			if _, ok := GetCodec().(*JPEGCodec); ok {
+				newCodec := NewJPEGCodec(int(configQuality.Load()))
+				if adaptiveQualityManager != nil {
+					newCodec.EnableAdaptiveQuality(adaptiveQualityManager)
+				}
+				SetCodec(newCodec)
 			}
-			SetCodec(newCodec)
 		}
-	}
-	if val, ok := pack.GetData(`codec`, reflect.String); ok {
-		switch strings.ToLower(val.(string)) {
-		case "raw", "rgba":
-			SetCodec(NewRawCodec())
-		case "webp":
-			SetCodec(NewWebPCodec(int(configQuality.Load())))
-		case "png", "lossless":
-			// PNG codec for lossless encoding (best for text/terminals/diagrams)
-			SetCodec(NewPNGCodecFast())
-		default:
-			jpeg := NewJPEGCodec(int(configQuality.Load()))
-			if adaptiveQualityManager != nil {
-				jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
+		if val, ok := pack.GetData(`codec`, reflect.String); ok {
+			switch strings.ToLower(val.(string)) {
+			case "raw", "rgba":
+				SetCodec(NewRawCodec())
+			case "webp":
+				SetCodec(NewWebPCodec(int(configQuality.Load())))
+			case "png", "lossless":
+				// PNG codec for lossless encoding (best for text/terminals/diagrams)
+				SetCodec(NewPNGCodecFast())
+			default:
+				jpeg := NewJPEGCodec(int(configQuality.Load()))
+				if adaptiveQualityManager != nil {
+					jpeg.EnableAdaptiveQuality(adaptiveQualityManager)
+				}
+				SetCodec(jpeg)
 			}
-			SetCodec(jpeg)
 		}
 	}
 
@@ -2693,6 +2676,9 @@ func InitDesktop(pack modules.Packet) error {
 		channel:     make(chan message, 10), // PERF: Increased from 5 to prevent blocking during frame bursts
 		lock:        &sync.Mutex{},
 		metricsStop: make(chan struct{}),
+	}
+	if singlePipeline {
+		desktop.wsFramesSuppressed.Store(true)
 	}
 	// Default to allowControl=true for legacy servers, but honor explicit policy from the server.
 	allowControl := true
@@ -2768,8 +2754,8 @@ func InitDesktop(pack modules.Packet) error {
 		prev, _ = prevVal.(*image.RGBA)
 	}
 
-	if prev != nil {
-		img := splitFullImage(prev, compress)
+	if !singlePipeline && prev != nil {
+		img := splitFullImage(prev, compress, nil) // nil pool = sequential (init path)
 		if img != nil {
 			initialFrameSeq := globalFrameSeq.Add(1)
 			select {
@@ -2799,7 +2785,7 @@ func InitDesktop(pack modules.Packet) error {
 	// which leaves prevDesktop unset and the browser with a black canvas. Previously we
 	// seeded synchronously during init, but that can block handleDesktop/worker startup
 	// in the UI bridge. Seed asynchronously so streaming starts immediately.
-	if prev == nil {
+	if !singlePipeline && prev == nil {
 		go func(desktopUUID string, monitor int32, rect image.Rectangle, sess *session) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -2839,7 +2825,7 @@ func InitDesktop(pack modules.Packet) error {
 				"monitor":      monitor,
 			})
 
-			img := splitFullImage(seed, compress)
+			img := splitFullImage(seed, compress, nil) // nil pool = sequential (reseed path)
 			if img == nil {
 				return
 			}
@@ -2909,6 +2895,9 @@ func KillDesktop(pack modules.Packet) {
 
 func GetDesktop(pack modules.Packet) {
 	if forwarded, _ := relayDesktopCommand(pack, ipc.MsgTypeDesktopShot); forwarded {
+		return
+	}
+	if isWindowsSinglePipeline() {
 		return
 	}
 
@@ -2983,7 +2972,7 @@ func GetDesktop(pack modules.Packet) {
 		return
 	}
 
-	img := splitFullImage(prev, compress)
+	img := splitFullImage(prev, compress, nil) // nil pool = sequential (screenshot path)
 	if img == nil {
 		return
 	}
@@ -3063,9 +3052,40 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 			if msg.t == 0 {
 				desktop.lock.Lock()
 				rawEvent := desktop.rawEvent
+				rtcSess := desktop.rtc
 				desktop.lock.Unlock()
 
-				// OPTIMIZED METADATA PACKING & CHUNKING
+				// Try WebRTC data channel first (lower latency than WebSocket)
+				if rtcSess != nil && rtcSess.rtc != nil {
+					if rtcSess.rtc.TilesChannelReady() {
+						blocks := *msg.frame
+						sent, err := rtcSess.rtc.SendTiles(blocks)
+						if err == nil && sent == len(blocks) {
+							// All tiles sent via WebRTC, skip WS
+							continue
+						}
+						// Partial send or error - fall back to WebSocket for remaining tiles
+						if sent > 0 {
+							telemetry.LogStructured("WARN", "desktop: partial WebRTC tile send, falling back to WS", map[string]interface{}{
+								"desktop": uuid,
+								"sent":    sent,
+								"total":   len(blocks),
+								"error":   err,
+							})
+						}
+					} else {
+						// Log first few times when tiles DC isn't ready (to debug latency issues)
+						dcNotReadyCount := tilesDCNotReadyCounter.Add(1)
+						if dcNotReadyCount <= 5 || dcNotReadyCount%500 == 0 {
+							telemetry.LogStructured("DEBUG", "desktop: tiles DC not ready, using WS", map[string]interface{}{
+								"desktop": uuid,
+								"count":   dcNotReadyCount,
+							})
+						}
+					}
+				}
+
+				// OPTIMIZED METADATA PACKING & CHUNKING (WebSocket fallback)
 				// Protocol: [magic(5)][opcode(1)][eventID(16)][blocks...]
 				// Each block: [len(2)][type(2)][x(2)][y(2)][w(2)][h(2)][data(len-10)]
 				// Chunks must stay under MaxMessageSize (65KB)
@@ -3139,7 +3159,8 @@ func cloneCaptureFrameForRTC(frame *CaptureFrame) *CaptureFrame {
 	}
 
 	out := &CaptureFrame{
-		Image: frame.Image,
+		Image:         frame.Image,
+		CaptureTimeNs: frame.CaptureTimeNs,
 	}
 	if frame.GPU != nil {
 		out.GPU = cloneGPUFrame(frame.GPU)

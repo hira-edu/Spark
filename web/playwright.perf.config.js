@@ -24,6 +24,7 @@ export default defineConfig({
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
+        '--disable-features=WebRtcHideLocalIpsWithMdns',
       ],
     },
     video: 'retain-on-failure',

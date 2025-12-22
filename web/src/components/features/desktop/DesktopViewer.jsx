@@ -19,9 +19,6 @@ const DesktopViewer = ({
   onClose,
 }) => {
   // State
-  const [codec, setCodec] = useState('jpeg');
-  const [qualityAuto, setQualityAuto] = useState(true);
-  const [quality, setQuality] = useState(75); // Used when Auto quality is off
   const [targetFps, setTargetFps] = useState(30);
   const [mouseEnabled, setMouseEnabled] = useState(true);
   const [keyboardEnabled, setKeyboardEnabled] = useState(true);
@@ -74,10 +71,14 @@ const DesktopViewer = ({
     return () => { cancelled = true; };
   }, [shareToken]);
 
+  // Ref for tile data callback (used to avoid circular dependency)
+  const handleTileBlockRef = useRef(null);
+
   const {
     videoRef: webrtcVideoRef,
     isActive: webrtcActive,
     controlChannel: webrtcControlChannel,
+    tilesChannel: webrtcTilesChannel,
     videoFps: webrtcVideoFps,
     start: startWebRTC,
     stop: stopWebRTC,
@@ -89,6 +90,12 @@ const DesktopViewer = ({
     sendSignal: useCallback((payload) => {
       if (sendSignalRef.current) {
         sendSignalRef.current(payload);
+      }
+    }, []),
+    // Route WebRTC tile data to the stream hook's tile renderer via ref
+    onTileData: useCallback((data) => {
+      if (handleTileBlockRef.current) {
+        handleTileBlockRef.current(data);
       }
     }, []),
   });
@@ -106,18 +113,24 @@ const DesktopViewer = ({
     disconnect,
     sendConfig,
     sendInput,
-    sendClipboard,
-    sendFileDrop,
-    requestShot,
     sendSignal,
+    handleTileBlock,
   } = useDesktopStream(device, canvasRef, {
     shareToken,
     shareSecret,
     allowControl,
     controlChannel: webrtcControlChannel,
     onJSONMessage: handleSignalMessage,
-    suppressFrames: webrtcActive,
+    // FIXED: Always render WS tile frames as a fallback.
+    // WebRTC video overlays the canvas when active, but tiles ensure
+    // the viewer works even when hardware encoding is unavailable.
+    suppressFrames: false,
   });
+
+  // Update the tile block ref after useDesktopStream is initialized
+  useEffect(() => {
+    handleTileBlockRef.current = handleTileBlock;
+  }, [handleTileBlock]);
 
   // Wire WS-only sendSignal into the WebRTC hook.
   useEffect(() => {
@@ -166,33 +179,16 @@ const DesktopViewer = ({
     };
   }, [deviceId, shareToken, shareSecret, connect, disconnect]);
 
-  // Send config when settings change
+  // Send config when settings change (WebRTC-only transport).
   useEffect(() => {
     if (status === 'connected') {
-      const config = {
+      sendConfig({
         fps: targetFps,
         display: selectedMonitor,
-        codec,
-      };
-
-      // Adaptive quality only applies to JPEG tiles.
-      if (codec === 'jpeg') {
-        config.qualityAuto = qualityAuto;
-        if (!qualityAuto) {
-          config.quality = quality;
-        }
-      }
-
-      sendConfig(config);
+        transport: 'webrtc',
+      });
     }
-  }, [codec, qualityAuto, quality, targetFps, selectedMonitor, status, sendConfig]);
-
-  // When WebRTC video is active, suppress the WS tile/canvas stream for this session.
-  useEffect(() => {
-    if (status === 'connected') {
-      sendConfig({ transport: webrtcActive ? 'webrtc' : 'tiles' });
-    }
-  }, [status, webrtcActive, sendConfig]);
+  }, [targetFps, selectedMonitor, status, sendConfig]);
 
   // Handle screenshot
   const handleScreenshot = useCallback(() => {
@@ -228,26 +224,6 @@ const DesktopViewer = ({
     }
   }, [device, webrtcActive, webrtcVideoRef]);
 
-  // Handle clipboard sync
-  const handleClipboardSync = useCallback(async () => {
-    if (!allowControl) {
-      message.warning(i18n.t('SHARE.VIEW_ONLY_NOTICE') || 'View-only mode');
-      return;
-    }
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        sendClipboard(text);
-        message.success(i18n.t('SHARE.COPIED'));
-      } else {
-        message.info(i18n.t('COMMON.EMPTY') || 'Clipboard empty');
-      }
-    } catch (err) {
-      console.error('Clipboard access failed:', err);
-      message.error('Failed to access clipboard');
-    }
-  }, [allowControl, sendClipboard]);
-
   // Handle reconnect
   const handleReconnect = useCallback(() => {
     disconnect();
@@ -282,31 +258,6 @@ const DesktopViewer = ({
     };
   }, [pointerLocked, exitPointerLock]);
 
-  // File drag/drop -> send metadata as a control op
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return undefined;
-
-    const preventDefault = (e) => {
-      e.preventDefault();
-    };
-    const handleDrop = (e) => {
-      e.preventDefault();
-      if (!allowControl) return;
-      const { files } = e.dataTransfer || {};
-      if (files && files.length > 0) {
-        sendFileDrop(files);
-      }
-    };
-
-    canvas.addEventListener('dragover', preventDefault);
-    canvas.addEventListener('drop', handleDrop);
-    return () => {
-      canvas.removeEventListener('dragover', preventDefault);
-      canvas.removeEventListener('drop', handleDrop);
-    };
-  }, [allowControl, sendFileDrop]);
-
   const isConnected = status === 'connected';
   const canvasRect = canvasRef.current?.getBoundingClientRect();
   const contentRect = contentRef.current?.getBoundingClientRect();
@@ -332,7 +283,7 @@ const DesktopViewer = ({
         bandwidth={bandwidth}
         resolution={resolution}
         onClose={onClose}
-        transport={webrtcActive ? 'webrtc' : 'tiles'}
+        transport="webrtc"
       />
 
       {/* Canvas Container */}
@@ -373,12 +324,6 @@ const DesktopViewer = ({
 
       {/* Bottom Control Bar */}
       <ControlBar
-        codec={codec}
-        onCodecChange={setCodec}
-        quality={quality}
-        onQualityChange={setQuality}
-        qualityAuto={qualityAuto}
-        onQualityAutoChange={setQualityAuto}
         targetFps={targetFps}
         onFpsChange={setTargetFps}
         allowControl={allowControl}
@@ -387,7 +332,6 @@ const DesktopViewer = ({
         keyboardEnabled={keyboardEnabled}
         onKeyboardToggle={() => setKeyboardEnabled(!keyboardEnabled)}
         onScreenshot={handleScreenshot}
-        onClipboard={handleClipboardSync}
         isFullscreen={isFullscreen}
         onFullscreen={toggleFullscreen}
         monitors={monitors}
