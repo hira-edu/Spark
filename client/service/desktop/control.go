@@ -15,9 +15,10 @@ import (
 
 // Configuration parameters (atomic updates)
 var (
-	configFPS     atomic.Int32 // Target FPS (24-60)
-	configQuality atomic.Int32 // Codec quality (1-100)
-	configMonitor atomic.Int32 // Monitor index (0-N)
+	configFPS      atomic.Int32 // Target FPS (24-60)
+	configQuality  atomic.Int32 // Codec quality (1-100)
+	configMonitor  atomic.Int32 // Monitor index (0-N)
+	configTextMode atomic.Bool  // Text mode: use 4:4:4 subsampling for sharper text
 )
 
 func init() {
@@ -26,6 +27,16 @@ func init() {
 	configQuality.Store(imageQuality)
 	configMonitor.Store(0)
 	setConfiguredCaptureBackend(CaptureBackendAuto)
+
+	if envFlagEnabled("SPARK_FORCE_GDI") {
+		setConfiguredCaptureBackend(CaptureBackendGDI)
+		setFallbackOrder([]CaptureBackendMode{CaptureBackendGDI})
+		bumpCaptureConfigEpoch()
+		telemetry.LogStructured("INFO", "config: capture backend forced to gdi", map[string]interface{}{
+			"backend": captureBackendName(CaptureBackendGDI),
+		})
+		return
+	}
 
 	if isWindowsSinglePipeline() {
 		setConfiguredCaptureBackend(CaptureBackendDXGI_NV12)
@@ -275,6 +286,34 @@ skipQualityAuto:
 	}
 skipQuality:
 
+	// Update text mode (4:4:4 subsampling for sharper text)
+	if textModeVal, ok := pack.Data["text_mode"]; ok {
+		if singlePipeline {
+			warnings = append(warnings, "text_mode: ignored in webrtc-only mode")
+			goto skipTextMode
+		}
+		textMode, okBool := textModeVal.(bool)
+		if !okBool {
+			errors = append(errors, "text_mode: invalid type (expected bool)")
+		} else {
+			oldTextMode := configTextMode.Swap(textMode)
+			updated = append(updated, "text_mode")
+
+			// Apply to current codec if it supports subsampling
+			current := GetCodec()
+			if turbo, ok := current.(*LibjpegTurboCodec); ok {
+				turbo.SetTextMode(textMode)
+			}
+
+			telemetry.LogStructured("INFO", "config: text_mode updated", map[string]interface{}{
+				"old":         oldTextMode,
+				"new":         textMode,
+				"subsampling": map[bool]string{true: "4:4:4", false: "4:2:0"}[textMode],
+			})
+		}
+	}
+skipTextMode:
+
 	// Update monitor index (if provided)
 	if monitorVal, ok := pack.Data["monitor"]; ok {
 		var monitor int32
@@ -357,7 +396,11 @@ skipCapture:
 			}
 			newCodec = jpeg
 		case "jpeg-turbo", "turbo":
-			newCodec = NewLibjpegTurboCodec(quality)
+			subsamp := Subsamp420
+			if configTextMode.Load() {
+				subsamp = Subsamp444 // 4:4:4 for text clarity
+			}
+			newCodec = NewLibjpegTurboCodecWithSubsampling(quality, subsamp)
 		case "png", "lossless":
 			newCodec = NewPNGCodecFast()
 		case "webp":
@@ -391,12 +434,15 @@ skipCodec:
 
 	// Send acknowledgement
 	currentCodec := GetCodec()
+	textMode := configTextMode.Load()
 	ackData := map[string]interface{}{
 		"updated":                updated,
 		"fps":                    configFPS.Load(),
 		"quality":                configQuality.Load(),
 		"monitor":                configMonitor.Load(),
 		"codec":                  currentCodec.Name(),
+		"text_mode":              textMode,
+		"subsampling":            map[bool]string{true: "4:4:4", false: "4:2:0"}[textMode],
 		"capture_backend":        captureBackendName(getConfiguredCaptureBackend()),
 		"capture_backend_active": getActiveCaptureBackend(),
 	}

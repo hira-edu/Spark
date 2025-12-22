@@ -3055,8 +3055,12 @@ func handleDesktop(pack modules.Packet, uuid string, desktop *session) {
 				rtcSess := desktop.rtc
 				desktop.lock.Unlock()
 
-				// Try WebRTC data channel first (lower latency than WebSocket)
-				if rtcSess != nil && rtcSess.rtc != nil {
+				// Check if session is in fallback mode - skip WebRTC, use tiles via WebSocket
+				if rtcSess != nil && rtcSess.IsInFallbackMode() {
+					// In fallback mode, always use WebSocket tiles
+					// Fall through to WebSocket path below
+				} else if rtcSess != nil && rtcSess.rtc != nil {
+					// Normal mode: Try WebRTC data channel first (lower latency than WebSocket)
 					if rtcSess.rtc.TilesChannelReady() {
 						blocks := *msg.frame
 						sent, err := rtcSess.rtc.SendTiles(blocks)

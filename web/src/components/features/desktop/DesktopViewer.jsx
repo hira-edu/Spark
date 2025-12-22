@@ -179,16 +179,17 @@ const DesktopViewer = ({
     };
   }, [deviceId, shareToken, shareSecret, connect, disconnect]);
 
-  // Send config when settings change (WebRTC-only transport).
+  // Send config when settings change, preferring WebRTC when active.
   useEffect(() => {
     if (status === 'connected') {
+      const transport = webrtcActive ? 'webrtc' : 'tiles';
       sendConfig({
         fps: targetFps,
         display: selectedMonitor,
-        transport: 'webrtc',
+        transport,
       });
     }
-  }, [targetFps, selectedMonitor, status, sendConfig]);
+  }, [targetFps, selectedMonitor, status, webrtcActive, sendConfig]);
 
   // Handle screenshot
   const handleScreenshot = useCallback(() => {

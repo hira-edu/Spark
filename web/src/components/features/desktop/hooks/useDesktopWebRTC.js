@@ -27,6 +27,11 @@ function iceServersKey(iceServers) {
 }
 
 function preferH264Codec(transceiver) {
+  // Prefer H.264 but keep other codecs available for fallback.
+  preferCodec(transceiver, 'h264');
+}
+
+function preferCodec(transceiver, codecName) {
   if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return;
   if (typeof RTCRtpReceiver === 'undefined' || typeof RTCRtpReceiver.getCapabilities !== 'function') return;
 
@@ -34,14 +39,21 @@ function preferH264Codec(transceiver) {
   const codecs = capabilities?.codecs || [];
   if (!Array.isArray(codecs) || codecs.length === 0) return;
 
-  const h264 = codecs.filter((c) => (c?.mimeType || '').toLowerCase() === 'video/h264');
-  if (h264.length === 0) return;
+  const normalized = codecName.toLowerCase();
+  const mimeType = `video/${normalized}`;
+  const preferred = codecs.filter((c) => (c?.mimeType || '').toLowerCase() === mimeType);
+  if (preferred.length === 0) {
+    console.warn(`[WebRTC] codec ${codecName} not available in browser`);
+    return;
+  }
 
+  // Put preferred codec first, then others
+  const others = codecs.filter((c) => (c?.mimeType || '').toLowerCase() !== mimeType);
   try {
-    // Hard-lock to H.264 to match the Windows hardware pipeline.
-    transceiver.setCodecPreferences(h264);
-  } catch (_) {
-    // Codec preference is best-effort; ignore browsers that reject custom ordering.
+    transceiver.setCodecPreferences([...preferred, ...others]);
+    console.log(`[WebRTC] codec preference set to ${codecName}`);
+  } catch (err) {
+    console.warn(`[WebRTC] setCodecPreferences failed:`, err);
   }
 }
 
@@ -51,6 +63,7 @@ export function useDesktopWebRTC({
   sendSignal = null,
   iceServers = null,
   onTileData = null, // Callback for tile data received via WebRTC data channel
+  onFallback = null, // Callback when encoder fallback occurs
 } = {}) {
   const videoRef = useRef(null);
   const pcRef = useRef(null);
@@ -61,6 +74,8 @@ export function useDesktopWebRTC({
   const perfStatsRef = useRef({ lastCaptureTs: 0, samples: [] });
   const startingRef = useRef(false); // Guard against concurrent start() calls
   const onTileDataRef = useRef(onTileData); // Ref to avoid stale closures
+  const onFallbackRef = useRef(onFallback); // Ref for fallback callback
+  const preferredCodecRef = useRef('h264'); // Current codec preference
 
   const [status, setStatus] = useState('off'); // off | connecting | connected | failed
   const [controlChannel, setControlChannel] = useState(null);
@@ -68,11 +83,15 @@ export function useDesktopWebRTC({
   const [hasVideo, setHasVideo] = useState(false);
   const [videoFps, setVideoFps] = useState(0);
   const [latencyMs, setLatencyMs] = useState(0);
+  const [displayMode, setDisplayMode] = useState('webrtc'); // webrtc | tiles
 
-  // Keep onTileData ref updated
+  // Keep refs updated
   useEffect(() => {
     onTileDataRef.current = onTileData;
   }, [onTileData]);
+  useEffect(() => {
+    onFallbackRef.current = onFallback;
+  }, [onFallback]);
 
   // FPS tracking via requestVideoFrameCallback
   const fpsCountRef = useRef(0);
@@ -91,10 +110,12 @@ export function useDesktopWebRTC({
     setControlChannel(null);
     setTilesChannel(null);
     setLatencyMs(0);
+    setDisplayMode('webrtc');
     perfStatsRef.current = { lastCaptureTs: 0, samples: [] };
     iceKeyRef.current = '';
     pendingIceRef.current = [];
     startingRef.current = false; // Allow restart after stop
+    preferredCodecRef.current = 'h264'; // Reset codec preference
 
     const dc = dcRef.current;
     dcRef.current = null;
@@ -303,6 +324,68 @@ export function useDesktopWebRTC({
     }
   }, [effectiveIceKey, start, stop]);
 
+  // Initiate SDP renegotiation with a different codec preference
+  const initiateRenegotiation = useCallback(async (codec) => {
+    const pc = pcRef.current;
+    if (!pc || !sendSignal) {
+      console.warn('[WebRTC] cannot renegotiate: no PC or sendSignal');
+      return;
+    }
+
+    console.log(`[WebRTC] initiating renegotiation for codec: ${codec}`);
+    preferredCodecRef.current = codec;
+
+    try {
+      // Find the video transceiver and update codec preferences
+      const transceivers = pc.getTransceivers();
+      const videoTransceiver = transceivers.find(t => t.receiver?.track?.kind === 'video');
+      if (videoTransceiver) {
+        preferCodec(videoTransceiver, codec);
+      }
+
+      // Create and send a new offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      console.log('[WebRTC] sending renegotiation offer for', codec);
+      await sendSignal({
+        act: 'DESKTOP_WEBRTC_OFFER',
+        data: {
+          sdp: offer.sdp,
+          type: offer.type,
+          role: allowControl ? 'viewer' : 'viewer_readonly',
+          renegotiate: true,
+          codec: codec,
+        },
+      });
+    } catch (err) {
+      console.error('[WebRTC] renegotiation failed:', err);
+    }
+  }, [allowControl, sendSignal]);
+
+  // Switch to tiles-only display mode (disable video track)
+  const switchToTilesMode = useCallback(() => {
+    console.log('[WebRTC] switching to tiles mode');
+    setDisplayMode('tiles');
+    setHasVideo(false);
+
+    // Stop the video track but keep the PC for data channels
+    const video = videoRef.current;
+    if (video && video.srcObject) {
+      const stream = video.srcObject;
+      stream.getVideoTracks().forEach(track => {
+        console.log('[WebRTC] stopping video track:', track.id);
+        track.stop();
+      });
+      video.srcObject = null;
+    }
+
+    // Notify parent component
+    if (onFallbackRef.current) {
+      onFallbackRef.current({ mode: 'tiles', reason: 'encoder_fallback' });
+    }
+  }, []);
+
   const handleSignalMessage = useCallback((msg) => {
     const pc = pcRef.current;
     console.log('[WebRTC] handleSignalMessage', { act: msg?.act, hasPC: !!pc, hasSdp: !!msg?.data?.sdp });
@@ -354,8 +437,31 @@ export function useDesktopWebRTC({
       }
       pc.addIceCandidate(candidate)
         .catch((err) => console.error('[WebRTC] addIceCandidate failed:', err));
+      return;
     }
-  }, [stop]);
+
+    // Handle encoder fallback: codec switch required (e.g., NVENC -> VP8)
+    if (act === 'CODEC_SWITCH_REQUIRED') {
+      const toCodec = data?.to_codec || data?.codec || 'vp8';
+      console.log(`[WebRTC] server requested codec switch to: ${toCodec}`);
+
+      // Notify parent about the fallback
+      if (onFallbackRef.current) {
+        onFallbackRef.current({ mode: 'codec_switch', codec: toCodec, reason: data?.reason });
+      }
+
+      // Initiate renegotiation with the new codec
+      initiateRenegotiation(toCodec);
+      return;
+    }
+
+    // Handle transport fallback: switch to tiles mode (encoder completely failed)
+    if (act === 'TRANSPORT_FALLBACK') {
+      console.log('[WebRTC] server requested transport fallback to tiles');
+      switchToTilesMode();
+      return;
+    }
+  }, [stop, initiateRenegotiation, switchToTilesMode]);
 
   useEffect(() => {
     if (!enabled) {
@@ -438,8 +544,10 @@ export function useDesktopWebRTC({
     videoFps,
     latencyMs,
     perfStats: perfStatsRef.current,
+    displayMode, // 'webrtc' | 'tiles' - current display mode
     start,
     stop,
     handleSignalMessage,
+    initiateRenegotiation, // For manual codec switching if needed
   };
 }

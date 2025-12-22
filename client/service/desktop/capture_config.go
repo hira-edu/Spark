@@ -11,7 +11,10 @@ import (
 // fallback order, flags) into the desktop worker before any sessions start.
 func ApplyCaptureConfig(cfg config.CaptureConfig) {
 	mode := cfg.Mode
-	if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
+	forceGDI := envFlagEnabled("SPARK_FORCE_GDI")
+	if forceGDI {
+		mode = "gdi"
+	} else if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
 		// Allow environment override for CI/perf harnesses.
 		// Example: SPARK_CAPTURE_BACKEND=dxgi
 		mode = raw
@@ -29,7 +32,9 @@ func ApplyCaptureConfig(cfg config.CaptureConfig) {
 
 	enableSharedSurfaceCapture(cfg.EnablePreDWM)
 
-	if len(cfg.FallbackOrder) > 0 {
+	if forceGDI {
+		setFallbackOrder([]CaptureBackendMode{CaptureBackendGDI})
+	} else if len(cfg.FallbackOrder) > 0 {
 		setFallbackOrder(parseFallbackList(cfg.FallbackOrder))
 	} else if cfg.EnablePreDWM {
 		setFallbackOrder([]CaptureBackendMode{
@@ -46,6 +51,7 @@ func ApplyCaptureConfig(cfg config.CaptureConfig) {
 		"requested_mode":    captureBackendName(desired),
 		"previous_mode":     captureBackendName(prev),
 		"enable_pre_dwm":    cfg.EnablePreDWM,
+		"force_gdi":         forceGDI,
 		"fallback_order":    captureBackendNames(getFallbackOrder()),
 		"adapter_luid_hint": cfg.AdapterLUID,
 	})
@@ -82,4 +88,13 @@ func captureBackendNames(modes []CaptureBackendMode) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

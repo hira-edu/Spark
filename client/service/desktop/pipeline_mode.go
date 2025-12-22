@@ -23,22 +23,54 @@ func checkNVENCAvailable() bool {
 	return nvencAvailable
 }
 
+func isEnvTruthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // isWindowsSinglePipeline reports whether the app should hard-lock to the
 // Windows GPU pipeline (DXGI NV12 + hardware H.264 + WebRTC).
 //
-// Uses NVIDIA NVENC for hardware H.264 encoding, bypassing the unreliable
-// Windows Media Foundation encoder which fires MEError and breaks after frame 1.
+// Uses NVIDIA NVENC for hardware H.264 encoding.
 //
 // Returns false if:
+// - SPARK_FORCE_GDI=1 is set
 // - SPARK_DISABLE_NVENC=1 is set
+// - SPARK_CAPTURE_BACKEND selects a CPU backend
 // - NVENC is not available (no NVIDIA GPU or driver)
 //
-// When false, falls back to tile-based WebSocket encoding.
+// When false, falls back to CPU capture (DXGI/GDI) and tile-based transport.
 func isWindowsSinglePipeline() bool {
-	val := strings.TrimSpace(os.Getenv("SPARK_DISABLE_NVENC"))
-	if val == "1" || strings.ToLower(val) == "true" {
+	if isEnvTruthy(os.Getenv("SPARK_FORCE_GDI")) {
 		return false
 	}
-	// Only enable single pipeline if NVENC is actually available
+
+	if raw := strings.TrimSpace(os.Getenv("SPARK_CAPTURE_BACKEND")); raw != "" {
+		if mode, err := captureBackendFromString(raw); err == nil {
+			if mode == CaptureBackendDXGI_NV12 {
+				if isEnvTruthy(os.Getenv("SPARK_DISABLE_NVENC")) {
+					return false
+				}
+				return checkNVENCAvailable()
+			}
+			return false
+		}
+	}
+
+	if isEnvTruthy(os.Getenv("SPARK_DISABLE_NVENC")) {
+		return false
+	}
+
+	if getConfiguredCaptureBackend() == CaptureBackendDXGI_NV12 {
+		return checkNVENCAvailable()
+	}
+
+	if !isEnvTruthy(os.Getenv("SPARK_ENABLE_NVENC")) {
+		return false
+	}
 	return checkNVENCAvailable()
 }

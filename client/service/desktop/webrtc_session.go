@@ -79,9 +79,15 @@ type rtcSession struct {
 	encodeErrorLogged atomic.Bool
 	sendErrorLogged   atomic.Bool
 
-	// Codec fallback tracking
+	// Codec fallback tracking (legacy - kept for compatibility)
 	consecutiveEncodeErrors atomic.Int32
 	codecFallbackTriggered  atomic.Bool
+
+	// Encoder health monitoring and fallback system
+	healthMonitor   *EncoderHealthMonitor
+	fallbackEncoder WebRTCEncoder
+	fallbackCodec   WebRTCCodec
+	inFallbackMode  atomic.Bool
 }
 
 type rtcFrameRequest struct {
@@ -172,7 +178,6 @@ func sessionLog(format string, args ...interface{}) {
 
 func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec, h264Sel h264FmtpSelection) (*rtcSession, error) {
 	sessionLog("[SESSION] newRTCSession starting, desktopID=%s, requestedCodec=%s\n", desktopID, string(codec))
-	codec = WebRTCCodecH264
 	bitrate := parseEnvInt(envWebRTCBitrate, webRTCDefaultBR)
 	fps := parseEnvInt(envWebRTCFPS, webRTCDefaultFPS)
 	if fps <= 0 {
@@ -234,6 +239,7 @@ func newRTCSession(desktopID string, rtc *DesktopWebRTC, codec WebRTCCodec, h264
 		webcamStop:     webcamStop,
 		audioStop:      audioStop,
 		qualityManager: sessionQualityManager,
+		healthMonitor:  NewEncoderHealthMonitor(),
 	}
 	sess.start()
 	return sess, nil
@@ -280,6 +286,114 @@ func (r *rtcSession) close() {
 	if r.rtc != nil {
 		r.rtc.Close()
 	}
+}
+
+// triggerTilesFallback switches the session to tile-based encoding over WebSocket/DataChannel.
+// This is the ultimate fallback when all WebRTC video encoding fails.
+func (r *rtcSession) triggerTilesFallback() {
+	if r.inFallbackMode.Load() {
+		return // Already in fallback mode
+	}
+
+	golog.Warnf("[WEBRTC_FALLBACK] Triggering tiles fallback for session %s, WebRTC video disabled", r.desktopID)
+	r.inFallbackMode.Store(true)
+
+	// Stop the video encoder
+	if r.encoder != nil {
+		r.encoder.Close()
+		r.encoder = nil
+	}
+
+	// Enable WebSocket frames for this desktop session
+	r.enableWSFrames()
+
+	// Notify browser to switch to tiles display mode
+	if r.rtc != nil {
+		msg := map[string]interface{}{
+			"act": "TRANSPORT_FALLBACK",
+			"data": map[string]interface{}{
+				"mode":   "tiles",
+				"reason": r.healthMonitor.GetLastFallbackReason(),
+			},
+		}
+		if payload, err := json.Marshal(msg); err == nil {
+			r.rtc.SendInput(payload)
+		}
+	}
+}
+
+// triggerVP8Fallback attempts to switch to VP8 software encoding.
+// This requires SDP renegotiation with the browser.
+func (r *rtcSession) triggerVP8Fallback() {
+	if r.inFallbackMode.Load() {
+		return // Already in fallback mode
+	}
+
+	golog.Warnf("[WEBRTC_FALLBACK] Triggering VP8 fallback from %s for session %s", r.codec, r.desktopID)
+
+	// Check if VP8 is available
+	if !isVPXAvailable() {
+		golog.Warnf("[WEBRTC_FALLBACK] VP8 not available, falling back to tiles")
+		r.triggerTilesFallback()
+		return
+	}
+
+	// Create VP8 encoder
+	vpxEncoder, err := NewVPXEncoder(WebRTCCodecVP8, WebRTCEncoderConfig{
+		BitRate:          r.bitrate,
+		KeyFrameInterval: 60,
+	})
+	if err != nil {
+		golog.Errorf("[WEBRTC_FALLBACK] VP8 encoder creation failed: %v, falling back to tiles", err)
+		r.triggerTilesFallback()
+		return
+	}
+
+	// Store fallback encoder (will be used after renegotiation)
+	r.fallbackEncoder = vpxEncoder
+	r.fallbackCodec = WebRTCCodecVP8
+	r.inFallbackMode.Store(true)
+
+	// Request SDP renegotiation from browser
+	r.requestRenegotiation()
+}
+
+// requestRenegotiation sends a message to the browser requesting a new WebRTC offer with VP8.
+func (r *rtcSession) requestRenegotiation() {
+	if r.rtc == nil {
+		return
+	}
+
+	msg := map[string]interface{}{
+		"act": "CODEC_SWITCH_REQUIRED",
+		"data": map[string]interface{}{
+			"from_codec": string(r.codec),
+			"to_codec":   "vp8",
+			"reason":     r.healthMonitor.GetLastFallbackReason(),
+		},
+	}
+
+	if payload, err := json.Marshal(msg); err == nil {
+		r.rtc.SendInput(payload)
+		golog.Infof("[WEBRTC_FALLBACK] Sent CODEC_SWITCH_REQUIRED to browser, from=%s to=vp8", r.codec)
+	}
+}
+
+// enableWSFrames enables WebSocket frame delivery for the desktop session.
+func (r *rtcSession) enableWSFrames() {
+	// Find the desktop session by ID and enable WS frames
+	if desktop, ok := sessions.Get(r.desktopID); ok && desktop != nil {
+		desktop.wsFramesSuppressed.Store(false)
+		golog.Infof("[WEBRTC_FALLBACK] Enabled WS frames for desktop %s", r.desktopID)
+	}
+}
+
+// IsInFallbackMode returns true if the session has fallen back from primary encoder.
+func (r *rtcSession) IsInFallbackMode() bool {
+	if r == nil {
+		return false
+	}
+	return r.inFallbackMode.Load()
 }
 
 type frameEncoder interface {
@@ -397,37 +511,64 @@ func (r *rtcSession) sendQueued(req rtcFrameRequest) {
 		}
 		sample, err := enc.EncodeFrame(req.frame, duration)
 		if err != nil {
-			// Track consecutive encode errors for potential codec fallback
+			// Use health monitor for progressive fallback
+			isFatal := !errors.Is(err, ErrWebRTCEncoderTimeout)
+			newState := r.healthMonitor.RecordError(isFatal)
+
+			// Also update legacy counter for backwards compatibility
 			errCount := r.consecutiveEncodeErrors.Add(1)
 
 			if errors.Is(err, ErrWebRTCEncoderTimeout) {
 				if cnt <= 5 || cnt%300 == 0 {
 					sessionLog("[SESSION] frame=%d ErrWebRTCEncoderTimeout (dropped, single-pipeline)\n", cnt)
 				}
-				// Timeout errors don't close session but may trigger fallback
-				// Reduced threshold since encoder now has internal recovery at 3 errors
+
+				// Check if health monitor triggered a fallback
+				if newState == EncoderStateVP8 {
+					r.triggerVP8Fallback()
+					return
+				}
+				if newState == EncoderStateTiles {
+					r.triggerTilesFallback()
+					return
+				}
+
+				// Legacy behavior: reduce quality after 5 timeouts
 				if errCount >= 5 && r.codecFallbackTriggered.CompareAndSwap(false, true) {
 					golog.Warnf("[WEBRTC_ENCODE] codec fallback recommended: %d consecutive timeouts, codec=%s", errCount, string(r.codec))
-					// TODO: Implement actual codec switch to VP8/VP9 when H.264 consistently fails
-					// For now, log and reduce quality via adaptive quality manager
 					if r.qualityManager != nil {
 						r.qualityManager.UpdateNetworkMetrics(500, 10.0, 1024*1024) // Force quality downgrade
 					}
 				}
 				return
 			}
+
+			// Fatal error
 			if r.encodeErrorLogged.CompareAndSwap(false, true) {
 				sessionLog("[SESSION] EncodeFrame failed: %v\n", err)
 			}
-			golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s consecutiveErrors=%d", err.Error(), string(r.codec), errCount)
+			golog.Warnf("[WEBRTC_ENCODE] GPU encode failed error=%s codec=%s consecutiveErrors=%d state=%s",
+				err.Error(), string(r.codec), errCount, newState.String())
 
-			// After 5 consecutive hard errors, close session
+			// Check health monitor state for fallback
+			if newState == EncoderStateTiles {
+				r.triggerTilesFallback()
+				return
+			}
+			if newState == EncoderStateVP8 {
+				r.triggerVP8Fallback()
+				return
+			}
+
+			// After 5 consecutive hard errors without fallback, close session
 			if errCount >= 5 {
 				r.close()
 			}
 			return
 		}
-		// Reset error counter on successful encode
+
+		// Reset error counters on successful encode
+		r.healthMonitor.RecordSuccess()
 		r.consecutiveEncodeErrors.Store(0)
 		if len(sample.Data) == 0 {
 			if cnt <= 5 || cnt%300 == 0 {

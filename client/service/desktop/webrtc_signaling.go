@@ -89,11 +89,17 @@ func HandleWebRTCOffer(pack modules.Packet) (map[string]any, error) {
 		sess.rtc = nil
 	}
 
-	// Get configured codec from environment (default to H.264 on Windows 10+).
+	// Get configured codec from environment, defaulting based on pipeline support.
 	codec := WebRTCCodec(strings.ToLower(strings.TrimSpace(os.Getenv(envWebRTCCodec))))
 	if codec == "" {
-		if runtime.GOOS == "windows" {
+		if isWindowsSinglePipeline() {
 			codec = WebRTCCodecH264
+		} else if runtime.GOOS == "windows" {
+			if isVPXAvailable() {
+				codec = WebRTCCodecVP8
+			} else {
+				codec = WebRTCCodecH264
+			}
 		} else {
 			codec = WebRTCCodecVP8
 		}

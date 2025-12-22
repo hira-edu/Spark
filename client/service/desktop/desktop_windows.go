@@ -109,9 +109,16 @@ func dxgiCaptureTimeoutMillis() int {
 }
 
 func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
+	if envFlagEnabled("SPARK_FORCE_GDI") {
+		return []CaptureBackendMode{CaptureBackendGDI}
+	}
+
 	order := getFallbackOrder()
 	final := make([]CaptureBackendMode, 0, len(order)+4)
 	appendMode := func(mode CaptureBackendMode) {
+		if mode == CaptureBackendDXGI_NV12 && !isWindowsSinglePipeline() {
+			return
+		}
 		if mode == CaptureBackendAuto || !isBackendSelectable(mode) {
 			return
 		}
@@ -148,16 +155,12 @@ func backendPreferenceOrder(desired CaptureBackendMode) []CaptureBackendMode {
 			appendMode(CaptureBackendNVFBC)
 		}
 	} else {
-		// DISABLED: GPU-native NV12 produces GPU-only frames which require hardware H.264 encoding.
-		// Hardware encoding fails on AMD GPUs (MEError after first frame), so we skip it for now.
-		// Use standard DXGI (produces CPU images for tile encoding) as the primary path.
-		// TODO: Re-enable DXGI_NV12 when hardware encoder issues are fixed across Intel/AMD/NVIDIA.
-		// appendMode(CaptureBackendDXGI_NV12) // DISABLED - hardware encoder broken on AMD
+		// Default to DXGI CPU capture; fall back to GDI when DXGI init/capture fails.
+		appendMode(CaptureBackendDXGI)
+		appendMode(CaptureBackendGDI)
 		if nvfbcSupported() {
 			appendMode(CaptureBackendNVFBC)
 		}
-		appendMode(CaptureBackendDXGI) // Standard DXGI - produces CPU images
-		appendMode(CaptureBackendGDI)  // Fallback
 	}
 
 	if len(final) == 0 {
